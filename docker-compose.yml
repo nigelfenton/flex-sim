@@ -1,0 +1,29 @@
+# flex-sim via macvlan: the container gets its OWN IP on your LAN and behaves as a
+# distinct radio, so AetherSDR (on another LAN host) auto-discovers it and there is
+# no :4992 collision. Edit `parent`, `subnet`, `gateway`, and `ipv4_address` to match
+# your network, then:  docker compose up --build
+#
+# Note: with macvlan, the *Docker host itself* cannot talk to the container — that's a
+# macvlan limitation, not flex-sim. AE must run on a DIFFERENT machine on the LAN.
+# If AE shares the Docker host, use a separate machine/VM instead (or `--network host`
+# on a box that isn't the AE host).
+
+services:
+  flex-sim:
+    build: .
+    image: flex-sim:latest
+    # command: ["--pattern", "carrier"]      # optional extra flags
+    networks:
+      lan:
+        ipv4_address: 10.0.0.90              # an unused address on your LAN
+    restart: unless-stopped
+
+networks:
+  lan:
+    driver: macvlan
+    driver_opts:
+      parent: eth0                           # your LAN interface (eth0 / enp3s0 / ...)
+    ipam:
+      config:
+        - subnet: 10.0.0.0/24
+          gateway: 10.0.0.1
