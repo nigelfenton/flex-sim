@@ -548,6 +548,7 @@ class Radio:
             for s in self.slices.values(): s["active"] = False
             self.slices[idx] = {"freq": freq, "mode": mode, "active": True, "pan": pid}
             self.pans[pid]["slice"] = idx
+            self.pans[pid]["center"] = freq                # pan frames on its slice at creation
             self.active_slice = idx
             self._sync_active_slice()                      # mirror active slice -> slice_freq/mode + pan centre
             self.reply(conn, seq, str(idx))
@@ -616,6 +617,9 @@ class Radio:
                 for s in self.slices.values(): s["active"] = False
                 sl["active"] = True
                 self.active_slice = idx
+            if kvs.get("autopan") == "1":                  # Pan Lock on: the pan re-centres on the slice
+                pid = sl.get("pan")
+                if pid in self.pans: self.pans[pid]["center"] = sl["freq"]
             self.reply(conn, seq)
             self._sync_active_slice()
             self.emit_slice_status(conn, idx)
@@ -644,17 +648,18 @@ class Radio:
     def _new_pan(self):
         pid, wid = self.pan_id + self.pan_seq, self.wf_id + self.pan_seq
         self.pan_seq += 1
-        self.pans[pid] = {"wf_id": wid, "slice": None, "y_pixels": self.y_pixels}
+        self.pans[pid] = {"wf_id": wid, "slice": None, "y_pixels": self.y_pixels,
+                          "center": self.slice_freq}     # framing centre; fixed unless AE pans (autopan)
         log(f"[pan] create -> 0x{pid:08X}/0x{wid:08X}  ({len(self.pans)} panadapter(s))")
         return pid
 
     def _primary_pan(self):
         return next(iter(self.pans)) if self.pans else self._new_pan()
 
-    def _pan_center(self, pid):                            # a pan is centred on its slice's freq
-        pan = self.pans.get(pid)
-        if pan and pan["slice"] in self.slices:
-            return self.slices[pan["slice"]]["freq"]
+    def _pan_center(self, pid):                            # a pan's own framing centre (NOT the slice freq:
+        pan = self.pans.get(pid)                           # a slice can tune within a fixed pan, autopan=0)
+        if pan and "center" in pan:
+            return pan["center"]
         return self.slice_freq
 
     def _pan_from_kvs(self, kvs):                          # resolve "pan=0x...." to one of our panadapters
