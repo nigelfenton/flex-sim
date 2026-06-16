@@ -366,8 +366,8 @@ class Radio:
         # radio_id off the base constants below.
         self.radio_id = radio_id
         self.serial = f"FLEXSIM{radio_id:02d}"
-        self.handle = HANDLE + radio_id
-        self.handle_hex = f"{self.handle:08X}"
+        self.client_handle = HANDLE + radio_id   # NB: NOT self.handle — that's the method!
+        self.handle_hex = f"{self.client_handle:08X}"
         self.pan_id = PAN_ID + radio_id          # FFT stream id (PCC 0x8003)
         self.wf_id = WF_ID + radio_id            # waterfall stream id (PCC 0x8004)
         self.meter_sid = METER_SID + radio_id    # meter VITA stream id (PCC 0x8002)
