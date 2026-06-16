@@ -51,7 +51,7 @@ Patterns (each is a test signal; the control panel explains what to look for):
   tx_blank      periodic real TX gap -> repro #2126 / #1916
 Also handles AE's own CWX keyer (cwx send/wpm/qsk_enabled) for authentic CW TX.
 """
-import argparse, http.server, math, random, socket, struct, threading, time, urllib.parse, uuid
+import argparse, http.server, json, math, random, socket, struct, threading, time, urllib.parse, uuid
 
 FLEX_SIM_VERSION = "0.1.0"
 
@@ -399,10 +399,30 @@ class Radio:
         self.cwx_char_ends = []
         self.cwx_sent = 0
         self.qsk = False             # full break-in (RX between elements); AE sets via cwx qsk_enabled
+        self.enabled = True          # "power": when False, stop advertising (radio drops off AE)
+        self.last_vfo_dbm = -130.0   # last level at the VFO — drives the rack strip's signal meter
 
     @property
     def tx_on(self):
         return self.tx_mox or self.tx_tune
+
+    def set_power(self, on):
+        # Rack "power button": off -> stop streaming + drop AE's connection + stop
+        # advertising (radio vanishes from AE). on -> discovery resumes, AE re-finds it.
+        self.enabled = bool(on)
+        if not on:
+            self.streaming = False
+            c = self.conn
+            if c:
+                try: c.shutdown(socket.SHUT_RDWR); c.close()
+                except OSError: pass
+
+    def state(self):
+        # Snapshot for the rack strip (polled by the panel).
+        return {"id": self.radio_id, "serial": self.serial, "on": self.enabled,
+                "connected": self.conn is not None, "freq": round(self.slice_freq, 5),
+                "mode": self.slice_mode, "tx": self.tx_on, "pattern": self.pattern,
+                "power_w": round(self.tx_power_w), "meter_dbm": round(self.last_vfo_dbm, 1)}
 
     def dbm_to_pixel(self, dbm):
         p = (self.max_dbm - dbm) / (self.max_dbm - self.min_dbm) * (self.y_pixels - 1)
@@ -420,9 +440,10 @@ class Radio:
                f"max_licensed_version=3").encode()
         dests = [("255.255.255.255", DISCOVERY_PORT)] + ([(self.ae_ip, DISCOVERY_PORT)] if self.ae_ip else [])
         while self.run:
-            for d in dests:
-                try: s.sendto(msg, d)
-                except OSError: pass
+            if self.enabled:                       # "powered off" -> stop advertising
+                for d in dests:
+                    try: s.sendto(msg, d)
+                    except OSError: pass
             time.sleep(1.0)
 
     def prime_loop(self):
@@ -707,6 +728,7 @@ class Radio:
                 intens = [self.dbm_to_wf_raw(d) for d in levels]    #  don't flood AE with 50 fps of big FFT/wf)
                 low_hz = (self.center_mhz - self.span_mhz / 2) * 1e6   # track AE's live view
                 vfo_dbm = levels[ctx.center]                            # S-meter = level at the VFO
+                self.last_vfo_dbm = vfo_dbm                             # feed the rack strip's meter
                 wf_ab = min(intens)                                     # measured noise-floor black level (raw)
                 #                                                        -> AE #3586 radio-auto-black path
                 try:
@@ -839,6 +861,124 @@ def start_control_server(radio, port):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 
+# ---- the rack: one process hosting N radios + a combined "1U strip" panel ----
+class Rack:
+    def __init__(self, ip, ae_ip, n, base_port, pattern, bins, fps, width_khz):
+        self.radios = [Radio(ip, ae_ip, pattern, bins, fps, width_khz,
+                             port=base_port + i, radio_id=i) for i in range(n)]
+
+    def start(self):
+        for r in self.radios:
+            threading.Thread(target=r.discovery_loop, daemon=True).start()
+            threading.Thread(target=r.prime_loop, daemon=True).start()
+            threading.Thread(target=r.serve, daemon=True).start()
+
+
+RACK_HTML = """<!DOCTYPE html><html><head><meta charset=utf-8><title>flex-sim rack</title>
+<style>
+body{{font-family:sans-serif;background:#0d0f13;color:#dfe7ef;margin:0;padding:18px}}
+h2{{color:#5cf;margin:0 0 2px}} .sub{{color:#6b7480;font-size:13px;margin-bottom:14px}}
+.rack{{background:#14171c;border:1px solid #2b313b;border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:8px}}
+.strip{{display:flex;align-items:center;gap:8px;background:#1b2129;border:1px solid #2f3742;border-radius:8px;padding:8px 6px}}
+.strip.off{{background:#15181d;border-color:#23272e;opacity:.55}}
+.pwr{{width:26px;height:26px;border-radius:50%;border:1px solid #2c7a44;background:#16331f;color:#34d058;cursor:pointer;font-size:13px;line-height:1}}
+.pwr.off{{border-color:#3a3f47;background:#23272e;color:#5a616b}}
+.rid{{width:74px;line-height:1.15}} .rid b{{font-size:13px}} .rid span{{display:block;font-size:10px;color:#6b7480}}
+.lcd{{width:112px;font-family:monospace;font-size:14px;color:#f0b34a;background:#0c0e12;border-radius:4px;padding:4px 6px;text-align:right}}
+.mode{{width:46px;font-size:11px;color:#9fb3c8;background:#232a33;border-radius:4px;padding:4px 0;text-align:center}}
+.pill{{width:44px;font-size:11px;border-radius:4px;padding:4px 0;text-align:center;font-weight:bold}}
+.pill.rx{{color:#4ade80;background:#123a1e;border:1px solid #1f6b35}}
+.pill.tx{{color:#f87171;background:#3a1212;border:1px solid #6b1f1f}}
+.pill.off{{color:#5a616b;background:#1e232a}}
+select{{width:126px;font-size:12px;color:#cfe0f0;background:#232a33;border:1px solid #38414d;border-radius:5px;padding:4px 6px}}
+.met{{flex:1;display:flex;align-items:center;gap:6px}}
+.bar{{flex:1;height:10px;background:#0c0e12;border-radius:3px;overflow:hidden}}
+.fill{{height:100%;width:0;background:#2faf5a}}
+.mlbl{{font-size:11px;color:#9fb3c8;width:36px}}
+</style></head><body>
+<h2>flex-sim rack</h2><div class=sub>{n} virtual radios &mdash; driving AetherSDR</div>
+<div class=rack>{strips}</div>
+<script>
+function fmtFreq(m){{var hz=Math.round(m*1e6),s=String(hz).padStart(7,'0');
+return (s.slice(0,-6)||'0')+'.'+s.slice(-6,-3)+'.'+s.slice(-3);}}
+function setp(i,p){{fetch('/set?radio='+i+'&pattern='+p);}}
+function pwr(i,on){{fetch('/set?radio='+i+'&power='+(on?1:0));}}
+function S(d){{return d>=-73?('S9+'+Math.round(d+73)):('S'+Math.max(0,Math.round(9+(d+73)/6)));}}
+async function poll(){{
+ try{{var st=await(await fetch('/state')).json();st.forEach(function(s){{
+  var g=function(p){{return document.getElementById(p+'-'+s.id);}};
+  g('strip').className='strip'+(s.on?'':' off');
+  g('pwr').className='pwr'+(s.on?'':' off');
+  g('lcd').textContent=s.on?fmtFreq(s.freq):'—.———.———';
+  g('mode').textContent=s.on?s.mode:'—';
+  var pl=g('state');
+  if(!s.on){{pl.textContent='off';pl.className='pill off';}}
+  else if(s.tx){{pl.textContent='TX';pl.className='pill tx';}}
+  else{{pl.textContent='RX';pl.className='pill rx';}}
+  var f=g('fill'),l=g('mlbl');
+  if(!s.on){{f.style.width='0';l.textContent='—';}}
+  else if(s.tx){{f.style.width=Math.min(100,s.power_w)+'%';f.style.background='#e0892a';l.textContent=s.power_w+'W';}}
+  else{{f.style.width=Math.max(0,Math.min(100,(s.meter_dbm+130)/1.1))+'%';f.style.background='#2faf5a';l.textContent=S(s.meter_dbm);}}
+ }});}}catch(e){{}}
+ setTimeout(poll,750);
+}}
+poll();
+</script></body></html>"""
+
+
+def start_rack_control_server(rack, port):
+    def strip(r):
+        opts = "".join(f'<option{" selected" if p == r.pattern else ""}>{p}</option>'
+                       for p in sorted(PATTERNS))
+        i = r.radio_id
+        return (f'<div class=strip id=strip-{i}>'
+                f'<button class=pwr id=pwr-{i} title=power '
+                f'onclick="pwr({i},this.classList.contains(\'off\'))">&#9211;</button>'
+                f'<span class=rid><b>R{i + 1}</b><span>{r.serial}</span></span>'
+                f'<span class=lcd id=lcd-{i}>&mdash;.&mdash;&mdash;&mdash;.&mdash;&mdash;&mdash;</span>'
+                f'<span class=mode id=mode-{i}>&mdash;</span>'
+                f'<span class="pill off" id=state-{i}>off</span>'
+                f'<select id=pat-{i} onchange="setp({i},this.value)">{opts}</select>'
+                f'<span class=met><span class=bar><span class=fill id=fill-{i}></span></span>'
+                f'<span class=mlbl id=mlbl-{i}>&mdash;</span></span></div>')
+    page = RACK_HTML.format(n=len(rack.radios), strips="".join(strip(r) for r in rack.radios)).encode()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            if u.path == "/state":
+                body = json.dumps([r.state() for r in rack.radios]).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store"); self.end_headers()
+                self.wfile.write(body); return
+            if u.path == "/set":
+                q = urllib.parse.parse_qs(u.query)
+                try:
+                    r = rack.radios[int(q.get("radio", ["0"])[0])]
+                    if "power" in q:
+                        r.set_power(q["power"][0] == "1")
+                        log(f"[rack] R{r.radio_id + 1} power {'on' if r.enabled else 'off'}")
+                    if "pattern" in q and q["pattern"][0] in PATTERNS and q["pattern"][0] != r.pattern:
+                        leaving_auto = r.pattern in AUTO_TX_PATTERNS
+                        r.pattern = q["pattern"][0]
+                        if leaving_auto and r.tx_mox:
+                            r.tx_mox = False; r.emit_transmit_status()
+                        log(f"[rack] R{r.radio_id + 1} pattern -> {r.pattern}")
+                except (ValueError, IndexError):
+                    pass
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.end_headers(); self.wfile.write(page)
+
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", port), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+
 def main():
     ap = argparse.ArgumentParser(prog="flex-sim",
                                  description="Synthetic FlexRadio-6000 emulator / test bench for AetherSDR.")
@@ -852,9 +992,28 @@ def main():
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
                     help="control/data port we bind + advertise (default 4992; set e.g. 5992 to "
                          "coexist with AE on one host). Discovery is always sent to AE's :4992.")
+    ap.add_argument("--radios", type=int, default=1,
+                    help="number of virtual radios in one process (>1 = rack mode)")
+    ap.add_argument("--base-port", type=int, default=None,
+                    help="rack: first radio's port; radios use base..base+N-1 (default = --port)")
     ap.add_argument("--ctl-port", type=int, default=8731, help="web control-panel port")
     args = ap.parse_args()
     ip = args.ip or local_ip()
+    if args.radios > 1:                                    # ---- rack mode: N radios + strip panel ----
+        base = args.base_port or args.port
+        rack = Rack(ip, args.ae, args.radios, base, args.pattern, args.bins, args.fps, args.width_khz)
+        rack.start()
+        start_rack_control_server(rack, args.ctl_port)
+        log(f"flex-sim {FLEX_SIM_VERSION} - RACK of {args.radios} radios "
+            f"(FLEXSIM00..FLEXSIM{args.radios - 1:02d}, ports {base}..{base + args.radios - 1}) ip {ip}")
+        log(f"discovery -> AE's UDP :{DISCOVERY_PORT}")
+        log(f"** rack panel: http://{ip}:{args.ctl_port}/  (open in your host browser) **")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            log("bye")
+        return
     radio = Radio(ip, args.ae, args.pattern, args.bins, args.fps, args.width_khz, port=args.port)
     threading.Thread(target=radio.discovery_loop, daemon=True).start()
     threading.Thread(target=radio.prime_loop, daemon=True).start()

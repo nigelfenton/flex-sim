@@ -59,6 +59,12 @@ pyinstaller --onefile --name flex-sim flex_sim.py
 
 ---
 
+### Many radios at once (rack mode)
+```bash
+python3 flex_sim.py --radios 8 --ae <AE-ip>     # 8 virtual radios in one process
+```
+Runs N virtual radios (serials `FLEXSIM00…`, ports `base…base+N-1`) that AE discovers as separate rigs — a hardware-free multi-radio bench. The control panel becomes a **rack of 1U strips** (power · frequency · mode · RX/TX · test pattern · signal meter, per radio). `--base-port` sets the first port (default 4992; on one host each radio takes the next port up).
+
 ## Pointing AetherSDR at it
 With flex-sim running, AE should list it in the radio chooser (model `FLEX-6600`, serial `EMULATE01`) — select and connect. If it doesn't appear, confirm the networking rule above and that you passed `--ae <AE-ip>`.
 
