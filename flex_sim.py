@@ -32,8 +32,10 @@ host. Run flex-sim on a second machine / VM / container / WSL2 and point AE at i
 
 Pure Python 3.8+ stdlib — no dependencies.
 
-Usage:  python3 flex_sim.py [--ip IP] [--ae AE_IP] [--pattern NAME]
+Usage:  python3 flex_sim.py [--ip IP] [--ae AE_IP] [--pattern NAME] [--port P]
                             [--bins N] [--fps N] [--width-khz K] [--ctl-port P]
+  --port lets flex-sim run on the SAME host as AE: it binds/advertises that port
+  (e.g. 5992) for control+data while still announcing to AE's fixed :4992 listener.
 Patterns (each is a test signal; the control panel explains what to look for):
   noise_floor   flat floor (baseline; auto-black #3586)
   ramp          whole-span level swept min->max (auto-black / level mapping)
@@ -53,7 +55,9 @@ import argparse, http.server, math, random, socket, struct, threading, time, url
 
 FLEX_SIM_VERSION = "0.1.0"
 
-TCP_PORT = UDP_PORT = 4992
+DISCOVERY_PORT = 4992        # AE always listens for discovery here (fixed); we broadcast TO it
+DEFAULT_PORT = 4992          # flex-sim's own control (TCP) + VITA-prime (UDP) port; override with --port
+                             # -> set e.g. 5992 to run on the SAME host as AE without a :4992 clash
 HANDLE = 0x1A2B3C4D
 HANDLE_HEX = f"{HANDLE:08X}"
 PAN_ID = 0x40000000          # FFT stream id   (PCC 0x8003)
@@ -353,8 +357,10 @@ AUTO_TX_PATTERNS = {"tx_blank", "cw"}     # patterns that drive TX state themsel
 
 
 class Emu:
-    def __init__(self, ip, ae_ip, pattern="ramp", bins=BINS, fps=FPS, width_khz=SIGNAL_WIDTH_KHZ):
+    def __init__(self, ip, ae_ip, pattern="ramp", bins=BINS, fps=FPS, width_khz=SIGNAL_WIDTH_KHZ,
+                 port=DEFAULT_PORT):
         self.ip, self.ae_ip = ip, ae_ip
+        self.port = port                # control/data port we bind + advertise (discovery dest stays 4992)
         self.pattern = pattern if pattern in PATTERNS else "ramp"
         self.bins, self.fps = bins, fps
         self.sig_width_khz = width_khz
@@ -400,9 +406,9 @@ class Emu:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         msg = (f"name=flex-sim model={MODEL} serial={SERIAL} version={VERSION} "
-               f"ip={self.ip} port={TCP_PORT} status=Available mf_enable=1 "
+               f"ip={self.ip} port={self.port} status=Available mf_enable=1 "
                f"max_licensed_version=3").encode()
-        dests = [("255.255.255.255", UDP_PORT)] + ([(self.ae_ip, UDP_PORT)] if self.ae_ip else [])
+        dests = [("255.255.255.255", DISCOVERY_PORT)] + ([(self.ae_ip, DISCOVERY_PORT)] if self.ae_ip else [])
         while self.run:
             for d in dests:
                 try: s.sendto(msg, d)
@@ -412,7 +418,7 @@ class Emu:
     def prime_loop(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("", UDP_PORT))
+        s.bind(("", self.port))
         while self.run:
             try:
                 data, addr = s.recvfrom(2048)
@@ -425,8 +431,8 @@ class Emu:
     def serve(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("", TCP_PORT)); srv.listen(1)
-        log(f"[tcp] listening on :{TCP_PORT}  (emu ip {self.ip}, pattern={self.pattern})")
+        srv.bind(("", self.port)); srv.listen(1)
+        log(f"[tcp] listening on :{self.port}  (emu ip {self.ip}, pattern={self.pattern})")
         while self.run:
             conn, addr = srv.accept()
             log(f"[tcp] AE connected from {addr}")
@@ -833,15 +839,19 @@ def main():
     ap.add_argument("--bins", type=int, default=BINS)
     ap.add_argument("--fps", type=int, default=FPS)
     ap.add_argument("--width-khz", type=float, default=SIGNAL_WIDTH_KHZ)
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT,
+                    help="control/data port we bind + advertise (default 4992; set e.g. 5992 to "
+                         "coexist with AE on one host). Discovery is always sent to AE's :4992.")
     ap.add_argument("--ctl-port", type=int, default=8731, help="web control-panel port")
     args = ap.parse_args()
     ip = args.ip or local_ip()
-    emu = Emu(ip, args.ae, args.pattern, args.bins, args.fps, args.width_khz)
+    emu = Emu(ip, args.ae, args.pattern, args.bins, args.fps, args.width_khz, port=args.port)
     threading.Thread(target=emu.discovery_loop, daemon=True).start()
     threading.Thread(target=emu.prime_loop, daemon=True).start()
     start_control_server(emu, args.ctl_port)
     log(f"flex-sim {FLEX_SIM_VERSION} - model={MODEL} serial={SERIAL} ip={ip} pattern={args.pattern}")
-    log("discovery broadcasting on UDP :4992; control on TCP :4992")
+    log(f"discovery -> AE's UDP :{DISCOVERY_PORT}; control/data on :{args.port}"
+        + ("  (same-host mode)" if args.port != DISCOVERY_PORT else ""))
     log(f"** control panel: http://{ip}:{args.ctl_port}/  (open in your host browser) **")
     try:
         emu.serve()

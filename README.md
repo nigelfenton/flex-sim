@@ -20,6 +20,7 @@ flex-sim **and** AetherSDR both bind UDP **`:4992`**, so flex-sim needs its **ow
 
 - **Same physical machine as AE, on Windows → use WSL2.** WSL2 gives flex-sim its own IP (`172.x`), reachable from the Windows host, with no `:4992` clash. Put `[wsl2]\nlocalhostForwarding=false` in `%USERPROFILE%\.wslconfig` (so WSL's `:4992` doesn't relay onto the host), then run flex-sim **inside WSL** and let AE discover it. *This is the proven same-machine path on Windows.*
 - **Separate box on the LAN** (Pi / NUC / spare PC / VM) — easiest; run the `.exe`, Python, or Docker there and AE auto-discovers it.
+- **Same host as AE, no VM — `--port`:** `python3 flex_sim.py --port 5992 --ae <AE-ip>`. flex-sim binds **`:5992`** for control + data (not `:4992`) but still announces itself to AE's fixed `:4992` discovery listener, so the two coexist on one machine. (Works because AE honors the `port=` field in the discovery datagram. Discovery is always *sent to* `:4992`; only flex-sim's own control/data port moves.)
 - **`--ae <AE-ip>`** — flex-sim also unicasts discovery straight to AE (helps across subnets / when broadcast doesn't traverse).
 
 **Docker caveat:** on **Linux**, a `macvlan` network gives the container its own LAN IP (clean — see `docker-compose.yml`). On **Docker Desktop for Windows/Mac**, containers aren't reachable at their own IP from the host and `macvlan` isn't supported, so **Docker does *not* solve the same-host case there — use WSL2.** Docker is for a **separate Linux box**.
