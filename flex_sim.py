@@ -853,7 +853,10 @@ class Radio:
             if levels is not None and tc != last_tc:               # one pan/wf row per waterfall tick
                 pixels = [self.dbm_to_pixel(d) for d in levels]     # generated once; each stacked panadapter
                 intens = [self.dbm_to_wf_raw(d) for d in levels]    # shows it, centred on ITS slice (low_hz).
-                wf_ab = min(intens)                                 # (loop may run 50 fps for CW; throttled to tc)
+                wf_ab = self.dbm_to_wf_raw(self.noise_floor_dbm)    # auto-black = the CONFIGURED noise floor,
+                #   not min(intens): a flat pattern (step/impulse/ramp) has min==max, so min(intens) would
+                #   set the black level AT the signal and AE blanks the whole waterfall row. The true floor
+                #   keeps flat-high rows bright and still feeds AE's #3586 auto-black path correctly.
                 self.last_vfo_dbm = levels[ctx.center]              # active slice (pan centre) -> rack strip
                 try:
                     for pid, pan in list(self.pans.items()):        # AE stacks one panadapter per receiver
