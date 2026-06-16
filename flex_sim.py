@@ -26,9 +26,9 @@ It serves a live browser control panel (default http://<ip>:8731/) with a patter
 picker, dBm/S-unit level controls, TX keying and CW/CWX — each pattern shows what
 it exercises in AE.
 
-NETWORKING: flex-sim and AetherSDR both bind UDP :4992, so they CANNOT share one
-host. Run flex-sim on a second machine / VM / container / WSL2 and point AE at it
-(pass --ae <AE-ip> so flex-sim also unicasts discovery straight to AE).
+NETWORKING: by default flex-sim binds UDP :4992 like a real radio, so give it its
+own IP (second machine / VM / container / WSL2) — OR use --port to run it on the SAME
+host as AE on a different control port. Pass --ae <AE-ip> to also unicast discovery to AE.
 
 Pure Python 3.8+ stdlib — no dependencies.
 
@@ -113,14 +113,14 @@ def vita_header(stream_id, pcc, seq, payload_len):
     return struct.pack(">IIIIIII", word0, stream_id, 0x001C2D00, pcc & 0xFFFF, 0, 0, 0)
 
 
-def fft_packet(seq, pixels, frame_index):
+def fft_packet(stream_id, seq, pixels, frame_index):
     n = len(pixels)
     sub = struct.pack(">HHHHI", 0, n, 2, n, frame_index)
     payload = sub + struct.pack(">%dH" % n, *pixels)
-    return vita_header(PAN_ID, PCC_FFT, seq, len(payload)) + payload
+    return vita_header(stream_id, PCC_FFT, seq, len(payload)) + payload
 
 
-def wf_packet(seq, intens, low_hz, binbw_hz, timecode, auto_black=20):
+def wf_packet(stream_id, seq, intens, low_hz, binbw_hz, timecode, auto_black=20):
     # auto_black = the tile's AutoBlackLevel field (raw uint, same domain as the
     # intensity samples). A real Flex puts the radio-measured noise-floor level
     # here; AE's #3586 auto-black path uses it as the waterfall black/low point.
@@ -130,14 +130,14 @@ def wf_packet(seq, intens, low_hz, binbw_hz, timecode, auto_black=20):
     binbw_raw = int(round(binbw_hz))                       # unambiguous for HF/VHF, unlike Hz*2^20 at low f)
     sub = struct.pack(">qqIHHIIHH", low_raw, binbw_raw, 100, w, 1, timecode, auto_black, w, 0)
     payload = sub + struct.pack(">%dh" % w, *intens)       # signed int16, AE reads /128.0
-    return vita_header(WF_ID, PCC_WF, seq, len(payload)) + payload
+    return vita_header(stream_id, PCC_WF, seq, len(payload)) + payload
 
 
-def meter_packet(seq, meter_id, dbm):
+def meter_packet(stream_id, seq, meter_id, dbm):
     # PCC 0x8002 payload: N x (uint16 meter_id, int16 raw). AE: dBm = raw / 128.0
     raw = max(-32768, min(32767, int(round(dbm * 128.0))))
     payload = struct.pack(">Hh", meter_id, raw)
-    return vita_header(METER_SID, PCC_METER, seq, len(payload)) + payload
+    return vita_header(stream_id, PCC_METER, seq, len(payload)) + payload
 
 
 # ---- pattern engine: each pattern returns a per-bin dBm list (or None = TX gap) ----
@@ -356,11 +356,21 @@ PATTERNS = {
 AUTO_TX_PATTERNS = {"tx_blank", "cw"}     # patterns that drive TX state themselves
 
 
-class Emu:
+class Radio:
     def __init__(self, ip, ae_ip, pattern="ramp", bins=BINS, fps=FPS, width_khz=SIGNAL_WIDTH_KHZ,
-                 port=DEFAULT_PORT):
+                 port=DEFAULT_PORT, radio_id=0):
         self.ip, self.ae_ip = ip, ae_ip
         self.port = port                # control/data port we bind + advertise (discovery dest stays 4992)
+        # Per-radio identity, so many radios can live in one process (the "rack").
+        # Each value must be unique per radio or AE cross-wires them; derived from
+        # radio_id off the base constants below.
+        self.radio_id = radio_id
+        self.serial = f"FLEXSIM{radio_id:02d}"
+        self.handle = HANDLE + radio_id
+        self.handle_hex = f"{self.handle:08X}"
+        self.pan_id = PAN_ID + radio_id          # FFT stream id (PCC 0x8003)
+        self.wf_id = WF_ID + radio_id            # waterfall stream id (PCC 0x8004)
+        self.meter_sid = METER_SID + radio_id    # meter VITA stream id (PCC 0x8002)
         self.pattern = pattern if pattern in PATTERNS else "ramp"
         self.bins, self.fps = bins, fps
         self.sig_width_khz = width_khz
@@ -405,7 +415,7 @@ class Emu:
     def discovery_loop(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        msg = (f"name=flex-sim model={MODEL} serial={SERIAL} version={VERSION} "
+        msg = (f"name=flex-sim model={MODEL} serial={self.serial} version={VERSION} "
                f"ip={self.ip} port={self.port} status=Available mf_enable=1 "
                f"max_licensed_version=3").encode()
         dests = [("255.255.255.255", DISCOVERY_PORT)] + ([(self.ae_ip, DISCOVERY_PORT)] if self.ae_ip else [])
@@ -432,7 +442,7 @@ class Emu:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("", self.port)); srv.listen(1)
-        log(f"[tcp] listening on :{self.port}  (emu ip {self.ip}, pattern={self.pattern})")
+        log(f"[tcp] listening on :{self.port}  (radio ip {self.ip}, pattern={self.pattern})")
         while self.run:
             conn, addr = srv.accept()
             log(f"[tcp] AE connected from {addr}")
@@ -445,8 +455,8 @@ class Emu:
         self.conn = conn
         with self.send_lock:
             conn.sendall(f"V{VERSION}\n".encode())
-            conn.sendall(f"H{HANDLE_HEX}\n".encode())
-        log(f"[tcp] sent V{VERSION} / H{HANDLE_HEX}")
+            conn.sendall(f"H{self.handle_hex}\n".encode())
+        log(f"[tcp] sent V{VERSION} / H{self.handle_hex}")
         buf = b""
         while self.run:
             chunk = conn.recv(4096)
@@ -463,7 +473,7 @@ class Emu:
 
     def status(self, conn, obj_kvs):
         with self.send_lock:
-            conn.sendall(f"S{HANDLE_HEX}|{obj_kvs}\n".encode())
+            conn.sendall(f"S{self.handle_hex}|{obj_kvs}\n".encode())
 
     def on_line(self, conn, line):
         if not line.startswith("C") or "|" not in line:
@@ -476,7 +486,7 @@ class Emu:
         elif c == "slice list":
             self.reply(conn, seq, "")
         elif c.startswith("display panafall create") or c.startswith("display pan create"):
-            self.reply(conn, seq, f"0x{PAN_ID:08X},0x{WF_ID:08X}")
+            self.reply(conn, seq, f"0x{self.pan_id:08X},0x{self.wf_id:08X}")
             self.emit_pan_status(conn)
         elif c.startswith("slice create"):
             kvs = parse_kvs(c)
@@ -499,7 +509,7 @@ class Emu:
             if "bandwidth" in kvs: self.span_mhz = float(kvs["bandwidth"])
             self.reply(conn, seq)
         elif c.startswith("info"):
-            self.reply(conn, seq, f"model={MODEL},chassis_serial={SERIAL},callsign=SDRSIM,"
+            self.reply(conn, seq, f"model={MODEL},chassis_serial={self.serial},callsign=SDRSIM,"
                                   f"name=flex-sim,software_ver={VERSION},ip={self.ip}")
         elif c == "mic list":
             self.reply(conn, seq, "MIC,LINE")
@@ -531,12 +541,12 @@ class Emu:
 
     def emit_pan_status(self, conn):
         self.status(conn,
-            f"display pan 0x{PAN_ID:08X} client_handle=0x{HANDLE_HEX} waterfall=0x{WF_ID:08X} "
+            f"display pan 0x{self.pan_id:08X} client_handle=0x{self.handle_hex} waterfall=0x{self.wf_id:08X} "
             f"center={self.center_mhz:.6f} bandwidth={self.span_mhz:.6f} min_dbm={self.min_dbm:.0f} "
             f"max_dbm={self.max_dbm:.0f} x_pixels={self.bins} y_pixels={self.y_pixels} fps={self.fps} "
             f"ant_list=ANT1 rxant=ANT1")
         self.status(conn,
-            f"display waterfall 0x{WF_ID:08X} client_handle=0x{HANDLE_HEX} panadapter=0x{PAN_ID:08X} "
+            f"display waterfall 0x{self.wf_id:08X} client_handle=0x{self.handle_hex} panadapter=0x{self.pan_id:08X} "
             f"line_duration=100 center={self.center_mhz:.6f} bandwidth={self.span_mhz:.6f} "
             f"auto_black=1 black_level=15 color_gain=50")
         log("[->] emitted display pan + waterfall status")
@@ -545,7 +555,7 @@ class Emu:
             threading.Thread(target=self.stream_loop, daemon=True).start()
 
     def emit_slice_status(self, conn):
-        self.status(conn, f"slice 0 client_handle=0x{HANDLE_HEX} pan=0x{PAN_ID:08X} "
+        self.status(conn, f"slice 0 client_handle=0x{self.handle_hex} pan=0x{self.pan_id:08X} "
                           f"RF_frequency={self.slice_freq:.6f} mode={self.slice_mode} in_use=1 active=1")
 
     def emit_meter_status(self, conn):
@@ -572,7 +582,7 @@ class Emu:
         try:
             self.status(self.conn,
                 f"interlock state={'TRANSMITTING' if on else 'READY'} source=SW "
-                f"tx_client_handle=0x{HANDLE_HEX}")
+                f"tx_client_handle=0x{self.handle_hex}")
             self.status(self.conn,
                 f"transmit mox={1 if self.tx_mox else 0} tune={1 if self.tx_tune else 0} "
                 f"freq={self.slice_freq:.6f} rfpower={int(self.tx_power_w)} "
@@ -700,9 +710,9 @@ class Emu:
                 wf_ab = min(intens)                                     # measured noise-floor black level (raw)
                 #                                                        -> AE #3586 radio-auto-black path
                 try:
-                    s.sendto(fft_packet(fseq & 0xF, pixels, fi), dest); fseq += 1
-                    s.sendto(wf_packet(wseq & 0xF, intens, low_hz, binbw_hz, tc, auto_black=wf_ab), dest); wseq += 1
-                    s.sendto(meter_packet(mseq & 0xF, SLC_LEVEL_ID, vfo_dbm), dest); mseq += 1
+                    s.sendto(fft_packet(self.pan_id, fseq & 0xF, pixels, fi), dest); fseq += 1
+                    s.sendto(wf_packet(self.wf_id, wseq & 0xF, intens, low_hz, binbw_hz, tc, auto_black=wf_ab), dest); wseq += 1
+                    s.sendto(meter_packet(self.meter_sid, mseq & 0xF, SLC_LEVEL_ID, vfo_dbm), dest); mseq += 1
                 except OSError as e:
                     log("[stream] send error:", e); break
                 fi += 1
@@ -713,8 +723,8 @@ class Emu:
             sw = self.tx_swr if keyed else 1.0
             fwd_dbm = 10.0 * math.log10(max(pw, 1e-6)) + 30.0
             try:
-                s.sendto(meter_packet(mseq & 0xF, FWDPWR_ID, fwd_dbm), dest); mseq += 1
-                s.sendto(meter_packet(mseq & 0xF, SWR_ID, sw), dest); mseq += 1
+                s.sendto(meter_packet(self.meter_sid, mseq & 0xF, FWDPWR_ID, fwd_dbm), dest); mseq += 1
+                s.sendto(meter_packet(self.meter_sid, mseq & 0xF, SWR_ID, sw), dest); mseq += 1
             except OSError:
                 pass
             dt = period - (time.time() - now)
@@ -779,8 +789,8 @@ upd();
 </script></body></html>"""
 
 
-def start_control_server(emu, port):
-    opts = "".join(f'<option value="{p}"{" selected" if p == emu.pattern else ""}>{p}</option>'
+def start_control_server(radio, port):
+    opts = "".join(f'<option value="{p}"{" selected" if p == radio.pattern else ""}>{p}</option>'
                    for p in sorted(PATTERNS))
     page = CONTROL_HTML.format(options=opts).encode()
 
@@ -793,28 +803,28 @@ def start_control_server(emu, port):
             if u.path == "/set":
                 q = urllib.parse.parse_qs(u.query)
                 try:
-                    if "floor" in q:   emu.noise_floor_dbm = float(q["floor"][0])
-                    if "level" in q:   emu.sig_level_dbm = float(q["level"][0])
-                    if "width" in q:   emu.sig_width_khz = float(q["width"][0])
-                    if "tilt" in q:    emu.noise_color = float(q["tilt"][0])
-                    if "txpw" in q:    emu.tx_power_w = float(q["txpw"][0])
-                    if "swr" in q:     emu.tx_swr = float(q["swr"][0])
-                    if "qsk" in q:     emu.qsk = q["qsk"][0] == "1"
-                    if "tx" in q and emu.pattern not in AUTO_TX_PATTERNS and not emu.cwx_active:
+                    if "floor" in q:   radio.noise_floor_dbm = float(q["floor"][0])
+                    if "level" in q:   radio.sig_level_dbm = float(q["level"][0])
+                    if "width" in q:   radio.sig_width_khz = float(q["width"][0])
+                    if "tilt" in q:    radio.noise_color = float(q["tilt"][0])
+                    if "txpw" in q:    radio.tx_power_w = float(q["txpw"][0])
+                    if "swr" in q:     radio.tx_swr = float(q["swr"][0])
+                    if "qsk" in q:     radio.qsk = q["qsk"][0] == "1"
+                    if "tx" in q and radio.pattern not in AUTO_TX_PATTERNS and not radio.cwx_active:
                         newtx = q["tx"][0] == "1"
-                        if newtx != emu.tx_mox:
-                            emu.tx_mox = newtx
-                            emu.emit_transmit_status()
+                        if newtx != radio.tx_mox:
+                            radio.tx_mox = newtx
+                            radio.emit_transmit_status()
                             log(f"[ctl] TX {'ON' if newtx else 'off'} "
-                                f"({emu.tx_power_w:.0f} W, SWR {emu.tx_swr:.1f})")
-                    if "pattern" in q and q["pattern"][0] in PATTERNS and q["pattern"][0] != emu.pattern:
-                        leaving_auto = emu.pattern in AUTO_TX_PATTERNS
-                        emu.pattern = q["pattern"][0]
-                        if leaving_auto and emu.tx_mox:            # don't leave TX stuck on after a gap/over
-                            emu.tx_mox = False
-                            emu.emit_transmit_status()
-                        log(f"[ctl] pattern -> {emu.pattern}  (floor={emu.noise_floor_dbm:.0f}dBm "
-                            f"level={emu.sig_level_dbm:.0f}dBm width={emu.sig_width_khz:.0f} tilt={emu.noise_color:.0f})")
+                                f"({radio.tx_power_w:.0f} W, SWR {radio.tx_swr:.1f})")
+                    if "pattern" in q and q["pattern"][0] in PATTERNS and q["pattern"][0] != radio.pattern:
+                        leaving_auto = radio.pattern in AUTO_TX_PATTERNS
+                        radio.pattern = q["pattern"][0]
+                        if leaving_auto and radio.tx_mox:            # don't leave TX stuck on after a gap/over
+                            radio.tx_mox = False
+                            radio.emit_transmit_status()
+                        log(f"[ctl] pattern -> {radio.pattern}  (floor={radio.noise_floor_dbm:.0f}dBm "
+                            f"level={radio.sig_level_dbm:.0f}dBm width={radio.sig_width_khz:.0f} tilt={radio.noise_color:.0f})")
                 except ValueError:
                     pass
                 self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
@@ -845,18 +855,18 @@ def main():
     ap.add_argument("--ctl-port", type=int, default=8731, help="web control-panel port")
     args = ap.parse_args()
     ip = args.ip or local_ip()
-    emu = Emu(ip, args.ae, args.pattern, args.bins, args.fps, args.width_khz, port=args.port)
-    threading.Thread(target=emu.discovery_loop, daemon=True).start()
-    threading.Thread(target=emu.prime_loop, daemon=True).start()
-    start_control_server(emu, args.ctl_port)
-    log(f"flex-sim {FLEX_SIM_VERSION} - model={MODEL} serial={SERIAL} ip={ip} pattern={args.pattern}")
+    radio = Radio(ip, args.ae, args.pattern, args.bins, args.fps, args.width_khz, port=args.port)
+    threading.Thread(target=radio.discovery_loop, daemon=True).start()
+    threading.Thread(target=radio.prime_loop, daemon=True).start()
+    start_control_server(radio, args.ctl_port)
+    log(f"flex-sim {FLEX_SIM_VERSION} - model={MODEL} serial={radio.serial} ip={ip} pattern={args.pattern}")
     log(f"discovery -> AE's UDP :{DISCOVERY_PORT}; control/data on :{args.port}"
         + ("  (same-host mode)" if args.port != DISCOVERY_PORT else ""))
     log(f"** control panel: http://{ip}:{args.ctl_port}/  (open in your host browser) **")
     try:
-        emu.serve()
+        radio.serve()
     except KeyboardInterrupt:
-        emu.run = False
+        radio.run = False
         log("bye")
 
 
