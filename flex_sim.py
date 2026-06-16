@@ -571,12 +571,12 @@ class Radio:
     def emit_pan_status(self, conn):
         self.status(conn,
             f"display pan 0x{self.pan_id:08X} client_handle=0x{self.handle_hex} waterfall=0x{self.wf_id:08X} "
-            f"center={self.center_mhz:.6f} bandwidth={self.span_mhz:.6f} min_dbm={self.min_dbm:.0f} "
+            f"center={self.slice_freq:.6f} bandwidth={self.span_mhz:.6f} min_dbm={self.min_dbm:.0f} "
             f"max_dbm={self.max_dbm:.0f} x_pixels={self.bins} y_pixels={self.y_pixels} fps={self.fps} "
             f"ant_list=ANT1 rxant=ANT1")
         self.status(conn,
             f"display waterfall 0x{self.wf_id:08X} client_handle=0x{self.handle_hex} panadapter=0x{self.pan_id:08X} "
-            f"line_duration=100 center={self.center_mhz:.6f} bandwidth={self.span_mhz:.6f} "
+            f"line_duration=100 center={self.slice_freq:.6f} bandwidth={self.span_mhz:.6f} "
             f"auto_black=1 black_level=15 color_gain=50")
         log("[->] emitted display pan + waterfall status")
         if not self.streaming:
@@ -734,7 +734,9 @@ class Radio:
             if levels is not None and tc != last_tc:               # one pan/wf row per waterfall tick
                 pixels = [self.dbm_to_pixel(d) for d in levels]     # (loop may run at 50 fps for CW keying;
                 intens = [self.dbm_to_wf_raw(d) for d in levels]    #  don't flood AE with 50 fps of big FFT/wf)
-                low_hz = (self.center_mhz - self.span_mhz / 2) * 1e6   # track AE's live view
+                low_hz = (self.slice_freq - self.span_mhz / 2) * 1e6   # centre the window on the VFO/slice
+                #                                                        (AE draws the pan on the slice, not on
+                #                                                        the center= it sometimes commands)
                 vfo_dbm = levels[ctx.center]                            # S-meter = level at the VFO
                 self.last_vfo_dbm = vfo_dbm                             # feed the rack strip's meter
                 wf_ab = min(intens)                                     # measured noise-floor black level (raw)
