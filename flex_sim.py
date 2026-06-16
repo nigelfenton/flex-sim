@@ -72,8 +72,9 @@ MODELS = {                       # model -> caps; slice count drives the multi-s
 CENTER_MHZ, SPAN_MHZ, BINS, FPS = 14.100, 0.250, 1024, 20
 PCC_FFT, PCC_WF, PCC_METER = 0x8003, 0x8004, 0x8002
 METER_SID = 0x46000000       # meter VITA stream id (AE routes meters by PCC, not by sid)
-SLC_LEVEL_ID = 1             # meter index for the slice S-meter (src=SLC nam=LEVEL unit=dBm)
+SLC_LEVEL_ID = 1             # (legacy) single-slice S-meter id; superseded by SLICE_METER_BASE+index
 FWDPWR_ID, SWR_ID = 2, 3     # TX meters: forward power (src=TX nam=FWDPWR, dBm->W) + SWR
+SLICE_METER_BASE = 10        # per-slice S-meter: slice k -> meter id SLICE_METER_BASE+k (def num=k)
 
 # pattern timing/shape defaults (seconds / counts)
 RAMP_PERIOD = 10.0
@@ -375,8 +376,10 @@ class Radio:
         self.serial = f"FLEXSIM{radio_id:02d}"
         self.client_handle = HANDLE + radio_id   # NB: NOT self.handle — that's the method!
         self.handle_hex = f"{self.client_handle:08X}"
-        self.pan_id = PAN_ID + radio_id          # FFT stream id (PCC 0x8003)
-        self.wf_id = WF_ID + radio_id            # waterfall stream id (PCC 0x8004)
+        self.pan_id = PAN_ID + radio_id * 16     # FFT stream-id BASE; AE stacks a panadapter per +RX,
+        self.wf_id = WF_ID + radio_id * 16       # waterfall base. pan k -> base+k (16 ids/radio, no overlap)
+        self.pans = {}                           # pan_id -> {"wf_id":int,"slice":global_idx|None,"y_pixels":int}
+        self.pan_seq = 0                          # next panadapter index for this radio
         self.meter_sid = METER_SID + radio_id    # meter VITA stream id (PCC 0x8002)
         self.pattern = pattern if pattern in PATTERNS else "ramp"
         self.bins, self.fps = bins, fps
@@ -391,8 +394,10 @@ class Radio:
         self.ae_peer_ip = None          # only accept the UDP prime from the connected AE
         self.y_pixels, self.min_dbm, self.max_dbm = 700, -130.0, -20.0
         self.center_mhz, self.span_mhz = CENTER_MHZ, SPAN_MHZ   # track AE's actual pan view
-        self.slice_freq = CENTER_MHZ                            # follows AE's slice-create freq (= VFO)
+        self.slice_freq = CENTER_MHZ                            # active slice freq (= VFO); mirrors slices[active]
         self.slice_mode = "USB"
+        self.slices = {}            # index -> {"freq":MHz,"mode":str,"active":bool}; AE adds via +RX (slice create)
+        self.active_slice = 0       # the slice the pan/waterfall/primary carrier follow
         self.conn = None            # active TCP conn (so the control panel can push TX status)
         self.tx_mox = False         # live: TX keyed (panel toggle or AE's 'transmit set mox=1')
         self.tx_tune = False
@@ -430,7 +435,8 @@ class Radio:
                 "on": self.enabled, "connected": self.conn is not None,
                 "freq": round(self.slice_freq, 5), "mode": self.slice_mode, "tx": self.tx_on,
                 "pattern": self.pattern, "power_w": round(self.tx_power_w),
-                "meter_dbm": round(self.last_vfo_dbm, 1)}
+                "meter_dbm": round(self.last_vfo_dbm, 1),
+                "slices": len(self.slices), "max_slices": self.max_slices}
 
     def dbm_to_pixel(self, dbm):
         p = (self.max_dbm - dbm) / (self.max_dbm - self.min_dbm) * (self.y_pixels - 1)
@@ -448,6 +454,7 @@ class Radio:
             if self.enabled:                       # "powered off" -> stop advertising
                 msg = (f"name=flex-sim model={self.model} serial={self.serial} version={VERSION} "
                        f"ip={self.ip} port={self.port} status=Available mf_enable=1 "
+                       f"slices={self.max_slices} pans={self.max_slices} "   # capacity -> AE enables +RX
                        f"max_licensed_version=3").encode()   # rebuilt each tick -> live model change propagates
                 for d in dests:
                     try: s.sendto(msg, d)
@@ -496,9 +503,9 @@ class Radio:
                 line = line.decode(errors="replace").strip()
                 if line: self.on_line(conn, line)
 
-    def reply(self, conn, seq, body=""):
+    def reply(self, conn, seq, body="", code=0):
         with self.send_lock:
-            conn.sendall(f"R{seq}|0|{body}\n".encode())
+            conn.sendall(f"R{seq}|{code:X}|{body}\n".encode())
 
     def status(self, conn, obj_kvs):
         with self.send_lock:
@@ -515,19 +522,39 @@ class Radio:
         elif c == "slice list":
             self.reply(conn, seq, "")
         elif c.startswith("display panafall create") or c.startswith("display pan create"):
-            self.reply(conn, seq, f"0x{self.pan_id:08X},0x{self.wf_id:08X}")
-            self.emit_pan_status(conn)
+            pid = self._new_pan()                          # AE's +RX = a NEW stacked panadapter
+            self.reply(conn, seq, f"0x{pid:08X},0x{self.pans[pid]['wf_id']:08X}")
+            self.emit_pan_status(conn, pid)
+        elif c.startswith("display pan remove") or c.startswith("display panafall remove"):
+            self.reply(conn, seq)
+            for t in c.split():
+                if t.lower().startswith("0x"):
+                    pid = int(t, 16)
+                    if self.pans.pop(pid, None):           # stop streaming the removed panadapter
+                        for g, sl in list(self.slices.items()):
+                            if sl.get("pan") == pid: self.slices.pop(g, None)
+                        log(f"[pan] remove -> 0x{pid:08X}  ({len(self.pans)} left)")
+                    break
         elif c.startswith("slice create"):
             kvs = parse_kvs(c)
-            if "freq" in kvs:                              # follow AE's freq -> drives VFO + pan center
-                self.slice_freq = float(kvs["freq"])
-                self.center_mhz = self.slice_freq
-            if "mode" in kvs:
-                self.slice_mode = kvs["mode"]
-            self.reply(conn, seq, "0")
-            self.emit_slice_status(conn)
-            self.emit_meter_status(conn)                   # define the slice S-meter (SLC/LEVEL)
-            self.emit_pan_status(conn)                     # re-center pan + waterfall on the slice
+            idx = self._next_slice_index()
+            if idx is None:                                # model's slice budget exhausted
+                self.reply(conn, seq, code=0x50000000)     # -> AE: "No available slices"
+                log(f"[slice] create refused: all {self.max_slices} slices in use")
+                return
+            pid = self._pan_from_kvs(kvs)                  # the panadapter this receiver lands on
+            freq = float(kvs["freq"]) if "freq" in kvs else self.slice_freq
+            mode = kvs.get("mode", self.slice_mode)
+            for s in self.slices.values(): s["active"] = False
+            self.slices[idx] = {"freq": freq, "mode": mode, "active": True, "pan": pid}
+            self.pans[pid]["slice"] = idx
+            self.active_slice = idx
+            self._sync_active_slice()                      # mirror active slice -> slice_freq/mode + pan centre
+            self.reply(conn, seq, str(idx))
+            log(f"[slice] create -> slice {idx} @ {freq:.5f} {mode} on pan 0x{pid:08X}  ({len(self.slices)}/{self.max_slices})")
+            self.emit_slice_status(conn, idx)
+            self.emit_meter_status(conn)                   # (re)define S-meters incl. the new slice
+            self.emit_pan_status(conn, pid)                # centre this pan/waterfall on its slice
         elif c.startswith("display pan set"):
             kvs = parse_kvs(c)
             if "ypixels" in kvs: self.y_pixels = max(2, int(kvs["ypixels"]))
@@ -537,6 +564,9 @@ class Radio:
             if "center" in kvs: self.center_mhz = float(kvs["center"])      # align waterfall to AE's view
             if "bandwidth" in kvs: self.span_mhz = float(kvs["bandwidth"])
             self.reply(conn, seq)
+        elif c == "sub radio all":
+            self.reply(conn, seq)
+            self.emit_radio_status(conn)                   # slice/pan capability -> AE enables +RX
         elif c.startswith("info"):
             self.reply(conn, seq, f"model={self.model},chassis_serial={self.serial},callsign=SDRSIM,"
                                   f"name=flex-sim,software_ver={VERSION},ip={self.ip}")
@@ -557,50 +587,132 @@ class Radio:
         elif c.startswith("cwx "):                          # AE's CW text keyer
             self.handle_cwx(c)
             self.reply(conn, seq)
+        elif c.startswith("slice remove"):
+            idx = self._slice_index_from(c)
+            gone = self.slices.pop(idx, None)
+            if gone:                                       # free its panadapter slot too
+                self.pans.pop(gone.get("pan"), None)
+            self.reply(conn, seq)
+            self.status(conn, f"slice {idx} in_use=0")
+            log(f"[slice] remove -> slice {idx}  ({len(self.slices)}/{self.max_slices})")
+            if idx == self.active_slice and self.slices:
+                self.active_slice = next(iter(self.slices))
+            self._sync_active_slice()
+            self.emit_meter_status(conn)                   # drop the removed slice's S-meter def
         elif c.startswith("slice set") or c.startswith("slice tune"):
             kvs = parse_kvs(c)
-            if "mode" in kvs: self.slice_mode = kvs["mode"]
+            idx = self._slice_index_from(c)
+            sl = self.slices.setdefault(idx, {"freq": self.slice_freq, "mode": self.slice_mode,
+                                              "active": False, "pan": self._primary_pan()})
+            if "mode" in kvs: sl["mode"] = kvs["mode"]
             for k in ("RF_frequency", "freq"):
-                if k in kvs:
-                    self.slice_freq = float(kvs[k]); self.center_mhz = self.slice_freq
+                if k in kvs: sl["freq"] = float(kvs[k])
+            if c.startswith("slice tune"):                 # "slice tune <idx> <freq>" (positional)
+                parts = c.split()
+                if len(parts) >= 4:
+                    try: sl["freq"] = float(parts[3])
+                    except ValueError: pass
+            if kvs.get("active") == "1":
+                for s in self.slices.values(): s["active"] = False
+                sl["active"] = True
+                self.active_slice = idx
             self.reply(conn, seq)
-            self.emit_slice_status(conn)
+            self._sync_active_slice()
+            self.emit_slice_status(conn, idx)
         else:
             self.reply(conn, seq)
 
-    def emit_pan_status(self, conn):
+    def emit_pan_status(self, conn, pid=None):
+        if pid is None: pid = self._primary_pan()
+        pan = self.pans.get(pid)
+        if not pan: return
+        wid, cfreq = pan["wf_id"], self._pan_center(pid)
         self.status(conn,
-            f"display pan 0x{self.pan_id:08X} client_handle=0x{self.handle_hex} waterfall=0x{self.wf_id:08X} "
-            f"center={self.slice_freq:.6f} bandwidth={self.span_mhz:.6f} min_dbm={self.min_dbm:.0f} "
+            f"display pan 0x{pid:08X} client_handle=0x{self.handle_hex} waterfall=0x{wid:08X} "
+            f"center={cfreq:.6f} bandwidth={self.span_mhz:.6f} min_dbm={self.min_dbm:.0f} "
             f"max_dbm={self.max_dbm:.0f} x_pixels={self.bins} y_pixels={self.y_pixels} fps={self.fps} "
             f"ant_list=ANT1 rxant=ANT1")
         self.status(conn,
-            f"display waterfall 0x{self.wf_id:08X} client_handle=0x{self.handle_hex} panadapter=0x{self.pan_id:08X} "
-            f"line_duration=100 center={self.slice_freq:.6f} bandwidth={self.span_mhz:.6f} "
+            f"display waterfall 0x{wid:08X} client_handle=0x{self.handle_hex} panadapter=0x{pid:08X} "
+            f"line_duration=100 center={cfreq:.6f} bandwidth={self.span_mhz:.6f} "
             f"auto_black=1 black_level=15 color_gain=50")
-        log("[->] emitted display pan + waterfall status")
+        log(f"[->] pan 0x{pid:08X} / wf 0x{wid:08X} status @ {cfreq:.5f}")
         if not self.streaming:
             self.streaming = True
             threading.Thread(target=self.stream_loop, daemon=True).start()
 
-    def emit_slice_status(self, conn):
-        self.status(conn, f"slice 0 client_handle=0x{self.handle_hex} pan=0x{self.pan_id:08X} "
-                          f"RF_frequency={self.slice_freq:.6f} mode={self.slice_mode} in_use=1 active=1")
+    def _new_pan(self):
+        pid, wid = self.pan_id + self.pan_seq, self.wf_id + self.pan_seq
+        self.pan_seq += 1
+        self.pans[pid] = {"wf_id": wid, "slice": None, "y_pixels": self.y_pixels}
+        log(f"[pan] create -> 0x{pid:08X}/0x{wid:08X}  ({len(self.pans)} panadapter(s))")
+        return pid
+
+    def _primary_pan(self):
+        return next(iter(self.pans)) if self.pans else self._new_pan()
+
+    def _pan_center(self, pid):                            # a pan is centred on its slice's freq
+        pan = self.pans.get(pid)
+        if pan and pan["slice"] in self.slices:
+            return self.slices[pan["slice"]]["freq"]
+        return self.slice_freq
+
+    def _pan_from_kvs(self, kvs):                          # resolve "pan=0x...." to one of our panadapters
+        if "pan" in kvs:
+            try:
+                pid = int(str(kvs["pan"]).lower().replace("0x", ""), 16)
+                if pid in self.pans: return pid
+            except ValueError: pass
+        return self._primary_pan()
+
+    def _next_slice_index(self):
+        for k in range(self.max_slices):
+            if k not in self.slices: return k
+        return None                                        # budget exhausted
+
+    def _slice_index_from(self, c):
+        for t in c.split()[2:]:                            # after "slice set"/"slice tune"/"slice remove"
+            if t.isdigit(): return int(t)
+        return self.active_slice
+
+    def _sync_active_slice(self):
+        sl = self.slices.get(self.active_slice)
+        if sl:
+            self.slice_freq, self.slice_mode = sl["freq"], sl["mode"]
+            self.center_mhz = self.slice_freq              # active slice drives the pan/waterfall centre
+
+    def emit_slice_status(self, conn, idx=None):
+        if idx is None: idx = self.active_slice
+        sl = self.slices.get(idx)
+        if not sl: return
+        pid = sl.get("pan") or self._primary_pan()
+        self.status(conn, f"slice {idx} client_handle=0x{self.handle_hex} pan=0x{pid:08X} "
+                          f"RF_frequency={sl['freq']:.6f} mode={sl['mode']} in_use=1 "
+                          f"active={1 if sl['active'] else 0}")
+
+    def emit_radio_status(self, conn):
+        # Capability advert. AE computes MaxSlices/SlicesRemaining from the radio status;
+        # without it SlicesRemaining stays 0 and +RX is greyed. slices/max_slices = the model
+        # cap; AE stacks one panadapter per receiver, so panadapters tracks the same cap.
+        self.status(conn, f"radio slices={self.max_slices} max_slices={self.max_slices} "
+                          f"panadapters={self.max_slices} "
+                          f"lineout_gain=50 lineout_mute=0 headphone_gain=50 headphone_mute=0 "
+                          f"callsign=SDRSIM nickname=flex-sim")
+        log(f"[->] emitted radio status: slices/panadapters={self.max_slices}")
 
     def emit_meter_status(self, conn):
         # Define the radio's meters. NB: meter status is '#'-separated
         # index.key=value tokens after "meter " (NOT space-separated, and NO
         # leading "meter N") -- RadioModel::handleMeterStatus.
-        defs = [
-            (SLC_LEVEL_ID, "SLC", "LEVEL",  "dBm", -150.0, 20.0),   # RX S-meter
-            (FWDPWR_ID,    "TX",  "FWDPWR", "dBm",    0.0, 60.0),   # TX fwd power (dBm -> W)
-            (SWR_ID,       "TX",  "SWR",    "SWR",    1.0, 10.0),   # TX SWR
-        ]
-        for i, src, nam, unit, lo, hi in defs:
-            toks = "#".join([f"{i}.src={src}", f"{i}.num=0", f"{i}.nam={nam}",
+        defs = [(FWDPWR_ID, 0, "TX", "FWDPWR", "dBm", 0.0, 60.0),    # TX fwd power (dBm -> W)
+                (SWR_ID,    0, "TX", "SWR",    "SWR", 1.0, 10.0)]    # TX SWR
+        for k in (sorted(self.slices) or [0]):                       # one S-meter per slice (num = slice index)
+            defs.append((SLICE_METER_BASE + k, k, "SLC", "LEVEL", "dBm", -150.0, 20.0))
+        for i, num, src, nam, unit, lo, hi in defs:
+            toks = "#".join([f"{i}.src={src}", f"{i}.num={num}", f"{i}.nam={nam}",
                              f"{i}.unit={unit}", f"{i}.low={lo}", f"{i}.hi={hi}"])
             self.status(conn, f"meter {toks}")
-        log("[->] emitted meter defs: SLC/LEVEL (S-meter) + TX/FWDPWR + TX/SWR")
+        log(f"[->] emitted meter defs: {len(self.slices) or 1} S-meter(s) + TX FWDPWR/SWR")
 
     def emit_transmit_status(self):
         # interlock state drives AE's m_radioTransmitting; transmit status drives
@@ -732,19 +844,17 @@ class Radio:
                     self.emit_transmit_status()
                 keyed = ctx.cw_keydown if self.pattern == "cw" else self.tx_on
             if levels is not None and tc != last_tc:               # one pan/wf row per waterfall tick
-                pixels = [self.dbm_to_pixel(d) for d in levels]     # (loop may run at 50 fps for CW keying;
-                intens = [self.dbm_to_wf_raw(d) for d in levels]    #  don't flood AE with 50 fps of big FFT/wf)
-                low_hz = (self.slice_freq - self.span_mhz / 2) * 1e6   # centre the window on the VFO/slice
-                #                                                        (AE draws the pan on the slice, not on
-                #                                                        the center= it sometimes commands)
-                vfo_dbm = levels[ctx.center]                            # S-meter = level at the VFO
-                self.last_vfo_dbm = vfo_dbm                             # feed the rack strip's meter
-                wf_ab = min(intens)                                     # measured noise-floor black level (raw)
-                #                                                        -> AE #3586 radio-auto-black path
+                pixels = [self.dbm_to_pixel(d) for d in levels]     # generated once; each stacked panadapter
+                intens = [self.dbm_to_wf_raw(d) for d in levels]    # shows it, centred on ITS slice (low_hz).
+                wf_ab = min(intens)                                 # (loop may run 50 fps for CW; throttled to tc)
+                self.last_vfo_dbm = levels[ctx.center]              # active slice (pan centre) -> rack strip
                 try:
-                    s.sendto(fft_packet(self.pan_id, fseq & 0xF, pixels, fi), dest); fseq += 1
-                    s.sendto(wf_packet(self.wf_id, wseq & 0xF, intens, low_hz, binbw_hz, tc, auto_black=wf_ab), dest); wseq += 1
-                    s.sendto(meter_packet(self.meter_sid, mseq & 0xF, SLC_LEVEL_ID, vfo_dbm), dest); mseq += 1
+                    for pid, pan in list(self.pans.items()):        # AE stacks one panadapter per receiver
+                        low_hz = (self._pan_center(pid) - self.span_mhz / 2) * 1e6
+                        s.sendto(fft_packet(pid, fseq & 0xF, pixels, fi), dest); fseq += 1
+                        s.sendto(wf_packet(pan["wf_id"], wseq & 0xF, intens, low_hz, binbw_hz, tc, auto_black=wf_ab), dest); wseq += 1
+                    for g in list(self.slices):                     # per-slice S-meter (level at slice = pan centre)
+                        s.sendto(meter_packet(self.meter_sid, mseq & 0xF, SLICE_METER_BASE + g, levels[ctx.center]), dest); mseq += 1
                 except OSError as e:
                     log("[stream] send error:", e); break
                 fi += 1

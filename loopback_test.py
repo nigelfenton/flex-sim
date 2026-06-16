@@ -75,7 +75,8 @@ def main():
                 statuses.append(s)
         assert any("display pan 0x" in s and "waterfall=0x" in s for s in statuses), "no pan status"
         assert any("display waterfall 0x" in s for s in statuses), "no waterfall status"
-        assert any("|meter " in s and "1.nam=LEVEL" in s for s in statuses), "no SLC LEVEL meter def"
+        assert any("|meter " in s and "10.nam=LEVEL" in s for s in statuses), "no SLC LEVEL meter def"
+        #                                  ^ slice-0 S-meter = SLICE_METER_BASE+0 (per-slice meter ids)
 
         seen = {PCC_FFT: 0, PCC_WF: 0, PCC_METER: 0}
         fft_sample = meter_sample = None
@@ -98,7 +99,7 @@ def main():
         assert seen[PCC_FFT] > 0 and seen[PCC_WF] > 0 and seen[PCC_METER] > 0, ("no packets", seen)
 
         mid, mdbm = decode_meter(meter_sample)
-        assert mid == 1, ("meter id", mid)
+        assert mid == 10, ("meter id", mid)            # slice-0 S-meter (SLICE_METER_BASE+0)
         assert -160.0 < mdbm < 30.0, ("meter dBm out of range", mdbm)
         print(f"[{PATTERN}] S-meter (VFO) id={mid} -> {mdbm:.1f} dBm")
 
