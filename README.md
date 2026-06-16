@@ -61,9 +61,16 @@ pyinstaller --onefile --name flex-sim flex_sim.py
 
 ### Many radios at once (rack mode)
 ```bash
-python3 flex_sim.py --radios 8 --ae <AE-ip>     # 8 virtual radios in one process
+python3 flex_sim.py --radios 3 --models FLEX-6300,FLEX-6600,FLEX-6700 --ae <AE-ip>
 ```
-Runs N virtual radios (serials `FLEXSIM00…`, ports `base…base+N-1`) that AE discovers as separate rigs — a hardware-free multi-radio bench. The control panel becomes a **rack of 1U strips** (power · frequency · mode · RX/TX · test pattern · signal meter, per radio). `--base-port` sets the first port (default 4992; on one host each radio takes the next port up).
+Runs N independent virtual radios that AE discovers as separate rigs — a hardware-free multi-radio bench. Each radio gets its **own IP** (the `--ip` base, then `+1`, `+2`, …) on the same port `:4992` (like real radios), its own serial (`FLEXSIM00…`), and a model from `--models` (cycled; default all `FLEX-6600`). The control panel becomes a **rack of 1U strips** (power · frequency · mode · RX/TX · test pattern · signal meter, per radio).
+
+On **one host** the extra IPs must exist on the interface first (real rigs each have their own):
+```bash
+sudo ip addr add 172.17.189.199/20 dev eth0    # radio 2
+sudo ip addr add 172.17.189.200/20 dev eth0    # radio 3   (one per extra radio)
+```
+On a separate box per radio, just give each its real IP. Models differ in slice/SCU count (6300/6400 = 2 slices / 1 SCU, 6600 = 4 / 2, 6700 = 8 / 2) — so a mixed rack lets you test single-MCU vs multi-MCU side by side.
 
 ## Pointing AetherSDR at it
 With flex-sim running, AE should list it in the radio chooser (model `FLEX-6600`, serial `EMULATE01`) — select and connect. If it doesn't appear, confirm the networking rule above and that you passed `--ae <AE-ip>`.

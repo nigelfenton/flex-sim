@@ -63,6 +63,11 @@ HANDLE_HEX = f"{HANDLE:08X}"
 PAN_ID = 0x40000000          # FFT stream id   (PCC 0x8003)
 WF_ID  = 0x42000000          # waterfall id    (PCC 0x8004)
 SERIAL, MODEL, VERSION = "EMULATE01", "FLEX-6600", "3.3.28.0"
+MODELS = {                       # model -> caps; slice count drives the multi-slice axis later
+    "FLEX-6300": {"slices": 2, "scu": 1}, "FLEX-6400": {"slices": 2, "scu": 1},
+    "FLEX-6500": {"slices": 4, "scu": 1}, "FLEX-6600": {"slices": 4, "scu": 2},
+    "FLEX-6700": {"slices": 8, "scu": 2}, "FLEX-8600": {"slices": 8, "scu": 2},
+}
 
 CENTER_MHZ, SPAN_MHZ, BINS, FPS = 14.100, 0.250, 1024, 20
 PCC_FFT, PCC_WF, PCC_METER = 0x8003, 0x8004, 0x8002
@@ -358,9 +363,11 @@ AUTO_TX_PATTERNS = {"tx_blank", "cw"}     # patterns that drive TX state themsel
 
 class Radio:
     def __init__(self, ip, ae_ip, pattern="ramp", bins=BINS, fps=FPS, width_khz=SIGNAL_WIDTH_KHZ,
-                 port=DEFAULT_PORT, radio_id=0):
+                 port=DEFAULT_PORT, radio_id=0, model=MODEL):
         self.ip, self.ae_ip = ip, ae_ip
         self.port = port                # control/data port we bind + advertise (discovery dest stays 4992)
+        self.model = model if model in MODELS else MODEL
+        self.max_slices = MODELS.get(self.model, {}).get("slices", 4)   # advertised cap (multi-slice TODO)
         # Per-radio identity, so many radios can live in one process (the "rack").
         # Each value must be unique per radio or AE cross-wires them; derived from
         # radio_id off the base constants below.
@@ -419,10 +426,11 @@ class Radio:
 
     def state(self):
         # Snapshot for the rack strip (polled by the panel).
-        return {"id": self.radio_id, "serial": self.serial, "on": self.enabled,
-                "connected": self.conn is not None, "freq": round(self.slice_freq, 5),
-                "mode": self.slice_mode, "tx": self.tx_on, "pattern": self.pattern,
-                "power_w": round(self.tx_power_w), "meter_dbm": round(self.last_vfo_dbm, 1)}
+        return {"id": self.radio_id, "serial": self.serial, "model": self.model, "ip": self.ip,
+                "on": self.enabled, "connected": self.conn is not None,
+                "freq": round(self.slice_freq, 5), "mode": self.slice_mode, "tx": self.tx_on,
+                "pattern": self.pattern, "power_w": round(self.tx_power_w),
+                "meter_dbm": round(self.last_vfo_dbm, 1)}
 
     def dbm_to_pixel(self, dbm):
         p = (self.max_dbm - dbm) / (self.max_dbm - self.min_dbm) * (self.y_pixels - 1)
@@ -435,7 +443,7 @@ class Radio:
     def discovery_loop(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        msg = (f"name=flex-sim model={MODEL} serial={self.serial} version={VERSION} "
+        msg = (f"name=flex-sim model={self.model} serial={self.serial} version={VERSION} "
                f"ip={self.ip} port={self.port} status=Available mf_enable=1 "
                f"max_licensed_version=3").encode()
         dests = [("255.255.255.255", DISCOVERY_PORT)] + ([(self.ae_ip, DISCOVERY_PORT)] if self.ae_ip else [])
@@ -449,7 +457,7 @@ class Radio:
     def prime_loop(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("", self.port))
+        s.bind((self.ip, self.port))
         while self.run:
             try:
                 data, addr = s.recvfrom(2048)
@@ -462,7 +470,7 @@ class Radio:
     def serve(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("", self.port)); srv.listen(1)
+        srv.bind((self.ip, self.port)); srv.listen(1)   # bind our own IP (rack: each radio a distinct IP)
         log(f"[tcp] listening on :{self.port}  (radio ip {self.ip}, pattern={self.pattern})")
         while self.run:
             conn, addr = srv.accept()
@@ -530,7 +538,7 @@ class Radio:
             if "bandwidth" in kvs: self.span_mhz = float(kvs["bandwidth"])
             self.reply(conn, seq)
         elif c.startswith("info"):
-            self.reply(conn, seq, f"model={MODEL},chassis_serial={self.serial},callsign=SDRSIM,"
+            self.reply(conn, seq, f"model={self.model},chassis_serial={self.serial},callsign=SDRSIM,"
                                   f"name=flex-sim,software_ver={VERSION},ip={self.ip}")
         elif c == "mic list":
             self.reply(conn, seq, "MIC,LINE")
@@ -863,9 +871,16 @@ def start_control_server(radio, port):
 
 # ---- the rack: one process hosting N radios + a combined "1U strip" panel ----
 class Rack:
-    def __init__(self, ip, ae_ip, n, base_port, pattern, bins, fps, width_khz):
-        self.radios = [Radio(ip, ae_ip, pattern, bins, fps, width_khz,
-                             port=base_port + i, radio_id=i) for i in range(n)]
+    def __init__(self, ip, ae_ip, n, base_port, pattern, bins, fps, width_khz, models=None):
+        prefix, last = ip.rsplit(".", 1)                  # each radio gets its own IP (like real rigs):
+        base_last = int(last)                             # base, base+1, ... on the same port (default 4992)
+        models = models or []
+        self.radios = []
+        for i in range(n):
+            rip = f"{prefix}.{base_last + i}"
+            mdl = models[i % len(models)] if models else MODEL
+            self.radios.append(Radio(rip, ae_ip, pattern, bins, fps, width_khz,
+                                     port=base_port, radio_id=i, model=mdl))
 
     def start(self):
         for r in self.radios:
@@ -934,7 +949,7 @@ def start_rack_control_server(rack, port):
         return (f'<div class=strip id=strip-{i}>'
                 f'<button class=pwr id=pwr-{i} title=power '
                 f'onclick="pwr({i},this.classList.contains(\'off\'))">&#9211;</button>'
-                f'<span class=rid><b>R{i + 1}</b><span>{r.serial}</span></span>'
+                f'<span class=rid title="{r.serial} @ {r.ip}:{r.port}"><b>R{i + 1}</b><span>{r.model}</span></span>'
                 f'<span class=lcd id=lcd-{i}>&mdash;.&mdash;&mdash;&mdash;.&mdash;&mdash;&mdash;</span>'
                 f'<span class=mode id=mode-{i}>&mdash;</span>'
                 f'<span class="pill off" id=state-{i}>off</span>'
@@ -995,18 +1010,21 @@ def main():
     ap.add_argument("--radios", type=int, default=1,
                     help="number of virtual radios in one process (>1 = rack mode)")
     ap.add_argument("--base-port", type=int, default=None,
-                    help="rack: first radio's port; radios use base..base+N-1 (default = --port)")
+                    help="rack: port for the radios (each gets its own IP, so they share a port; default = --port)")
+    ap.add_argument("--models", default=None,
+                    help="rack: comma-list of models per radio, e.g. FLEX-6300,FLEX-6600,FLEX-6700")
     ap.add_argument("--ctl-port", type=int, default=8731, help="web control-panel port")
     args = ap.parse_args()
     ip = args.ip or local_ip()
     if args.radios > 1:                                    # ---- rack mode: N radios + strip panel ----
         base = args.base_port or args.port
-        rack = Rack(ip, args.ae, args.radios, base, args.pattern, args.bins, args.fps, args.width_khz)
+        models = [m.strip() for m in args.models.split(",")] if args.models else None
+        rack = Rack(ip, args.ae, args.radios, base, args.pattern, args.bins, args.fps, args.width_khz, models=models)
         rack.start()
         start_rack_control_server(rack, args.ctl_port)
-        log(f"flex-sim {FLEX_SIM_VERSION} - RACK of {args.radios} radios "
-            f"(FLEXSIM00..FLEXSIM{args.radios - 1:02d}, ports {base}..{base + args.radios - 1}) ip {ip}")
-        log(f"discovery -> AE's UDP :{DISCOVERY_PORT}")
+        log(f"flex-sim {FLEX_SIM_VERSION} - RACK of {args.radios} radios on :{base}")
+        for r in rack.radios:
+            log(f"   R{r.radio_id + 1}  {r.serial}  {r.model}  {r.ip}:{r.port}")
         log(f"** rack panel: http://{ip}:{args.ctl_port}/  (open in your host browser) **")
         try:
             while True:
