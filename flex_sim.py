@@ -443,12 +443,12 @@ class Radio:
     def discovery_loop(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        msg = (f"name=flex-sim model={self.model} serial={self.serial} version={VERSION} "
-               f"ip={self.ip} port={self.port} status=Available mf_enable=1 "
-               f"max_licensed_version=3").encode()
         dests = [("255.255.255.255", DISCOVERY_PORT)] + ([(self.ae_ip, DISCOVERY_PORT)] if self.ae_ip else [])
         while self.run:
             if self.enabled:                       # "powered off" -> stop advertising
+                msg = (f"name=flex-sim model={self.model} serial={self.serial} version={VERSION} "
+                       f"ip={self.ip} port={self.port} status=Available mf_enable=1 "
+                       f"max_licensed_version=3").encode()   # rebuilt each tick -> live model change propagates
                 for d in dests:
                     try: s.sendto(msg, d)
                     except OSError: pass
@@ -905,7 +905,8 @@ h2{{color:#5cf;margin:0 0 2px}} .sub{{color:#6b7480;font-size:13px;margin-bottom
 .pill.rx{{color:#4ade80;background:#123a1e;border:1px solid #1f6b35}}
 .pill.tx{{color:#f87171;background:#3a1212;border:1px solid #6b1f1f}}
 .pill.off{{color:#5a616b;background:#1e232a}}
-select{{width:126px;font-size:12px;color:#cfe0f0;background:#232a33;border:1px solid #38414d;border-radius:5px;padding:4px 6px}}
+select{{width:116px;font-size:12px;color:#cfe0f0;background:#232a33;border:1px solid #38414d;border-radius:5px;padding:4px 6px}}
+.mdl{{width:104px;font-size:11px}}
 .met{{flex:1;display:flex;align-items:center;gap:6px}}
 .bar{{flex:1;height:10px;background:#0c0e12;border-radius:3px;overflow:hidden}}
 .fill{{height:100%;width:0;background:#2faf5a}}
@@ -917,6 +918,7 @@ select{{width:126px;font-size:12px;color:#cfe0f0;background:#232a33;border:1px s
 function fmtFreq(m){{var hz=Math.round(m*1e6),s=String(hz).padStart(7,'0');
 return (s.slice(0,-6)||'0')+'.'+s.slice(-6,-3)+'.'+s.slice(-3);}}
 function setp(i,p){{fetch('/set?radio='+i+'&pattern='+p);}}
+function setm(i,m){{fetch('/set?radio='+i+'&model='+m);}}
 function pwr(i,on){{fetch('/set?radio='+i+'&power='+(on?1:0));}}
 function S(d){{return d>=-73?('S9+'+Math.round(d+73)):('S'+Math.max(0,Math.round(9+(d+73)/6)));}}
 async function poll(){{
@@ -924,14 +926,17 @@ async function poll(){{
   var g=function(p){{return document.getElementById(p+'-'+s.id);}};
   g('strip').className='strip'+(s.on?'':' off');
   g('pwr').className='pwr'+(s.on?'':' off');
-  g('lcd').textContent=s.on?fmtFreq(s.freq):'—.———.———';
-  g('mode').textContent=s.on?s.mode:'—';
+  var live=s.on&&s.connected;
+  g('lcd').textContent=live?fmtFreq(s.freq):'—.———.———';
+  g('mode').textContent=live?s.mode:'—';
+  var md=g('mdl'); if(md&&md.value!==s.model)md.value=s.model;
   var pl=g('state');
   if(!s.on){{pl.textContent='off';pl.className='pill off';}}
+  else if(!s.connected){{pl.textContent='idle';pl.className='pill off';}}
   else if(s.tx){{pl.textContent='TX';pl.className='pill tx';}}
   else{{pl.textContent='RX';pl.className='pill rx';}}
   var f=g('fill'),l=g('mlbl');
-  if(!s.on){{f.style.width='0';l.textContent='—';}}
+  if(!live){{f.style.width='0';l.textContent='—';}}
   else if(s.tx){{f.style.width=Math.min(100,s.power_w)+'%';f.style.background='#e0892a';l.textContent=s.power_w+'W';}}
   else{{f.style.width=Math.max(0,Math.min(100,(s.meter_dbm+130)/1.1))+'%';f.style.background='#2faf5a';l.textContent=S(s.meter_dbm);}}
  }});}}catch(e){{}}
@@ -945,11 +950,13 @@ def start_rack_control_server(rack, port):
     def strip(r):
         opts = "".join(f'<option{" selected" if p == r.pattern else ""}>{p}</option>'
                        for p in sorted(PATTERNS))
+        mopts = "".join(f'<option{" selected" if m == r.model else ""}>{m}</option>' for m in MODELS)
         i = r.radio_id
         return (f'<div class=strip id=strip-{i}>'
                 f'<button class=pwr id=pwr-{i} title=power '
                 f'onclick="pwr({i},this.classList.contains(\'off\'))">&#9211;</button>'
-                f'<span class=rid title="{r.serial} @ {r.ip}:{r.port}"><b>R{i + 1}</b><span>{r.model}</span></span>'
+                f'<span class=rid title="{r.serial}"><b>R{i + 1}</b><span>{r.ip}</span></span>'
+                f'<select class=mdl id=mdl-{i} onchange="setm({i},this.value)">{mopts}</select>'
                 f'<span class=lcd id=lcd-{i}>&mdash;.&mdash;&mdash;&mdash;.&mdash;&mdash;&mdash;</span>'
                 f'<span class=mode id=mode-{i}>&mdash;</span>'
                 f'<span class="pill off" id=state-{i}>off</span>'
@@ -981,6 +988,14 @@ def start_rack_control_server(rack, port):
                         if leaving_auto and r.tx_mox:
                             r.tx_mox = False; r.emit_transmit_status()
                         log(f"[rack] R{r.radio_id + 1} pattern -> {r.pattern}")
+                    if "model" in q and q["model"][0] in MODELS and q["model"][0] != r.model:
+                        r.model = q["model"][0]
+                        r.max_slices = MODELS[r.model]["slices"]
+                        log(f"[rack] R{r.radio_id + 1} model -> {r.model} (re-discovering)")
+                        c = r.conn                         # drop -> AE re-discovers it as the new model
+                        if c:
+                            try: c.shutdown(socket.SHUT_RDWR); c.close()
+                            except OSError: pass
                 except (ValueError, IndexError):
                     pass
                 self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
