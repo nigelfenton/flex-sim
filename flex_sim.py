@@ -694,11 +694,13 @@ class Radio:
         # Capability advert. AE computes MaxSlices/SlicesRemaining from the radio status;
         # without it SlicesRemaining stays 0 and +RX is greyed. slices/max_slices = the model
         # cap; AE stacks one panadapter per receiver, so panadapters tracks the same cap.
-        self.status(conn, f"radio slices={self.max_slices} max_slices={self.max_slices} "
+        # slices = CURRENT in-use count (AE: free = max_slices - slices); max_slices = the cap.
+        # (Sending slices=max told AE "all slices used" -> it refused every new receiver.)
+        self.status(conn, f"radio slices={len(self.slices)} max_slices={self.max_slices} "
                           f"panadapters={self.max_slices} "
                           f"lineout_gain=50 lineout_mute=0 headphone_gain=50 headphone_mute=0 "
                           f"callsign=SDRSIM nickname=flex-sim")
-        log(f"[->] emitted radio status: slices/panadapters={self.max_slices}")
+        log(f"[->] radio status: slices(in-use)={len(self.slices)} max_slices={self.max_slices}")
 
     def emit_meter_status(self, conn):
         # Define the radio's meters. NB: meter status is '#'-separated
