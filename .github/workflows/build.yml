@@ -22,6 +22,8 @@ jobs:
         include:
           - os: ubuntu-latest
             asset: flex-sim-linux-x64
+          - os: ubuntu-24.04-arm        # free ARM Linux runner (public repos) -> Raspberry Pi etc.
+            asset: flex-sim-linux-arm64
           - os: windows-latest
             asset: flex-sim-windows-x64.exe
           - os: macos-latest

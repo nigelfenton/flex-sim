@@ -53,7 +53,7 @@ Also handles AE's own CWX keyer (cwx send/wpm/qsk_enabled) for authentic CW TX.
 """
 import argparse, http.server, json, math, random, socket, struct, threading, time, urllib.parse, uuid
 
-FLEX_SIM_VERSION = "0.1.0"
+FLEX_SIM_VERSION = "0.1.1"
 
 DISCOVERY_PORT = 4992        # AE always listens for discovery here (fixed); we broadcast TO it
 DEFAULT_PORT = 4992          # flex-sim's own control (TCP) + VITA-prime (UDP) port; override with --port
