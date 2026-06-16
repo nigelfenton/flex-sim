@@ -1,6 +1,9 @@
-# Builds single-file flex-sim executables for Linux / Windows / macOS.
-# NOTE: GitHub Actions only runs workflows from a repo's ROOT .github/ — this fires
-# once flex-sim lives in its own repository (it's a subdirectory for now).
+# Builds single-file flex-sim executables for Linux / Windows / macOS and
+# attaches them to a GitHub Release when you push a version tag (e.g. v0.1.0):
+#     git tag v0.1.0 && git push origin v0.1.0
+# A manual run (workflow_dispatch) instead uploads them as artifacts.
+# (GitHub Actions runs workflows from a repo's ROOT .github/, so this fires in
+# the standalone flex-sim repo — not the monorepo subdirectory it's mirrored from.)
 name: build
 
 on:
@@ -8,11 +11,21 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: write          # needed to create the Release + upload the binaries
+
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            asset: flex-sim-linux-x64
+          - os: windows-latest
+            asset: flex-sim-windows-x64.exe
+          - os: macos-latest
+            asset: flex-sim-macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -21,7 +34,22 @@ jobs:
           python-version: "3.12"
       - run: pip install pyinstaller
       - run: pyinstaller --onefile --name flex-sim flex_sim.py
-      - uses: actions/upload-artifact@v4
+      - name: Name the binary per-OS
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            mv dist/flex-sim.exe "dist/${{ matrix.asset }}"
+          else
+            mv dist/flex-sim "dist/${{ matrix.asset }}"
+          fi
+      - name: Attach to the Release (tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
         with:
-          name: flex-sim-${{ matrix.os }}
-          path: dist/*
+          files: dist/${{ matrix.asset }}
+      - name: Upload as artifact (manual run)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
