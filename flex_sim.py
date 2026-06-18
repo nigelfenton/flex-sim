@@ -47,6 +47,7 @@ Patterns (each is a test signal; the control panel explains what to look for):
   step          whole-span square wave in time (temporal response)
   impulse       brief full-span flash each period (transient response)
   staircase     center carrier stepping floor->max (colormap ladder)
+  test_card     17 carriers S1..S9 (1/2-S steps) on a steppable noise floor (auto-black)
   noise         random noise band, white->pink tilt
   tx_blank      periodic real TX gap -> repro #2126 / #1916
 Also handles AE's own CWX keyer (cwx send/wpm/qsk_enabled) for authentic CW TX.
@@ -266,6 +267,27 @@ def pat_carrier(ctx, t):
     return out
 
 
+def pat_test_card(ctx, t):
+    # Auto-black test card: 17 carriers evenly spaced across the band at FIXED
+    # levels S1..S9 in 1/2-S (3 dB) steps (S9 = -73 dBm, 6 dB per S-unit), on a
+    # flat noise floor at ctx.floor. The floor is the swept variable (noise-floor
+    # slider / /set?floor=): as it rises, carriers below it submerge, and because
+    # flex-sim advertises auto_black = ctx.floor the receiver's black point tracks
+    # the floor up with it. One pattern that shows the level->colour gradient,
+    # auto-black tracking, and signal/noise contrast (PR #3586 / sblanchard).
+    out = [ctx.floor] * ctx.n
+    s9 = -73.0
+    levels = [s9 - k * 3.0 for k in range(16, -1, -1)]   # -121 (S1) .. -73 (S9)
+    m = len(levels)
+    for i, dbm in enumerate(levels):
+        b = int((i + 0.5) / m * ctx.n)
+        for d in range(-ctx.sig_half, ctx.sig_half + 1):
+            bb = b + d
+            if 0 <= bb < ctx.n:
+                out[bb] = max(out[bb], dbm)
+    return out
+
+
 # ---- CW keyer (Morse) ----
 _MORSE = {
     "A": ".-", "B": "-...", "C": "-.-.", "D": "-..", "E": ".", "F": "..-.",
@@ -357,7 +379,7 @@ PATTERNS = {
     "noise_floor": pat_noise_floor, "ramp": pat_ramp, "cal_tones": pat_cal_tones,
     "swept_carrier": pat_swept_carrier, "comb": pat_comb, "step": pat_step,
     "impulse": pat_impulse, "tx_blank": pat_tx_blank, "staircase": pat_staircase,
-    "noise": pat_noise,
+    "noise": pat_noise, "test_card": pat_test_card,
 }
 AUTO_TX_PATTERNS = {"tx_blank", "cw"}     # patterns that drive TX state themselves
 
@@ -920,6 +942,7 @@ carrier:"Steady carrier on the VFO. S-meter should read the signal level (dBm / 
 cw:"20-wpm Morse 'CQ CQ CQ TST'. Power meter keys the rhythm; waterfall flickers during keying — watch it recover cleanly after the over (#1916).",
 noise_floor:"Flat, featureless noise floor (baseline). With AE auto-black on, the floor should sit even and dark (#3586).",
 ramp:"Whole-span level swept min→max. Watch auto-black hold the floor even as level rises (#3586) and the colour map track it.",
+test_card:"17 carriers S1→S9 (1/2-S steps) on a steppable noise floor. Raise the floor: weak carriers submerge and AE's black point tracks it — auto-black doing its job (<i>#3586</i>).",
 cal_tones:"Tones at -100/-80/-60/-40 dBm. Verify the panadapter dB scale reads each one correctly (calibration card).",
 swept_carrier:"Single tone sweeping the span. Check frequency mapping / waterfall tile decode (#3457).",
 comb:"Evenly-spaced tones across the span. Dynamic range / many simultaneous bins.",
@@ -931,7 +954,7 @@ noise:"Random noise band, white→pink tilt. Floor texture and colour mapping."
 }};
 function setp(p){{pat.value=p;upd();}}
 function sendcw(q){{qskv=q;pat.value='cw';upd();}}
-function upd(){{var h=HINTS[pat.value];if(h)hint.textContent=h;
+function upd(){{var h=HINTS[pat.value];if(h)hint.innerHTML=h;
 floorv.textContent=floor.value;levelv.textContent=level.value;
 floors.textContent=sLabel(+floor.value);levels.textContent=sLabel(+level.value);
 widthv.textContent=width.value;tiltv.textContent=tilt.value;
