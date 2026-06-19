@@ -102,6 +102,16 @@ WF_FLOOR_VAL, WF_PEAK_VAL = 70.0, 235.0   # AE int16/128 intensity for our [min_
                                           # + S-meter read the exact dBm regardless.)
 S9_DBM = -73.0                            # HF S-meter convention: S9 = -73 dBm, 6 dB per S-unit
 
+# remote_audio_rx VITA-49 constants (sourced from AetherSDR PanadapterStream.cpp)
+AUDIO_OUI  = 0x00001C2D   # FlexRadio Systems IEEE OUI
+AUDIO_ICC  = 0x534C       # FlexRadio information class code ("SL")
+AUDIO_PCC       = 0x03E3  # PCC_IF_NARROW:         float32 stereo @ 24 kHz (full BW)
+AUDIO_PCC_MONO  = 0x0123  # PCC_IF_NARROW_REDUCED: int16   mono   @ 24 kHz (reduced BW)
+AUDIO_FRAMES = 128        # frames per packet (stereo: 128×2 floats; mono: 128 int16)
+AUDIO_RATE   = 24000      # Hz
+AUDIO_INTERVAL = AUDIO_FRAMES / AUDIO_RATE   # ~5.333 ms / packet → ~187.5 Hz
+AUDIO_SID_BASE = 0x48000010  # base stream id for audio (per-radio: + radio_id)
+
 
 def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
@@ -153,6 +163,29 @@ def meter_packet(stream_id, seq, meter_id, dbm):
     raw = max(-32768, min(32767, int(round(dbm * 128.0))))
     payload = struct.pack(">Hh", meter_id, raw)
     return vita_header(stream_id, PCC_METER, seq, len(payload)) + payload
+
+
+def audio_packet(stream_id, seq, samples, reduced_bw=False):
+    """VITA-49 remote_audio_rx packet.
+    reduced_bw=False: PCC 0x03E3 — float32 stereo big-endian, 128 frames (1024 B payload).
+    reduced_bw=True:  PCC 0x0123 — int16   mono  big-endian, 128 samples (256 B payload).
+    AE selects the decoder by PCC; use reduced_bw to match what AE requested via
+    'client set send_reduced_bw_dax=1'. OUI/ICC sourced from AetherSDR PanadapterStream.cpp.
+    """
+    if reduced_bw:
+        pcc = AUDIO_PCC_MONO
+        raw = [max(-32767, min(32767, int(v * 32767))) for v in samples[:AUDIO_FRAMES]]
+        payload = struct.pack(f">{AUDIO_FRAMES}h", *raw)   # 256 bytes = 64 words
+    else:
+        pcc = AUDIO_PCC
+        payload = struct.pack(f">{AUDIO_FRAMES * 2}f", *samples)  # 1024 bytes = 256 words
+    total_words = 7 + len(payload) // 4
+    word0 = (0x3 << 28) | (1 << 27) | ((seq & 0xF) << 16) | total_words
+    header = struct.pack(">IIIIIII",
+                         word0, stream_id,
+                         AUDIO_OUI, (AUDIO_ICC << 16) | pcc,
+                         0, 0, 0)
+    return header + payload
 
 
 # ---- pattern engine: each pattern returns a per-bin dBm list (or None = TX gap) ----
@@ -443,6 +476,12 @@ class Radio:
         self.qsk = False             # full break-in (RX between elements); AE sets via cwx qsk_enabled
         self.enabled = True          # "power": when False, stop advertising (radio drops off AE)
         self.last_vfo_dbm = -130.0   # last level at the VFO — drives the rack strip's signal meter
+        # remote_audio_rx stream state
+        self.audio_stream_id = None
+        self.audio_stop = threading.Event()
+        self.audio_thread = None
+        self.audio_tone_hz = 440.0 + radio_id * 220.0  # distinct tone per radio (A4, C#5, …)
+        self.audio_reduced_bw = False  # set True when AE sends 'client set send_reduced_bw_dax=1'
 
     @property
     def tx_on(self):
@@ -515,7 +554,14 @@ class Radio:
             self.ae_peer_ip = addr[0]; self.vita_dest = None
             try: self.handle(conn)
             except Exception as e: log("[tcp] conn error:", e)
-            finally: conn.close(); self.streaming = False; self.ae_peer_ip = None; self.conn = None
+            finally:
+                conn.close()
+                self.streaming = False; self.ae_peer_ip = None; self.conn = None; self.vita_dest = None
+                self.audio_stop.set(); self.audio_stream_id = None
+                # Free this client's receivers/panadapters on disconnect, like a real radio.
+                # Without it, stale slices/pans pile up across reconnects and the slice
+                # lettering drifts (A -> B -> C on each new connection).
+                self.slices.clear(); self.pans.clear(); self.pan_seq = 0; self.active_slice = 0
 
     def handle(self, conn):
         self.conn = conn
@@ -549,6 +595,12 @@ class Radio:
         log("[<-]", f"C{seq}|{c}")
         if c.startswith("client gui"):
             self.reply(conn, seq, str(uuid.uuid4()).upper())
+        elif c.startswith("client set"):
+            if "send_reduced_bw_dax=1" in c:
+                self.audio_reduced_bw = True
+            elif "send_reduced_bw_dax=0" in c:
+                self.audio_reduced_bw = False
+            self.reply(conn, seq)
         elif c == "slice list":
             self.reply(conn, seq, "")
         elif c.startswith("display panafall create") or c.startswith("display pan create"):
@@ -638,7 +690,25 @@ class Radio:
             except ValueError: pass
             self.reply(conn, seq)
         elif c.startswith("stream create"):
-            self.reply(conn, seq, "0x48000000")
+            kvs = parse_kvs(c)
+            if kvs.get("type") == "remote_audio_rx":
+                sid = AUDIO_SID_BASE + self.radio_id
+                self.audio_stream_id = sid
+                self.reply(conn, seq, f"0x{sid:08X}")
+                if not (self.audio_thread and self.audio_thread.is_alive()):
+                    self.audio_stop.clear()
+                    self.audio_thread = threading.Thread(
+                        target=self.audio_loop, daemon=True, name=f"audio-{self.radio_id}")
+                    self.audio_thread.start()
+            else:
+                self.reply(conn, seq, "0x48000000")
+        elif c.startswith("stream remove"):
+            for tok in c.split():
+                if tok.lower().startswith("0x"):
+                    if int(tok, 16) == self.audio_stream_id:
+                        self.audio_stop.set()
+                        self.audio_stream_id = None
+            self.reply(conn, seq)
         elif c.startswith("transmit set"):                 # AE keys TX (MOX / TUNE)
             kvs = parse_kvs(c)
             if "mox" in kvs:  self.tx_mox = kvs["mox"] == "1"
@@ -647,6 +717,18 @@ class Radio:
             self.emit_transmit_status()
         elif c.startswith("cwx "):                          # AE's CW text keyer
             self.handle_cwx(c)
+            self.reply(conn, seq)
+        elif c.startswith("slice set"):
+            kvs = parse_kvs(c)
+            idx = self._slice_index_from(c)
+            if idx in self.slices:
+                if "audio_mute" in kvs:
+                    self.slices[idx]["muted"] = (kvs["audio_mute"] == "1")
+                    log(f"[slice] {idx} audio_mute={kvs['audio_mute']}")
+                if "mode" in kvs:
+                    self.slices[idx]["mode"] = kvs["mode"]
+                    if self.slices[idx].get("active"):
+                        self.slice_mode = kvs["mode"]
             self.reply(conn, seq)
         elif c.startswith("slice remove"):
             idx = self._slice_index_from(c)
@@ -865,6 +947,51 @@ class Radio:
             if 0 <= b < ctx.n:
                 out[b] = ctx.sig_level
         return out, keydown
+
+    def audio_loop(self):
+        """Send remote_audio_rx VITA-49 packets: float32 stereo, 128 frames @ 24 kHz.
+        One stream per radio (AE mixes all slices server-side). Emits a deterministic
+        sine tone so AE has a real audio path to mute/route — making audio-path bugs
+        (e.g. RADE slice not muting) observable without a real radio.
+        """
+        t0 = time.monotonic()
+        while self.run and not self.vita_dest and time.monotonic() - t0 < 12:
+            time.sleep(0.05)
+        if not self.vita_dest:
+            log("[audio] no UDP dest — cannot stream"); return
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        dest = self.vita_dest
+        reduced = self.audio_reduced_bw
+        log(f"[audio] streaming {self.audio_tone_hz:.0f} Hz tone → {dest}  ({'mono int16' if reduced else 'stereo f32'})")
+        seq = 0
+        sample_t = 0   # running sample counter for phase continuity across packets
+        t_start = time.monotonic()
+        while self.run and not self.audio_stop.is_set():
+            amp = 0.1   # −20 dBFS — audible but safe
+            any_muted = any(sl.get("muted") for sl in self.slices.values())
+            if any_muted:
+                samples = [0.0] * (AUDIO_FRAMES if reduced else AUDIO_FRAMES * 2)
+            else:
+                samples = [amp * math.sin(2 * math.pi * self.audio_tone_hz * (sample_t + i) / AUDIO_RATE)
+                           for i in range(AUDIO_FRAMES)]
+                if not reduced:
+                    stereo = []
+                    for v in samples: stereo.extend([v, v])
+                    samples = stereo
+            sample_t += AUDIO_FRAMES
+            try:
+                s.sendto(audio_packet(self.audio_stream_id, seq & 0xF, samples, reduced_bw=reduced), dest)
+            except OSError as e:
+                log("[audio] send error:", e); break
+            seq += 1
+            # Absolute deadline scheduling — sleep overshoot is absorbed into the next
+            # interval rather than accumulating as drift.
+            deadline = t_start + seq * AUDIO_INTERVAL
+            wait = deadline - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+        s.close()
+        log("[audio] stopped")
 
     def stream_loop(self):
         t0 = time.time()
