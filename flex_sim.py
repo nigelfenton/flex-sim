@@ -71,6 +71,14 @@ MODELS = {                       # model -> caps; slice count drives the multi-s
 }
 
 CENTER_MHZ, SPAN_MHZ, BINS, FPS = 14.100, 0.250, 1024, 20
+# Band -> default panadapter centre (MHz). AE's band buttons send
+# "display pan set <pan> band=N"; map the band id to a sensible centre so a pan can be
+# retuned by band, and so stacked pans can sit on different bands (20m + 6m) at once.
+BAND_CENTERS_MHZ = {
+    "160": 1.900, "80": 3.750, "60": 5.357, "40": 7.150, "30": 10.125,
+    "20": 14.150, "17": 18.118, "15": 21.225, "12": 24.940, "10": 28.850,
+    "6": 50.150, "4": 70.200, "2": 145.000, "wwv": 10.000, "gen": 14.150,
+}
 PCC_FFT, PCC_WF, PCC_METER = 0x8003, 0x8004, 0x8002
 METER_SID = 0x46000000       # meter VITA stream id (AE routes meters by PCC, not by sid)
 SLC_LEVEL_ID = 1             # (legacy) single-slice S-meter id; superseded by SLICE_METER_BASE+index
@@ -580,13 +588,43 @@ class Radio:
             self.emit_pan_status(conn, pid)                # centre this pan/waterfall on its slice
         elif c.startswith("display pan set"):
             kvs = parse_kvs(c)
+            pid = None                                     # which panadapter this set targets
+            for t in c.split():
+                if t.lower().startswith("0x"):
+                    try: pid = int(t, 16)
+                    except ValueError: pid = None
+                    break
+            pan = self.pans.get(pid)
             if "ypixels" in kvs: self.y_pixels = max(2, int(kvs["ypixels"]))
             if "y_pixels" in kvs: self.y_pixels = max(2, int(kvs["y_pixels"]))
             if "min_dbm" in kvs: self.min_dbm = float(kvs["min_dbm"])
             if "max_dbm" in kvs: self.max_dbm = float(kvs["max_dbm"])
-            if "center" in kvs: self.center_mhz = float(kvs["center"])      # align waterfall to AE's view
             if "bandwidth" in kvs: self.span_mhz = float(kvs["bandwidth"])
+            # Retune THIS panadapter by absolute centre= or by band= (AE's band buttons).
+            # Per-pan, not radio-global, so stacked pans can sit on different bands; move
+            # the pan's slice with it (a band change retunes its receiver, like a real radio).
+            new_center = None
+            if "band" in kvs:
+                bc = BAND_CENTERS_MHZ.get(str(kvs["band"]).strip().lower())
+                if bc is not None: new_center = bc
+            if "center" in kvs:
+                try: new_center = float(kvs["center"])
+                except ValueError: pass
+            if new_center is not None:
+                if pan is not None:
+                    pan["center"] = new_center
+                    sidx = pan.get("slice")
+                    if sidx is not None and sidx in self.slices:
+                        self.slices[sidx]["freq"] = new_center
+                else:
+                    self.center_mhz = new_center           # no pan id: legacy radio-global behaviour
+                self._sync_active_slice()
             self.reply(conn, seq)
+            if pan is not None and new_center is not None:
+                self.emit_pan_status(conn, pid)            # re-announce the pan's new centre to AE
+                sidx = pan.get("slice")
+                if sidx is not None and sidx in self.slices:
+                    self.emit_slice_status(conn, sidx)
         elif c == "sub radio all":
             self.reply(conn, seq)
             self.emit_radio_status(conn)                   # slice/pan capability -> AE enables +RX
