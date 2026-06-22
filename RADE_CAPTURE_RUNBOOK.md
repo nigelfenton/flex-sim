@@ -138,3 +138,34 @@ ratio 1.0 (no resample). Replay *machinery* is done.
 
 **Everything else is GREEN:** golden clip captured + committed, replay reader works. Only the
 flex-sim<->AE audio transport on one host remains.
+
+## Replay session 2 (2026-06-22 ~02:02) — FULL CHAIN PROVEN, one scoped gap left
+
+**FIXED tonight (committed):**
+1. **Same-host UDP prime** — flex-sim now seeds `vita_dest` directly from AE's announced
+   `client udpport` (flex_sim.py ~L886) instead of relying on a prime packet that never
+   arrives when AE owns :4992 on the same host. Spectrum + audio data path now establish
+   on one Windows box. `[udp] VITA dest from client udpport: ...` confirms.
+2. **Live audio hot-swap** — `audio_loop` now re-reads `self.audio_source` each iteration
+   (~L1198) so the control panel can switch tone->wav without recreating the stream.
+   GOTCHA: the control-panel param is **`audio_src`** (NOT `audio_source`) — sending the
+   wrong name sets only wav_path and the source stays on tone.
+
+**The chain is PROVEN end-to-end:** golden clip -> flex-sim float-WAV replay -> vita_dest ->
+AE receives it -> **the RADE modem waveform ARRIVES at AE intact (audible as a "warble")**.
+
+**THE ONE REMAINING GAP — flex-sim sends audio on the wrong stream for RADE:**
+- RADE RX decodes audio **only from the DAX RX path**: `PanadapterStream::daxAudioReady` ->
+  `feedRxAudio(channel, pcm)` filtered to the slice's `daxChannel()`
+  (AetherSDR/src/gui/MainWindow_DigitalModes.cpp:403-412). Comment there: RADE RX "requires
+  DAX audio to be flowing first."
+- flex-sim streams **`remote_audio_rx`** (general speaker audio) and has **ZERO DAX handling**
+  (no dax_rx, no daxAudio in flex_sim.py). AE creates `stream create type=dax_rx dax_channel=1`
+  but flex-sim never sends audio on it -> RADE decoder gets nothing -> we hear the raw warble,
+  no decode.
+
+**FIX (scoped flex-sim feature, ~1-2h, next session):** add a **DAX RX audio VITA-49 stream**
+to flex-sim — distinct stream ID + AE's DAX-RX audio format — and stream the golden clip on
+THAT path on the channel AE assigned (dax_channel=1), not remote_audio_rx. Check AE's DAX RX
+decoder for the exact PCC/format. Then RADE will decode -> "the birch canoe slid on the smooth
+planks" out the speaker.

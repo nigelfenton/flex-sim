@@ -884,8 +884,20 @@ class Radio:
         elif c == "mic list":
             self.reply(conn, seq, "MIC,LINE")
         elif c.startswith("client udpport"):
-            try: log("[tcp] AE udpport =", int(c.split()[-1]))
-            except ValueError: pass
+            # AE announces the UDP port it listens on for VITA data. On a single
+            # host (AE owns :4992), AE's prime packet to our advertised port may
+            # never arrive — so seed vita_dest directly from this announcement +
+            # the known peer IP, instead of relying solely on prime_loop. The
+            # prime path still works as a fallback (e.g. WSL2 separate stacks).
+            try:
+                up = int(c.split()[-1])
+                if self.ae_peer_ip and not self.vita_dest:
+                    self.vita_dest = (self.ae_peer_ip, up)
+                    log(f"[udp] VITA dest from client udpport: {self.vita_dest}")
+                else:
+                    log("[tcp] AE udpport =", up)
+            except ValueError:
+                pass
             self.reply(conn, seq)
         elif c.startswith("stream create"):
             kvs = parse_kvs(c)
@@ -1182,8 +1194,21 @@ class Radio:
         t_start  = time.monotonic()
         amp      = 0.1  # −20 dBFS
 
+        wav_path = self.audio_wav_path        # track which file is open, to detect live changes
         try:
             while self.run and not self.audio_stop.is_set():
+                # Re-read the source each iteration so the control panel can hot-swap
+                # tone/noise/wav (and the WAV path) live without recreating the stream.
+                src = self.audio_source
+                if src == AUDIO_SRC_WAV and (wav is None or self.audio_wav_path != wav_path):
+                    try:
+                        if wav: wav.close()
+                        wav = WavPlayer(self.audio_wav_path)
+                        wav_path = self.audio_wav_path
+                        log(f"[audio] source -> wav: {wav_path}")
+                    except Exception as e:
+                        log(f"[audio] WAV open failed ({e}), tone"); src = AUDIO_SRC_TONE; wav = None
+
                 any_muted = any(sl.get("muted") for sl in self.slices.values())
                 if any_muted:
                     mono = [0.0] * AUDIO_FRAMES
