@@ -1473,6 +1473,115 @@ def test_run_status(rid):
     return rep
 
 
+# ---- LIVE test mode: drive the REAL connected AE through each ruler, visibly --------
+# Unlike start_test_run (hidden mock-AE subprocess), this sets the live sim to each
+# ruler's pattern so AE's panadapter/waterfall actually SHOW it, holds ~5 s so it's
+# unmistakable, and runs the SAME numeric check (run_tests.check_*) in parallel so the
+# measured-vs-expected lines stream alongside what Nigel sees on the radio. Auto-advances
+# (pausable). The numbers come from run_tests so they never diverge from the standalone runner.
+
+# Per-ruler order + the level/floor to set + the "what to look for on AE" guidance.
+LIVE_RULERS = [
+    ("carrier",   {"level": -73, "floor": -120},
+     "One sharp peak at the VFO centre. AE's S-meter should read ~-73 dBm (S9)."),
+    ("two_tone",  {"level": -73, "floor": -120},
+     "TWO equal peaks symmetric about the VFO, ~2 kHz apart, both at -73 dBm. Nothing between/outside."),
+    ("cal_tones", {"level": -73, "floor": -130},
+     "Four tones across the span at -100/-80/-60/-40 dBm. Check AE's dB scale reads each step."),
+    ("noise_cal", {"level": -73, "floor": -130},
+     "A flat noise shelf sitting AT -73 dBm (±1.5 dB ripple). Put AE's RX filter on it to trace its shape."),
+    ("comb",      {"level": -73, "floor": -120},
+     "Eight evenly-spaced tones across the span, all well above the floor."),
+]
+
+_live = {"id": None, "thread": None, "steps": [], "i": -1, "paused": False,
+         "running": False, "dwell": 5.0, "abort": False}
+_live_lock = threading.Lock()
+
+
+def _live_run(radio, dwell):
+    import run_tests as rt
+    prev_pattern = radio.pattern
+    prev_level, prev_floor = radio.sig_level_dbm, radio.noise_floor_dbm
+    try:
+        for idx, (pattern, cfg, look) in enumerate(LIVE_RULERS):
+            with _live_lock:
+                if _live["abort"]:
+                    break
+                _live["i"] = idx
+            # 1. Drive the REAL AE: set pattern + level/floor so the expected reading holds.
+            radio.sig_level_dbm = float(cfg["level"])
+            radio.noise_floor_dbm = float(cfg["floor"])
+            radio.pattern = pattern
+            radio.paused = False                      # make sure output is live so AE shows it
+            log(f"[live-test] {idx+1}/{len(LIVE_RULERS)} -> {pattern} (watch AE)")
+            with _live_lock:
+                _live["steps"][idx]["state"] = "showing"
+            # 2. Hold the dwell so it's visibly on screen (pausable).
+            t_end = time.monotonic() + dwell
+            while time.monotonic() < t_end:
+                with _live_lock:
+                    if _live["abort"]:
+                        break
+                    paused = _live["paused"]
+                    _live["steps"][idx]["remaining"] = max(0.0, round(t_end - time.monotonic(), 1))
+                if paused:
+                    t_end = time.monotonic() + 0.2     # freeze the countdown while paused
+                time.sleep(0.1)
+            # 3. Run the SAME numeric check (mock-loopback) and stream the lines.
+            try:
+                bins, mdbm = rt.capture_frame(pattern)
+                check = next(c for p, c in rt.RULERS if p == pattern)
+                r = check(bins, mdbm)
+                with _live_lock:
+                    _live["steps"][idx]["measurements"] = r.get("measurements", [])
+                    _live["steps"][idx]["passed"] = r.get("passed")
+                    _live["steps"][idx]["state"] = "done"
+            except Exception as e:
+                with _live_lock:
+                    _live["steps"][idx]["state"] = "done"
+                    _live["steps"][idx]["passed"] = False
+                    _live["steps"][idx]["error"] = str(e)
+    finally:
+        radio.pattern = prev_pattern
+        radio.sig_level_dbm, radio.noise_floor_dbm = prev_level, prev_floor
+        with _live_lock:
+            _live["running"] = False
+            _live["i"] = len(LIVE_RULERS)
+        log("[live-test] finished — restored prior pattern")
+
+
+def live_test_start(radio, dwell=5.0):
+    with _live_lock:
+        if _live["running"]:
+            return {"id": _live["id"], "already": True}
+        rid = f"live-{int(time.monotonic()*1000)}"
+        _live.update(id=rid, paused=False, running=True, abort=False, dwell=float(dwell), i=-1,
+                     steps=[{"pattern": p, "look": look, "state": "pending",
+                             "measurements": [], "passed": None, "remaining": None}
+                            for p, _, look in LIVE_RULERS])
+        th = threading.Thread(target=_live_run, args=(radio, float(dwell)), daemon=True)
+        _live["thread"] = th
+        th.start()
+        return {"id": rid}
+
+
+def live_test_status():
+    with _live_lock:
+        return {"id": _live["id"], "running": _live["running"], "paused": _live["paused"],
+                "i": _live["i"], "dwell": _live["dwell"],
+                "n": len(LIVE_RULERS), "steps": _live["steps"]}
+
+
+def live_test_set(paused=None, abort=False):
+    with _live_lock:
+        if paused is not None:
+            _live["paused"] = bool(paused)
+        if abort:
+            _live["abort"] = True
+    return {"ok": True}
+
+
 # ---- live control panel (web UI served by the sim; drive from the host browser) ----
 CONTROL_HTML = """<!DOCTYPE html><html><head><meta charset=utf-8><title>flex-sim control</title>
 <style>body{{font-family:sans-serif;background:#111;color:#ddd;padding:18px;max-width:440px}}
@@ -1536,6 +1645,12 @@ h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=rang
 <div id=rulers style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:10px"></div>
 <button id=runbtn onclick="runTests()">&#9654; Run selected rulers</button>
 <span id=runstat style="margin-left:10px;font-size:13px;color:#5cf"></span>
+<div style="font-size:12px;color:#888;margin:6px 0 0">(fast: hidden mock-AE loopback — proves the numbers, but your radio shows nothing)</div>
+<div style="margin-top:16px;padding-top:14px;border-top:1px solid #243">
+<div style="font-size:13px;color:#aaa;margin-bottom:6px">Live test — drives YOUR real AE, ~5 s per ruler, so you watch each signal appear</div>
+<button id=livebtn onclick="liveStart()" style="background:#1a5;color:#fff;border:none;border-radius:5px;padding:7px 14px;font-weight:bold;cursor:pointer">&#9654; Live test on real AE</button>
+<div id=livebox style="display:none;margin-top:12px;background:#0d1620;border:1px solid #243;border-radius:6px;padding:12px"></div>
+</div>
 <div style="font-size:13px;color:#aaa;margin:16px 0 6px">Recent reports</div>
 <div id=reports style="font-size:13px"></div>
 </div>
@@ -1581,7 +1696,7 @@ function pickFixture(){{var f=document.getElementById('fix').value;if(f){{docume
 function loadFixtures(){{fetch('/fixtures').then(r=>r.json()).then(list=>{{
   var s=document.getElementById('fix');
   list.forEach(f=>{{var o=document.createElement('option');o.value=f.path;
-    var d=f.dur?(' · '+f.dur+'s'):'';o.textContent=f.name+' ('+(f.size/1024|0)+' KB'+d+')';s.appendChild(o);}});
+    var d=f.dur?(' &middot; '+f.dur+'s'):'';o.textContent=f.name+' ('+(f.size/1024|0)+' KB'+d+')';s.appendChild(o);}});
 }}).catch(()=>{{}});}}
 
 // ---- tests & reports ----
@@ -1601,7 +1716,7 @@ function poll(id){{fetch('/run-status?id='+encodeURIComponent(id)).then(r=>r.jso
   if(!s.done){{setTimeout(()=>poll(id),700);return;}}
   document.getElementById('runbtn').disabled=false;
   var msg=(s.passed!=null)?(s.passed+'/'+s.total+' passed'):'done (rc '+s.rc+')';
-  document.getElementById('runstat').innerHTML=msg+' · <a style="color:#5cf" target=_blank href="/reports/'+s.report+'">open report</a>';
+  document.getElementById('runstat').innerHTML=msg+' &middot; <a style="color:#5cf" target=_blank href="/reports/'+s.report+'">open report</a>';
   loadReports();
 }});}}
 function loadReports(){{fetch('/reports').then(r=>r.json()).then(list=>{{
@@ -1637,13 +1752,59 @@ function pollStatus(){{fetch('/status').then(r=>r.json()).then(s=>{{
     dot.style.background=s.paused?'#fa3':'#3c6';
     conn.textContent='connected to AE'+(s.peer?(' ('+s.peer+')'):'');
     var what=s.paused?'<b style="color:#fa3">output STOPPED</b> — spectrum &amp; audio silent'
-                     :('streaming <b>'+s.pattern+'</b>'+(s.tx?' · TX':'')+' · '+s.meter_dbm+' dBm');
+                     :('streaming <b>'+s.pattern+'</b>'+(s.tx?' &middot; TX':'')+' &middot; '+s.meter_dbm+' dBm');
     ss.innerHTML=what;
   }}
 }}).catch(()=>{{
   document.getElementById('dot').style.background='#888';
   document.getElementById('conn').textContent='sim unreachable';
 }});}}
+
+// ---- live test (drive the real AE) ----
+var liveTimer=null, livePaused=false;
+function liveStart(){{
+  document.getElementById('livebox').style.display='block';
+  document.getElementById('livebtn').disabled=true;
+  livePaused=false;
+  fetch('/live-test/start?dwell=5').then(()=>{{
+    if(liveTimer)clearInterval(liveTimer);
+    liveTimer=setInterval(livePoll,400);livePoll();
+  }});
+}}
+function livePause(){{livePaused=!livePaused;fetch('/live-test/pause?paused='+(livePaused?1:0));}}
+function liveStop(){{fetch('/live-test/stop');}}
+function livePoll(){{fetch('/live-test/status').then(r=>r.json()).then(s=>{{
+  var box=document.getElementById('livebox');
+  var h='';
+  s.steps.forEach((st,i)=>{{
+    var cur=(i===s.i && s.running);
+    var icon=(st.state==='done')?(st.passed?'<span style="color:#3c6">&#10004;</span>':'<span style="color:#e55">&#10007;</span>')
+            :(st.state==='showing')?'<span style="color:#fa3">&#9654;</span>':'<span style="color:#666">&middot;</span>';
+    h+='<div style="margin:6px 0;padding:6px 8px;border-radius:5px;'+(cur?'background:#15202b;border:1px solid #fa3':'')+'">';
+    h+='<div style="font-weight:bold">'+icon+' '+(i+1)+'/'+s.n+'  '+st.pattern
+       +(cur&&st.state==='showing'?(' <span style="color:#fa3;font-size:12px">— SHOWING on AE ('+(st.remaining!=null?st.remaining:'')+'s)</span>'):'')+'</div>';
+    if(cur||st.state==='done')h+='<div style="font-size:12px;color:#9ab;margin:3px 0 0">'+st.look+'</div>';
+    (st.measurements||[]).forEach(m=>{{
+      var ok=m.ok?'<span style="color:#3c6">&#10004;</span>':'<span style="color:#e55">&#10007;</span>';
+      h+='<div style="font-size:12px;font-family:monospace;margin:2px 0 0 14px">'+ok+' '+m.name+': '
+         +'<b>'+m.measured+'</b> '+(m.unit||'')+' (exp '+m.expected+')</div>';
+    }});
+    if(st.error)h+='<div style="font-size:12px;color:#e55;margin-left:14px">'+st.error+'</div>';
+    h+='</div>';
+  }});
+  if(s.running){{
+    h+='<div style="margin-top:10px"><button onclick="livePause()" style="background:'+(livePaused?'#3a7':'#a73')+';color:#fff;border:none;border-radius:4px;padding:5px 12px;cursor:pointer">'
+      +(livePaused?'&#9654; Resume':'&#9208; Pause')+'</button> '
+      +'<button onclick="liveStop()" style="background:#555;color:#fff;border:none;border-radius:4px;padding:5px 12px;cursor:pointer;margin-left:6px">&#9632; Stop</button></div>';
+  }} else {{
+    if(liveTimer){{clearInterval(liveTimer);liveTimer=null;}}
+    document.getElementById('livebtn').disabled=false;
+    var np=s.steps.filter(x=>x.passed).length;
+    h+='<div style="margin-top:10px;font-weight:bold;color:#5cf">Done — '+np+'/'+s.n+' rulers passed (numbers). You watched each on AE.</div>';
+    loadReports();
+  }}
+  box.innerHTML=h;
+}}).catch(()=>{{}});}}
 
 loadFixtures();loadRulers();loadReports();
 pollStatus();setInterval(pollStatus,1500);
@@ -1716,6 +1877,19 @@ def start_control_server(radio, port):
             if u.path == "/run-status":
                 q = urllib.parse.parse_qs(u.query)
                 return self._json(test_run_status(q.get("id", [""])[0]))
+            # ---- LIVE test (drive the real AE) ----
+            if u.path == "/live-test/start":
+                q = urllib.parse.parse_qs(u.query)
+                try: dwell = float(q.get("dwell", ["5"])[0])
+                except ValueError: dwell = 5.0
+                return self._json(live_test_start(radio, dwell))
+            if u.path == "/live-test/status":
+                return self._json(live_test_status())
+            if u.path == "/live-test/pause":
+                q = urllib.parse.parse_qs(u.query)
+                return self._json(live_test_set(paused=q.get("paused", ["1"])[0] == "1"))
+            if u.path == "/live-test/stop":
+                return self._json(live_test_set(abort=True))
             if u.path.startswith("/reports/"):
                 # Serve a report file — basename only, must match the report pattern (no traversal).
                 name = os.path.basename(u.path[len("/reports/"):])
