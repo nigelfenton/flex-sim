@@ -178,3 +178,56 @@ and never reaching feedRxAudio (DAX RX), rade_sync() never sees signal -> m_sync
 false -> **no lamp**. So "warble to speaker + no decode lamp" is the SAME single root cause
 (wrong stream), not two problems. Fixing the DAX RX stream lights the lamp AND decodes the
 speech together.
+
+## Capture environment — the "kernel audio driver" (durable, for cold re-mint)
+
+The "new kernel audio driver" installed for RADE capture is **VB-CABLE (VB-Audio
+Virtual Cable)** — there is no second/other driver; that phrase = VB-CABLE.
+
+- **What it is:** VB-Audio Virtual Cable, a signed WDM kernel audio driver. Exposes a
+  loopback pair: **"CABLE Input" (a playback/render endpoint)** and **"CABLE Output"
+  (a recording/capture endpoint)** — anything played to CABLE Input appears at CABLE Output.
+- **Installed on:** **aurora13** (the Windows desktop, `C:\Users\nigel\Documents` box —
+  the machine AE + the build live on). NOT the hub. Installer was
+  `VBCABLE_Setup_x64.exe` from the official vb-audio.com driver pack (signature Valid,
+  signed "BUREL VINCENT" = Vincent Burel, the VB-Audio author), run **as Administrator**,
+  then a **reboot** (the cable doesn't register until rebooted). Driver pack staged at
+  `C:\Users\nigel\Documents\Claude\vbcable\`.
+- **Role — CAPTURE ONLY:** VB-CABLE is used *only* to inject known source speech into AE's
+  TX/encode path to mint the golden clip. It is **NOT part of the RX decode path** (replay
+  feeds AE over VITA/DAX from flex-sim — no cable involved on RX). Once the golden clip is
+  committed, capture never needs the cable again; replay/decode is cable-free.
+
+### Exact capture routing that worked (reproducible from cold)
+```
+rade_speech_gen.py (SAPI, voice David, 16k mono, fixed Harvard sentence)
+   -> fixtures/rade_src_s0_david_r0_16k.wav   (deterministic, sha-stable, 3.13s)
+Audacity  (Playback Device EXPLICITLY = "CABLE Input (VB-Audio Virtual Cable)")
+   -> [VB-CABLE]  CABLE Input --> CABLE Output
+AE  (RADE-TAP build; Radio Setup -> Audio -> Input device = CABLE Output;
+     slice RADE active -> DIGU; **mic source switched to PC**, not MIC)
+   -> RADE encoder (host-side) -> RADE_WAV_TAP Tap E
+   -> build/rade_taps/rade_tap_E_24k_stereo_full_session.wav  = THE golden clip
+```
+Procedure: create `build/rade_taps/` first; key MOX (PC source -> radio shows TX, no RF,
+that's fine); ~2s later hit Play in Audacity; let the full ~3s sentence play; hold ~1s;
+unkey (EOO finalises Tap E). Verify: float WAV (fmt tag 3), dur ~2.2–3s, RMS > 0.05,
+~all windows have signal. Promote -> `fixtures/rade_golden_s0_<sentence>_ae<SHA>.wav`.
+
+Current pinned clip: `rade_golden_s0_birchcanoe_ae2ade8d4c.wav` (AE SHA 2ade8d4c).
+**Re-mint only if `third_party/radae` changes** (clip is encoder-version-bound) — put the
+new AE SHA in the filename. (Note: AE has since been rebuilt at SHA bec97e9e for the RX
+work; the existing 2ade8d4c clip is still valid unless radae itself changed between them —
+diff `third_party/radae` before assuming a re-capture is needed.)
+
+### Gotchas that bit us during capture
+- **mic source = PC, not MIC** — THE blocker. MIC ignores the cable entirely. (session 1→2)
+- **`build/rade_taps/` must pre-exist** — `writeWavFloat` won't mkdir; silently `qWarning`s.
+- **Don't script the playback.** `System.Media.SoundPlayer` and MCI do NOT honour the CABLE
+  device routing (they hit the primary endpoint) → silent cable, 44-byte/empty captures.
+  NAudio 2.2.1 net472 single-DLL won't load in PS 5.1 (ReflectionTypeLoadException). Use a
+  REAL app that lets you pick the output device — **Audacity** worked.
+- **No RF appears with PC source** — expected, not a fault: RADE encodes host-side, Tap E is
+  written before the radio. (Real 6300 + ANT2 dummy load was used but RF is unnecessary.)
+- **VB-CABLE becomes the Windows default playback** during setup → system audio goes silent
+  (down the cable). Flip default back to **Realtek** when done; also reset Audacity's device.
