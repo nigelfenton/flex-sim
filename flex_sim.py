@@ -660,6 +660,8 @@ class Radio:
         self.run = True
         self.send_lock = threading.Lock()   # serialize TCP writes: stream thread (status) vs command thread (replies)
         self.streaming = False
+        self.paused = False             # Stop/Go: when True, stay connected but send NO pan/wf/meter data
+                                        # (AE keeps the radio; panadapter + waterfall go dead). Go resumes.
         self.ae_peer_ip = None          # only accept the UDP prime from the connected AE
         self.y_pixels, self.min_dbm, self.max_dbm = 700, -130.0, -20.0
         self.center_mhz, self.span_mhz = CENTER_MHZ, SPAN_MHZ   # track AE's actual pan view
@@ -1317,6 +1319,9 @@ class Radio:
         start = time.time()
         while self.run and self.streaming:
             now = time.time()
+            if self.paused:                                        # Stop: send nothing; AE's pan/wf go dead
+                time.sleep(0.1)                                    #       but the radio stays connected. Go resumes.
+                continue
             cw_mode = self.cwx_active or self.pattern == "cw"
             period = (1.0 / 50.0) if cw_mode else (1.0 / self.fps)  # 20-ms keying res for 20-wpm CW (60-ms dits)
             tc = int((now - start) * self.fps)                     # waterfall row index (loop-rate independent);
@@ -1473,6 +1478,13 @@ CONTROL_HTML = """<!DOCTYPE html><html><head><meta charset=utf-8><title>flex-sim
 h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=range]{{width:380px}}
 .v{{color:#5cf;font-weight:bold}}</style></head><body>
 <h2>flex-sim &mdash; live control</h2>
+<div id=statusbar style="display:flex;align-items:center;gap:12px;background:#15202b;border:1px solid #243;border-radius:6px;padding:10px 12px;margin:0 0 14px">
+  <button id=gobtn onclick="togglePause()" style="font-size:15px;font-weight:bold;padding:7px 16px;border:none;border-radius:5px;cursor:pointer;background:#c33;color:#fff">&#9632; Stop</button>
+  <div style="line-height:1.4">
+    <div><span id=dot style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;margin-right:7px"></span><span id=conn style="font-weight:bold">…</span></div>
+    <div id=streamstat style="font-size:12px;color:#9ab;margin-top:2px">&nbsp;</div>
+  </div>
+</div>
 <label>Pattern</label><select id=pat onchange=upd()>{options}</select>
 <div id=hint style="background:#15202b;border-left:3px solid #5cf;padding:8px 11px;margin:8px 0;font-size:13px;color:#bcd;line-height:1.45"></div>
 <label>Noise floor: <span class=v id=floorv>-120</span> dBm <span class=v id=floors>(S1)</span></label>
@@ -1492,9 +1504,9 @@ h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=rang
 <div style="margin-top:14px">
 <button onclick="sendcw(0)">&#9654; CW normal</button>
 <button onclick="sendcw(1)">&#9654; CW full break-in</button>
-<button onclick="setp('carrier')">&#9632; Stop</button>
+<button onclick="setp('carrier')">&#9632; back to carrier</button>
 </div>
-<div style="font-size:12px;color:#888;margin-top:6px">sim-keyed CQ CQ CQ TST @ 20 wpm. Authentic path: send from AE's CWX &mdash; the sim follows AE's QSK.</div>
+<div style="font-size:12px;color:#888;margin-top:6px">sim-keyed CQ CQ CQ TST @ 20 wpm. Authentic path: send from AE's CWX &mdash; the sim follows AE's QSK. (Use the Stop button up top to pause all output.)</div>
 <hr style="border-color:#333;margin:20px 0">
 <h3 style="color:#5cf;margin:0 0 10px">Audio source</h3>
 <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
@@ -1604,7 +1616,36 @@ function loadReports(){{fetch('/reports').then(r=>r.json()).then(list=>{{
   }});
 }}).catch(()=>{{}});}}
 
+// ---- Stop/Go + live status ----
+var paused=false;
+function togglePause(){{
+  paused=!paused;
+  fetch('/set?paused='+(paused?1:0));
+  renderGo();pollStatus();
+}}
+function renderGo(){{
+  var b=document.getElementById('gobtn');
+  if(paused){{b.innerHTML='&#9654; Go';b.style.background='#3a7';}}
+  else{{b.innerHTML='&#9632; Stop';b.style.background='#c33';}}
+}}
+function pollStatus(){{fetch('/status').then(r=>r.json()).then(s=>{{
+  paused=s.paused;renderGo();
+  var dot=document.getElementById('dot'),conn=document.getElementById('conn'),ss=document.getElementById('streamstat');
+  if(!s.connected){{dot.style.background='#888';conn.textContent='waiting for AetherSDR…';ss.innerHTML='&nbsp;';}}
+  else{{
+    dot.style.background=s.paused?'#fa3':'#3c6';
+    conn.textContent='connected to AE'+(s.peer?(' ('+s.peer+')'):'');
+    var what=s.paused?'<b style="color:#fa3">output STOPPED</b> — panadapter &amp; waterfall dead'
+                     :('streaming <b>'+s.pattern+'</b>'+(s.tx?' · TX':'')+' · '+s.meter_dbm+' dBm');
+    ss.innerHTML=what;
+  }}
+}}).catch(()=>{{
+  document.getElementById('dot').style.background='#888';
+  document.getElementById('conn').textContent='sim unreachable';
+}});}}
+
 loadFixtures();loadRulers();loadReports();
+pollStatus();setInterval(pollStatus,1500);
 upd();
 </script></body></html>"""
 
@@ -1651,6 +1692,17 @@ def start_control_server(radio, port):
 
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
+            # ---- live status (panel polls this for connection + stream state) ----
+            if u.path == "/status":
+                return self._json({
+                    "connected": radio.conn is not None,
+                    "peer": radio.ae_peer_ip,
+                    "streaming": radio.streaming,
+                    "paused": radio.paused,
+                    "pattern": radio.pattern,
+                    "tx": radio.tx_on,
+                    "meter_dbm": round(radio.last_vfo_dbm, 1),
+                })
             # ---- test-bench routes (JSON / report files) ----
             if u.path == "/fixtures":
                 return self._json(list_fixtures())
@@ -1687,6 +1739,9 @@ def start_control_server(radio, port):
                     if "txpw" in q:    radio.tx_power_w = float(q["txpw"][0])
                     if "swr" in q:     radio.tx_swr = float(q["swr"][0])
                     if "qsk" in q:     radio.qsk = q["qsk"][0] == "1"
+                    if "paused" in q:
+                        radio.paused = q["paused"][0] == "1"
+                        log(f"[ctl] output {'PAUSED' if radio.paused else 'resumed'}")
                     if "tx" in q and radio.pattern not in AUTO_TX_PATTERNS and not radio.cwx_active:
                         newtx = q["tx"][0] == "1"
                         if newtx != radio.tx_mox:
