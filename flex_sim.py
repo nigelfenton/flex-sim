@@ -1213,7 +1213,6 @@ class Radio:
 
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         dest    = self.vita_dest
-        reduced = self.audio_reduced_bw
         src     = self.audio_source
 
         # Open WAV file if needed (fall back to tone on error)
@@ -1225,9 +1224,8 @@ class Radio:
                 log(f"[audio] WAV open failed ({e}), falling back to tone")
                 src = AUDIO_SRC_TONE
 
-        fmt = "mono int16" if reduced else "stereo f32"
-        route = f"dax_rx ch{self.dax_channel}" if self.dax_channel else "remote_audio_rx"
-        log(f"[audio] streaming [{src}] → {dest}  ({fmt}, {route}, sid 0x{self.audio_stream_id:08X})")
+        log(f"[audio] streaming [{src}] → {dest}  (stream/format chosen live per route)")
+        last_route = None   # log only when the route/format actually changes
 
         seq      = 0
         sample_t = 0   # phase counter for tone source
@@ -1240,6 +1238,19 @@ class Radio:
                 # Re-read the source each iteration so the control panel can hot-swap
                 # tone/noise/wav (and the WAV path) live without recreating the stream.
                 src = self.audio_source
+                # Choose stream id + format LIVE: when a dax_rx (RADE/digital) channel is
+                # active, stream on the DAX id and FORCE full-BW float32 stereo — the RADE
+                # OFDM modem needs full bandwidth, so ignore send_reduced_bw_dax here. If AE
+                # arms RADE after remote_audio_rx already started this loop, this switches the
+                # running loop onto the dax stream without recreating it.
+                dax_on   = self.dax_channel is not None
+                reduced  = False if dax_on else self.audio_reduced_bw
+                stream_id = self.audio_stream_id
+                route = (f"dax_rx ch{self.dax_channel} (full-BW f32)" if dax_on
+                         else f"remote_audio_rx ({'mono int16' if reduced else 'stereo f32'})")
+                if route != last_route:
+                    log(f"[audio] route -> {route}, sid 0x{stream_id:08X}")
+                    last_route = route
                 if src == AUDIO_SRC_WAV and (wav is None or self.audio_wav_path != wav_path):
                     try:
                         if wav: wav.close()
@@ -1269,7 +1280,7 @@ class Radio:
                     for v in mono: samples.extend([v, v])
 
                 try:
-                    s.sendto(audio_packet(self.audio_stream_id, seq & 0xF, samples, reduced_bw=reduced), dest)
+                    s.sendto(audio_packet(stream_id, seq & 0xF, samples, reduced_bw=reduced), dest)
                 except OSError as e:
                     log("[audio] send error:", e); break
 
