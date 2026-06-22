@@ -114,7 +114,13 @@ AUDIO_PCC_MONO  = 0x0123  # PCC_IF_NARROW_REDUCED: int16   mono   @ 24 kHz (redu
 AUDIO_FRAMES = 128        # frames per packet (stereo: 128×2 floats; mono: 128 int16)
 AUDIO_RATE   = 24000      # Hz
 AUDIO_INTERVAL = AUDIO_FRAMES / AUDIO_RATE   # ~5.333 ms / packet → ~187.5 Hz
-AUDIO_SID_BASE = 0x48000010  # base stream id for audio (per-radio: + radio_id)
+AUDIO_SID_BASE = 0x48000010  # base stream id for remote_audio_rx (per-radio: + radio_id)
+DAX_SID_BASE   = 0x48000040  # base stream id for dax_rx (per-radio: + radio_id*4 + (ch-1))
+                             # AE routes dax_rx packets to its RADE/digital decoder ONLY when the
+                             # stream id was registered via a 'stream <id> type=dax_rx ...' status
+                             # line (TciServer::statusReceived -> registerDaxStream). The PCC/format
+                             # is the SAME as remote_audio_rx (PCC_IF_NARROW float32 stereo), so the
+                             # existing audio_loop streams the golden clip unchanged on the DAX id.
 
 AUDIO_SRC_TONE  = "tone"    # default: sine tone at audio_tone_hz
 AUDIO_SRC_NOISE = "noise"   # gaussian band noise
@@ -680,6 +686,10 @@ class Radio:
         self.audio_reduced_bw = False  # set True when AE sends 'client set send_reduced_bw_dax=1'
         self.audio_source   = AUDIO_SRC_TONE  # AUDIO_SRC_TONE | AUDIO_SRC_NOISE | AUDIO_SRC_WAV
         self.audio_wav_path = None             # filesystem path to WAV file (used when source=wav)
+        # dax_rx stream state (RADE / digital decode path). AE arms this via
+        # 'stream create type=dax_rx dax_channel=N' when a slice goes RADE/DIGU;
+        # we register an id back so AE feeds these packets to its host-side decoder.
+        self.dax_channel = None                # the dax_channel AE requested (1..4), or None
 
     @property
     def tx_on(self):
@@ -755,7 +765,7 @@ class Radio:
             finally:
                 conn.close()
                 self.streaming = False; self.ae_peer_ip = None; self.conn = None; self.vita_dest = None
-                self.audio_stop.set(); self.audio_stream_id = None
+                self.audio_stop.set(); self.audio_stream_id = None; self.dax_channel = None
                 # Free this client's receivers/panadapters on disconnect, like a real radio.
                 # Without it, stale slices/pans pile up across reconnects and the slice
                 # lettering drifts (A -> B -> C on each new connection).
@@ -904,12 +914,30 @@ class Radio:
             if kvs.get("type") == "remote_audio_rx":
                 sid = AUDIO_SID_BASE + self.radio_id
                 self.audio_stream_id = sid
+                self.dax_channel = None
                 self.reply(conn, seq, f"0x{sid:08X}")
-                if not (self.audio_thread and self.audio_thread.is_alive()):
-                    self.audio_stop.clear()
-                    self.audio_thread = threading.Thread(
-                        target=self.audio_loop, daemon=True, name=f"audio-{self.radio_id}")
-                    self.audio_thread.start()
+                self._start_audio_thread()
+            elif kvs.get("type") == "dax_rx":
+                # AE arms a DAX RX channel for RADE / digital decode. It relies on a
+                # 'stream <id> type=dax_rx dax_channel=N client_handle=<ours>' STATUS line
+                # (TciServer::statusReceived -> registerDaxStream) to learn the id; the
+                # command reply alone is NOT enough. Stream the golden clip on this id with
+                # the same PCC_IF_NARROW format -> AE routes it to feedRxAudio -> RADE decode.
+                try:
+                    ch = int(kvs.get("dax_channel", "1"))
+                except ValueError:
+                    ch = 1
+                ch = max(1, min(4, ch))
+                sid = DAX_SID_BASE + self.radio_id * 4 + (ch - 1)
+                self.audio_stream_id = sid
+                self.dax_channel = ch
+                self.reply(conn, seq, f"0x{sid:08X}")
+                # The registration status line — must carry our client_handle so AE's
+                # streamStatusBelongsToUs() accepts it, and the dax_channel it asked for.
+                self.status(conn, f"stream 0x{sid:08X} type=dax_rx dax_channel={ch} "
+                                  f"client_handle=0x{self.handle_hex}")
+                log(f"[dax] registered dax_rx stream 0x{sid:08X} channel={ch}")
+                self._start_audio_thread()
             else:
                 self.reply(conn, seq, "0x48000000")
         elif c.startswith("stream remove"):
@@ -918,6 +946,7 @@ class Radio:
                     if int(tok, 16) == self.audio_stream_id:
                         self.audio_stop.set()
                         self.audio_stream_id = None
+                        self.dax_channel = None
             self.reply(conn, seq)
         elif c.startswith("transmit set"):                 # AE keys TX (MOX / TUNE)
             kvs = parse_kvs(c)
@@ -1158,8 +1187,18 @@ class Radio:
                 out[b] = ctx.sig_level
         return out, keydown
 
+    def _start_audio_thread(self):
+        """Start the shared audio_loop if not already running. Used by both the
+        remote_audio_rx and dax_rx 'stream create' paths — the loop streams on
+        self.audio_stream_id with PCC_IF_NARROW, which AE accepts for either route."""
+        if not (self.audio_thread and self.audio_thread.is_alive()):
+            self.audio_stop.clear()
+            self.audio_thread = threading.Thread(
+                target=self.audio_loop, daemon=True, name=f"audio-{self.radio_id}")
+            self.audio_thread.start()
+
     def audio_loop(self):
-        """Send remote_audio_rx VITA-49 packets at AUDIO_RATE.
+        """Send remote_audio_rx / dax_rx VITA-49 packets at AUDIO_RATE.
 
         Three audio sources are supported (self.audio_source):
           AUDIO_SRC_TONE  — deterministic sine at audio_tone_hz (default)
@@ -1187,7 +1226,8 @@ class Radio:
                 src = AUDIO_SRC_TONE
 
         fmt = "mono int16" if reduced else "stereo f32"
-        log(f"[audio] streaming [{src}] → {dest}  ({fmt})")
+        route = f"dax_rx ch{self.dax_channel}" if self.dax_channel else "remote_audio_rx"
+        log(f"[audio] streaming [{src}] → {dest}  ({fmt}, {route}, sid 0x{self.audio_stream_id:08X})")
 
         seq      = 0
         sample_t = 0   # phase counter for tone source
