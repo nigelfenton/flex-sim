@@ -1267,8 +1267,9 @@ class Radio:
                         log(f"[audio] WAV open failed ({e}), tone"); src = AUDIO_SRC_TONE; wav = None
 
                 any_muted = any(sl.get("muted") for sl in self.slices.values())
-                if any_muted:
-                    mono = [0.0] * AUDIO_FRAMES
+                if self.paused or any_muted:                       # Stop: silence the audio too (not just the
+                    mono = [0.0] * AUDIO_FRAMES                     #        spectrum) — keep the stream alive so
+                    #                                                Go resumes cleanly with continuous timing.
                 elif src == AUDIO_SRC_WAV and wav:
                     mono = wav.read(AUDIO_FRAMES)
                 elif src == AUDIO_SRC_NOISE:
@@ -1635,7 +1636,7 @@ function pollStatus(){{fetch('/status').then(r=>r.json()).then(s=>{{
   else{{
     dot.style.background=s.paused?'#fa3':'#3c6';
     conn.textContent='connected to AE'+(s.peer?(' ('+s.peer+')'):'');
-    var what=s.paused?'<b style="color:#fa3">output STOPPED</b> — panadapter &amp; waterfall dead'
+    var what=s.paused?'<b style="color:#fa3">output STOPPED</b> — spectrum &amp; audio silent'
                      :('streaming <b>'+s.pattern+'</b>'+(s.tx?' · TX':'')+' · '+s.meter_dbm+' dBm');
     ss.innerHTML=what;
   }}
