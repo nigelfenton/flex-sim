@@ -44,6 +44,7 @@ Patterns (each is a test signal; the control panel explains what to look for):
   cw            20-wpm Morse 'CQ CQ CQ TST' (sim-keyed)
   swept_carrier one tone sweeping the span (freq mapping / tile decode)
   comb          N evenly-spaced tones (dynamic range)
+  two_tone      two equal tones spaced 2 kHz about the VFO (calibrated ruler / linearity / IMD)
   step          whole-span square wave in time (temporal response)
   impulse       brief full-span flash each period (transient response)
   staircase     center carrier stepping floor->max (colormap ladder)
@@ -91,6 +92,7 @@ SWEEP_PERIOD = 8.0
 STEP_DT = 1.0
 IMPULSE_PERIOD, IMPULSE_WIDTH = 2.0, 0.15
 COMB_TONES = 8
+TWO_TONE_SPACING_HZ = 2000.0                       # two-tone ruler: tone separation (700/1900 Hz pair = 2 kHz is the SSB IMD convention's close cousin; whole-span-independent)
 TXBLANK_PERIOD, TXBLANK_GAP = 6.0, 2.0
 STAIRCASE_STEPS, STAIRCASE_DWELL = 10, 0.6        # 0->max amplitude ladder
 SIGNAL_WIDTH_KHZ = 10.0                            # synthesized carrier/signal width (kHz)
@@ -264,6 +266,7 @@ class PatternCtx:
         self.floor = min_dbm + 10.0           # visible noise floor (live: noise-floor slider)
         self.sig_level = max_dbm - 5.0        # signal peak level (live: signal-level slider)
         self.sig_half = 2                     # half-width of a synthesized signal, in bins
+        self.two_tone_half_bins = 1           # two-tone ruler: half the tone spacing, in bins
         self.noise_color = 0.0                # noise tilt dB across band (0=white, >0=pink)
         self.cw_keydown = False               # CW keyer: element key-down this frame
         self.cw_in_message = False            # CW keyer: inside the message (TX over), not the tail gap
@@ -308,6 +311,23 @@ def pat_comb(ctx, t):
     step = max(1, ctx.n // COMB_TONES)
     for b in range(step // 2, ctx.n, step):
         out[b] = ctx.sig_level - 10
+    return out
+
+
+def pat_two_tone(ctx, t):
+    # Calibrated two-tone "golden ruler": two EQUAL tones symmetric about the VFO,
+    # spaced TWO_TONE_SPACING_HZ apart, each at exactly ctx.sig_level dBm. Single-bin
+    # placement (no level-corrupting smear) so the level you measure IS the level set.
+    # Classic linearity/IMD card: in a pure sim path the band between/around the tones
+    # stays at the noise floor (no intermod products) — so it also proves AE isn't
+    # inventing spurs. Spacing is rounded to whole bins (ctx.two_tone_half_bins, set
+    # per-frame from the live span); the true delivered spacing + the expected per-tone
+    # dBm/S-unit are reported in the control-panel hint so the ruler reads exactly.
+    out = _flat(ctx, ctx.floor)
+    for sign in (-1, +1):
+        b = ctx.center + sign * ctx.two_tone_half_bins
+        if 0 <= b < ctx.n:
+            out[b] = ctx.sig_level
     return out
 
 
@@ -486,9 +506,9 @@ def pat_cw(ctx, t):
 PATTERNS = {
     "carrier": pat_carrier, "cw": pat_cw,
     "noise_floor": pat_noise_floor, "ramp": pat_ramp, "cal_tones": pat_cal_tones,
-    "swept_carrier": pat_swept_carrier, "comb": pat_comb, "step": pat_step,
-    "impulse": pat_impulse, "tx_blank": pat_tx_blank, "staircase": pat_staircase,
-    "noise": pat_noise, "test_card": pat_test_card,
+    "swept_carrier": pat_swept_carrier, "comb": pat_comb, "two_tone": pat_two_tone,
+    "step": pat_step, "impulse": pat_impulse, "tx_blank": pat_tx_blank,
+    "staircase": pat_staircase, "noise": pat_noise, "test_card": pat_test_card,
 }
 AUTO_TX_PATTERNS = {"tx_blank", "cw"}     # patterns that drive TX state themselves
 
@@ -1121,6 +1141,7 @@ class Radio:
             ctx.cw_qsk = self.qsk
             binbw_hz = (self.span_mhz * 1e6) / self.bins            # track AE's live span
             ctx.sig_half = max(1, int(round((self.sig_width_khz * 1000.0) / binbw_hz / 2)))
+            ctx.two_tone_half_bins = max(1, int(round((TWO_TONE_SPACING_HZ / binbw_hz) / 2)))  # two-tone ruler spacing in bins
             if self.cwx_active:                                    # AE-initiated CWX overrides the pattern
                 levels, keyed = self._cwx_frame(ctx, now)
             else:
@@ -1225,6 +1246,7 @@ test_card:"17 carriers S1→S9 (1/2-S steps) on a steppable noise floor. Raise t
 cal_tones:"Tones at -100/-80/-60/-40 dBm. Verify the panadapter dB scale reads each one correctly (calibration card).",
 swept_carrier:"Single tone sweeping the span. Check frequency mapping / waterfall tile decode (#3457).",
 comb:"Evenly-spaced tones across the span. Dynamic range / many simultaneous bins.",
+two_tone:"Two EQUAL tones {tt_khz} kHz apart, symmetric about the VFO, each at the signal level (dBm / S-unit shown). <b>Golden ruler:</b> both peaks read the SAME level; the band between &amp; outside stays at the noise floor — no intermod products (a pure sim path is perfectly linear, so any spur AE shows is AE's, not the signal's).",
 step:"Whole-span square wave in time. Temporal response / waterfall scroll timing.",
 impulse:"Brief full-span flash each period. Transient response / paced fallback (#3182).",
 tx_blank:"Periodic real TX gap (keys interlock + power). Watch the waterfall during and after TX — #2126 (flicker) / #1916 (disappears).",
@@ -1253,7 +1275,7 @@ upd();
 def start_control_server(radio, port):
     opts = "".join(f'<option value="{p}"{" selected" if p == radio.pattern else ""}>{p}</option>'
                    for p in sorted(PATTERNS))
-    page = CONTROL_HTML.format(options=opts).encode()
+    page = CONTROL_HTML.format(options=opts, tt_khz=f"{TWO_TONE_SPACING_HZ / 1000.0:g}").encode()
 
     class H(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):

@@ -116,6 +116,21 @@ def main():
             print(f"[{PATTERN}] tone-bin pixels {vals} vs floor {floor} (lower = stronger)")
             assert all(v < floor for v in vals), "cal tones not stronger than floor!"
             assert vals[3] < vals[0], "expected -40dBm tone stronger than -100dBm tone"
+        elif PATTERN == "two_tone":
+            # Golden ruler: exactly two equal peaks, symmetric about centre, and
+            # everything else at the floor (no intermod spurs in a pure sim path).
+            floor = max(bins)                               # weakest pixel = floor
+            strong = sorted(range(BINS), key=lambda b: bins[b])[:2]  # 2 lowest-pixel = 2 strongest
+            assert bins[strong[0]] == bins[strong[1]], \
+                f"two-tone peaks not equal level: {bins[strong[0]]} vs {bins[strong[1]]}"
+            assert bins[strong[0]] < floor, "tones not stronger than floor"
+            ctr = BINS // 2
+            off0, off1 = sorted(abs(b - ctr) for b in strong)
+            assert off0 == off1, f"tones not symmetric about VFO: offsets {off0},{off1}"
+            spurs = [b for b in range(BINS) if b not in strong and bins[b] < floor]
+            assert not spurs, f"intermod spur(s) present at bins {spurs[:8]} (sim path must be linear)"
+            print(f"[{PATTERN}] two equal tones at bins {sorted(strong)} "
+                  f"(±{off0} about {ctr}), floor {floor}, NO spurs — ruler verified")
         elif PATTERN == "noise_floor":
             assert lo == hi, "noise_floor should be flat"
 
