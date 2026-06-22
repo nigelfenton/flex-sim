@@ -239,9 +239,12 @@ RULERS = [
 ]
 
 
-def run_all():
+def run_all(only=None):
+    """Run the ruler suite. `only` = optional iterable of pattern names to run a
+    subset (the control panel's per-ruler picker uses this); None = all rulers."""
+    rulers = RULERS if not only else [(p, c) for p, c in RULERS if p in set(only)]
     results = []
-    for pattern, check in RULERS:
+    for pattern, check in rulers:
         print(f"  running {pattern} ...", end=" ", flush=True)
         try:
             bins, mdbm = capture_frame(pattern)
@@ -356,16 +359,26 @@ def main():
     ap.add_argument("--open", action="store_true", help="open the HTML report when done")
     ap.add_argument("--stamp", default=None,
                     help="timestamp string for the report (default: ask the OS)")
+    ap.add_argument("--only", default=None,
+                    help="comma-separated ruler names to run a subset "
+                         f"(available: {','.join(p for p, _ in RULERS)})")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
+
+    only = [s.strip() for s in args.only.split(",") if s.strip()] if args.only else None
+    if only:
+        unknown = set(only) - {p for p, _ in RULERS}
+        if unknown:
+            sys.exit(f"unknown ruler(s): {','.join(sorted(unknown))}")
 
     # Timestamp: the workflow sandbox forbids Date.now(); a plain script is fine,
     # but allow an override so a caller can pin it for reproducible filenames.
     stamp = args.stamp or time.strftime("%Y-%m-%d_%H%M%S")
     pretty = args.stamp or time.strftime("%Y-%m-%d %H:%M:%S")
 
-    print(f"flex-sim ruler suite — {len(RULERS)} rulers")
-    results = run_all()
+    n_rulers = len(only) if only else len(RULERS)
+    print(f"flex-sim ruler suite — {n_rulers} ruler(s)" + (f" [{','.join(only)}]" if only else ""))
+    results = run_all(only)
     meta = {"timestamp": pretty, "emu_version": emu_version(),
             "pan_min_dbm": PAN_MIN_DBM, "pan_max_dbm": PAN_MAX_DBM, "bins": BINS}
 

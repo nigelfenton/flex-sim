@@ -54,7 +54,11 @@ Patterns (each is a test signal; the control panel explains what to look for):
   tx_blank      periodic real TX gap -> repro #2126 / #1916
 Also handles AE's own CWX keyer (cwx send/wpm/qsk_enabled) for authentic CW TX.
 """
-import argparse, http.server, json, math, random, socket, struct, threading, time, urllib.parse, uuid, wave
+import argparse, http.server, json, math, os, glob, random, socket, struct, subprocess, sys, threading, time, urllib.parse, uuid, wave
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FIXTURES_DIR = os.path.join(HERE, "fixtures")
+REPORTS_DIR  = os.path.join(HERE, "reports")
 
 FLEX_SIM_VERSION = "0.1.1"
 
@@ -1376,6 +1380,93 @@ class Radio:
         log("[stream] stopped")
 
 
+# ---- test-bench helpers: list fixtures + reports, run the ruler suite ----------
+# These back the panel's "Audio source" fixture dropdown and the "Tests & reports"
+# section. All read-only / sandboxed to the known dirs; the runner is a subprocess
+# (run_tests.py spins up its OWN mock-AE loopback, so it never disturbs the live sim).
+
+# Available ruler names — kept in sync with run_tests.py RULERS (the picker offers these).
+RULER_NAMES = ["two_tone", "noise_cal", "cal_tones", "carrier", "comb"]
+
+# In-flight test runs: id -> {proc, stamp, done, passed, report}
+_test_runs = {}
+_test_lock = threading.Lock()
+
+
+def list_fixtures():
+    """WAV fixtures available to the audio-source dropdown (name + size + duration)."""
+    out = []
+    for p in sorted(glob.glob(os.path.join(FIXTURES_DIR, "*.wav"))):
+        name = os.path.basename(p)
+        info = {"name": name, "path": p, "size": os.path.getsize(p)}
+        try:
+            with wave.open(p, "rb") as w:
+                info["dur"] = round(w.getnframes() / w.getframerate(), 2)
+        except Exception:
+            info["dur"] = None        # float WAVs (RADE Tap-E) — wave can't read fmt 3; that's fine
+        out.append(info)
+    return out
+
+
+def list_reports():
+    """Ruler reports on disk, newest first, with a pass/fail summary from the JSON sidecar."""
+    out = []
+    for p in sorted(glob.glob(os.path.join(REPORTS_DIR, "ruler-report_*.html")),
+                    key=os.path.getmtime, reverse=True):
+        name = os.path.basename(p)
+        rec = {"name": name, "mtime": os.path.getmtime(p), "passed": None, "total": None}
+        jp = p[:-5] + ".json"
+        try:
+            with open(jp, encoding="utf-8") as fp:
+                d = json.load(fp)
+            res = d.get("results", [])
+            rec["total"] = len(res)
+            rec["passed"] = sum(1 for r in res if r.get("passed"))
+            rec["stamp"] = d.get("meta", {}).get("timestamp")
+        except Exception:
+            pass
+        out.append(rec)
+    return out
+
+
+def start_test_run(only=None):
+    """Spawn run_tests.py as a subprocess; return a run-id to poll via /run-status."""
+    stamp = time.strftime("%Y-%m-%d_%H%M%S")
+    rid = f"run-{stamp}"
+    cmd = [sys.executable, os.path.join(HERE, "run_tests.py"),
+           "--out", REPORTS_DIR, "--stamp", stamp]
+    if only:
+        cmd += ["--only", ",".join(only)]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with _test_lock:
+        _test_runs[rid] = {"proc": proc, "stamp": stamp, "done": False,
+                           "report": f"ruler-report_{stamp}.html"}
+    log(f"[test] started ruler run {rid}" + (f" (only {','.join(only)})" if only else " (all)"))
+    return rid
+
+
+def test_run_status(rid):
+    """Poll a spawned run: running / done + the report filename and pass count."""
+    with _test_lock:
+        r = _test_runs.get(rid)
+    if not r:
+        return {"id": rid, "found": False}
+    rc = r["proc"].poll()
+    if rc is None:
+        return {"id": rid, "found": True, "done": False}
+    # finished — read pass/fail from the report json if present
+    rep = {"id": rid, "found": True, "done": True, "rc": rc, "report": r["report"]}
+    jp = os.path.join(REPORTS_DIR, r["report"][:-5] + ".json")
+    try:
+        with open(jp, encoding="utf-8") as fp:
+            res = json.load(fp).get("results", [])
+        rep["passed"] = sum(1 for x in res if x.get("passed"))
+        rep["total"] = len(res)
+    except Exception:
+        pass
+    return rep
+
+
 # ---- live control panel (web UI served by the sim; drive from the host browser) ----
 CONTROL_HTML = """<!DOCTYPE html><html><head><meta charset=utf-8><title>flex-sim control</title>
 <style>body{{font-family:sans-serif;background:#111;color:#ddd;padding:18px;max-width:440px}}
@@ -1412,13 +1503,30 @@ h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=rang
 <label style="margin:0"><input type=radio name=asrc value=wav id=r_wav onchange=updAudio()> WAV file</label>
 </div>
 <div id=wav_row style="margin-top:10px;display:none">
-<label style="margin:0 0 4px;display:block;font-size:13px;color:#aaa">WAV path (server filesystem)</label>
+<label style="margin:0 0 4px;display:block;font-size:13px;color:#aaa">Fixture (from fixtures/)</label>
+<select id=fix onchange="pickFixture()"
+  style="width:386px;background:#1a2332;color:#ddd;border:1px solid #334;padding:4px 6px">
+  <option value="">— choose a fixture —</option>
+</select>
+<label style="margin:10px 0 4px;display:block;font-size:13px;color:#aaa">…or custom path (server filesystem)</label>
 <input type=text id=wav_path placeholder="/path/to/capture.wav"
   style="width:374px;background:#1a2332;color:#ddd;border:1px solid #334;padding:4px 6px;font-family:monospace"
   oninput=updAudio()>
 <div style="font-size:12px;color:#666;margin-top:4px">Any sample rate / channel count. Resampled to 24&nbsp;kHz mono and looped.
 <br>Takes effect on next audio stream start (reconnect AE if already connected).</div>
 </div>
+<hr style="border-color:#333;margin:20px 0">
+<details style="margin-top:4px">
+<summary style="color:#5cf;font-size:18px;font-weight:bold;cursor:pointer">Tests &amp; reports</summary>
+<div style="margin-top:12px">
+<div style="font-size:13px;color:#aaa;margin-bottom:6px">Calibration rulers (run via run_tests.py — uses its own mock-AE loopback, doesn't touch the live sim)</div>
+<div id=rulers style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:10px"></div>
+<button id=runbtn onclick="runTests()">&#9654; Run selected rulers</button>
+<span id=runstat style="margin-left:10px;font-size:13px;color:#5cf"></span>
+<div style="font-size:13px;color:#aaa;margin:16px 0 6px">Recent reports</div>
+<div id=reports style="font-size:13px"></div>
+</div>
+</details>
 <script>
 function sLabel(d){{var o=d+73;if(o>0)return '(S9+'+Math.round(o)+'dB)';return '(S'+Math.max(0,Math.round(9+o/6))+')';}}
 var qskv=0;
@@ -1454,21 +1562,121 @@ floors.textContent=sLabel(+floor.value);levels.textContent=sLabel(+level.value);
 widthv.textContent=width.value;tiltv.textContent=tilt.value;
 txpwv.textContent=txpw.value;var sv=(swr.value/10).toFixed(1);swrv.textContent=sv;
 fetch('/set?pattern='+pat.value+'&floor='+floor.value+'&level='+level.value+'&width='+width.value+'&tilt='+tilt.value+'&tx='+(tx.checked?1:0)+'&txpw='+txpw.value+'&swr='+sv+'&qsk='+qskv);}}
+
+// ---- fixtures dropdown ----
+function pickFixture(){{var f=document.getElementById('fix').value;if(f){{document.getElementById('wav_path').value=f;updAudio();}}}}
+function loadFixtures(){{fetch('/fixtures').then(r=>r.json()).then(list=>{{
+  var s=document.getElementById('fix');
+  list.forEach(f=>{{var o=document.createElement('option');o.value=f.path;
+    var d=f.dur?(' · '+f.dur+'s'):'';o.textContent=f.name+' ('+(f.size/1024|0)+' KB'+d+')';s.appendChild(o);}});
+}}).catch(()=>{{}});}}
+
+// ---- tests & reports ----
+var RULERS=['two_tone','noise_cal','cal_tones','carrier','comb'];
+function loadRulers(){{var d=document.getElementById('rulers');
+  RULERS.forEach(r=>{{var l=document.createElement('label');l.style.margin='0';l.style.fontSize='13px';
+    l.innerHTML='<input type=checkbox value="'+r+'" checked> '+r;d.appendChild(l);}});}}
+function selectedRulers(){{return Array.from(document.querySelectorAll('#rulers input:checked')).map(c=>c.value);}}
+function runTests(){{
+  var only=selectedRulers();
+  if(!only.length){{document.getElementById('runstat').textContent='select at least one ruler';return;}}
+  document.getElementById('runbtn').disabled=true;
+  document.getElementById('runstat').textContent='running '+only.length+' ruler(s)…';
+  fetch('/run-tests?only='+only.join(',')).then(r=>r.json()).then(j=>poll(j.id));
+}}
+function poll(id){{fetch('/run-status?id='+encodeURIComponent(id)).then(r=>r.json()).then(s=>{{
+  if(!s.done){{setTimeout(()=>poll(id),700);return;}}
+  document.getElementById('runbtn').disabled=false;
+  var msg=(s.passed!=null)?(s.passed+'/'+s.total+' passed'):'done (rc '+s.rc+')';
+  document.getElementById('runstat').innerHTML=msg+' · <a style="color:#5cf" target=_blank href="/reports/'+s.report+'">open report</a>';
+  loadReports();
+}});}}
+function loadReports(){{fetch('/reports').then(r=>r.json()).then(list=>{{
+  var d=document.getElementById('reports');d.innerHTML='';
+  if(!list.length){{d.innerHTML='<span style="color:#666">no reports yet</span>';return;}}
+  list.slice(0,8).forEach(r=>{{
+    var ok=(r.passed!=null&&r.passed===r.total);
+    var dot=(r.passed==null)?'#888':(ok?'#3c6':'#e55');
+    var sum=(r.passed!=null)?(r.passed+'/'+r.total):'';
+    var when=r.stamp||r.name;
+    d.innerHTML+='<div style="margin:3px 0"><span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:'+dot+';margin-right:7px"></span>'
+      +'<a style="color:#5cf" target=_blank href="/reports/'+r.name+'">'+when+'</a> <span style="color:#888">'+sum+'</span></div>';
+  }});
+}}).catch(()=>{{}});}}
+
+loadFixtures();loadRulers();loadReports();
 upd();
 </script></body></html>"""
 
 
+# Pattern groups for the dropdown (presentation only — the HINTS map explains each).
+# Any pattern not listed here falls into "Other" so new patterns still show up.
+PATTERN_GROUPS = [
+    ("Calibration rulers", ["carrier", "two_tone", "noise_cal", "cal_tones", "comb", "test_card"]),
+    ("Diagnostic / stress", ["ramp", "swept_carrier", "step", "impulse", "staircase", "tx_blank", "noise"]),
+    ("Keying", ["cw"]),
+]
+
+
+def _grouped_pattern_options(current):
+    def opt(p):
+        return f'<option value="{p}"{" selected" if p == current else ""}>{p}</option>'
+    grouped, seen = [], set()
+    for label, pats in PATTERN_GROUPS:
+        avail = [p for p in pats if p in PATTERNS]
+        if not avail:
+            continue
+        seen.update(avail)
+        grouped.append(f'<optgroup label="{label}">' + "".join(opt(p) for p in avail) + "</optgroup>")
+    other = [p for p in sorted(PATTERNS) if p not in seen]
+    if other:
+        grouped.append('<optgroup label="Other">' + "".join(opt(p) for p in other) + "</optgroup>")
+    return "".join(grouped)
+
+
 def start_control_server(radio, port):
-    opts = "".join(f'<option value="{p}"{" selected" if p == radio.pattern else ""}>{p}</option>'
-                   for p in sorted(PATTERNS))
+    opts = _grouped_pattern_options(radio.pattern)
     page = CONTROL_HTML.format(options=opts, tt_khz=f"{TWO_TONE_SPACING_HZ / 1000.0:g}").encode()
 
     class H(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
+        def _json(self, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers(); self.wfile.write(body)
+
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
+            # ---- test-bench routes (JSON / report files) ----
+            if u.path == "/fixtures":
+                return self._json(list_fixtures())
+            if u.path == "/reports":
+                return self._json(list_reports())
+            if u.path == "/run-tests":
+                q = urllib.parse.parse_qs(u.query)
+                only = [s for s in q.get("only", [""])[0].split(",") if s in RULER_NAMES] or None
+                return self._json({"id": start_test_run(only)})
+            if u.path == "/run-status":
+                q = urllib.parse.parse_qs(u.query)
+                return self._json(test_run_status(q.get("id", [""])[0]))
+            if u.path.startswith("/reports/"):
+                # Serve a report file — basename only, must match the report pattern (no traversal).
+                name = os.path.basename(u.path[len("/reports/"):])
+                if not name.startswith("ruler-report_") or not name.endswith((".html", ".json")):
+                    self.send_response(404); self.end_headers(); return
+                fp = os.path.join(REPORTS_DIR, name)
+                if not os.path.isfile(fp):
+                    self.send_response(404); self.end_headers(); return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html" if name.endswith(".html") else "application/json")
+                self.end_headers()
+                with open(fp, "rb") as f:
+                    self.wfile.write(f.read())
+                return
             if u.path == "/set":
                 q = urllib.parse.parse_qs(u.query)
                 try:
