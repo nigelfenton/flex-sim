@@ -126,7 +126,8 @@ DAX_SID_BASE   = 0x48000040  # base stream id for dax_rx (per-radio: + radio_id*
                              # is the SAME as remote_audio_rx (PCC_IF_NARROW float32 stereo), so the
                              # existing audio_loop streams the golden clip unchanged on the DAX id.
 
-AUDIO_SRC_TONE  = "tone"    # default: sine tone at audio_tone_hz
+AUDIO_SRC_SILENCE = "silence"  # DEFAULT: send silence (no audio) — a spectrum bench shouldn't blast a tone
+AUDIO_SRC_TONE  = "tone"    # sine tone at audio_tone_hz (opt-in)
 AUDIO_SRC_NOISE = "noise"   # gaussian band noise
 AUDIO_SRC_WAV   = "wav"     # WAV file playback (looped)
 
@@ -690,7 +691,7 @@ class Radio:
         self.audio_thread = None
         self.audio_tone_hz = 440.0 + radio_id * 220.0  # distinct tone per radio (A4, C#5, …)
         self.audio_reduced_bw = False  # set True when AE sends 'client set send_reduced_bw_dax=1'
-        self.audio_source   = AUDIO_SRC_TONE  # AUDIO_SRC_TONE | AUDIO_SRC_NOISE | AUDIO_SRC_WAV
+        self.audio_source   = AUDIO_SRC_SILENCE  # default silent: SILENCE | TONE | NOISE | WAV
         self.audio_wav_path = None             # filesystem path to WAV file (used when source=wav)
         # dax_rx stream state (RADE / digital decode path). AE arms this via
         # 'stream create type=dax_rx dax_channel=N' when a slice goes RADE/DIGU;
@@ -1267,16 +1268,17 @@ class Radio:
                         log(f"[audio] WAV open failed ({e}), tone"); src = AUDIO_SRC_TONE; wav = None
 
                 any_muted = any(sl.get("muted") for sl in self.slices.values())
-                if self.paused or any_muted:                       # Stop: silence the audio too (not just the
-                    mono = [0.0] * AUDIO_FRAMES                     #        spectrum) — keep the stream alive so
-                    #                                                Go resumes cleanly with continuous timing.
+                if self.paused or any_muted:                       # Stop / slice mute: silence (stream stays
+                    mono = [0.0] * AUDIO_FRAMES                     #   alive so Go resumes with continuous timing)
                 elif src == AUDIO_SRC_WAV and wav:
                     mono = wav.read(AUDIO_FRAMES)
                 elif src == AUDIO_SRC_NOISE:
                     mono = [random.gauss(0, amp) for _ in range(AUDIO_FRAMES)]
-                else:  # AUDIO_SRC_TONE
+                elif src == AUDIO_SRC_TONE:
                     mono = [amp * math.sin(2 * math.pi * self.audio_tone_hz * (sample_t + i) / AUDIO_RATE)
                             for i in range(AUDIO_FRAMES)]
+                else:  # AUDIO_SRC_SILENCE (default) — no audio. The DEFAULT so the bench is quiet.
+                    mono = [0.0] * AUDIO_FRAMES
 
                 sample_t += AUDIO_FRAMES  # harmless for non-tone sources
 
@@ -1620,7 +1622,8 @@ h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=rang
 <hr style="border-color:#333;margin:20px 0">
 <h3 style="color:#5cf;margin:0 0 10px">Audio source</h3>
 <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
-<label style="margin:0"><input type=radio name=asrc value=tone id=r_tone checked onchange=updAudio()> Tone <span style="color:#888;font-size:12px">(440 Hz sine)</span></label>
+<label style="margin:0"><input type=radio name=asrc value=silence id=r_silence checked onchange=updAudio()> <b>Silence</b> <span style="color:#888;font-size:12px">(default — no audio)</span></label>
+<label style="margin:0"><input type=radio name=asrc value=tone id=r_tone onchange=updAudio()> Tone <span style="color:#888;font-size:12px">(440 Hz sine)</span></label>
 <label style="margin:0"><input type=radio name=asrc value=noise id=r_noise onchange=updAudio()> Noise <span style="color:#888;font-size:12px">(gaussian)</span></label>
 <label style="margin:0"><input type=radio name=asrc value=wav id=r_wav onchange=updAudio()> WAV file</label>
 </div>
@@ -1934,7 +1937,7 @@ def start_control_server(radio, port):
                             f"level={radio.sig_level_dbm:.0f}dBm width={radio.sig_width_khz:.0f} tilt={radio.noise_color:.0f})")
                     if "audio_src" in q:
                         src = q["audio_src"][0]
-                        if src in (AUDIO_SRC_TONE, AUDIO_SRC_NOISE, AUDIO_SRC_WAV):
+                        if src in (AUDIO_SRC_SILENCE, AUDIO_SRC_TONE, AUDIO_SRC_NOISE, AUDIO_SRC_WAV):
                             radio.audio_source = src
                             log(f"[ctl] audio_source -> {src}")
                     if "wav_path" in q:
