@@ -169,3 +169,12 @@ to flex-sim — distinct stream ID + AE's DAX-RX audio format — and stream the
 THAT path on the channel AE assigned (dax_channel=1), not remote_audio_rx. Check AE's DAX RX
 decoder for the exact PCC/format. Then RADE will decode -> "the birch canoe slid on the smooth
 planks" out the speaker.
+
+### Confirming evidence: no RADE sync lamp
+The RADE decode/sync lamp is driven by `rade_sync(m_rade)` queried INSIDE the decode
+path (RADEEngine.cpp:492-495, emits syncChanged). It lights only when the DECODER locks
+onto an incoming RADE waveform via feedRxAudio. With the clip on remote_audio_rx (speaker)
+and never reaching feedRxAudio (DAX RX), rade_sync() never sees signal -> m_synced stays
+false -> **no lamp**. So "warble to speaker + no decode lamp" is the SAME single root cause
+(wrong stream), not two problems. Fixing the DAX RX stream lights the lamp AND decodes the
+speech together.
