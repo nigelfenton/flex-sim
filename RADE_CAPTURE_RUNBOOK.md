@@ -51,3 +51,36 @@ SAPI WAV (known sentence)
 - If no virtual cable is available, an alternative is the in-tree test-tone path, but
   that gives a tone not speech — speech is needed for a real intelligibility fixture.
 ```
+
+## Capture session 1 (2026-06-22 ~01:18) — pipeline PROVEN, audio injection BLOCKED
+
+**What worked (end-to-end pipeline confirmed):**
+- RADE-TAP build runs, RADE engages on MOX, encodes, writes all 5 taps (A/B/D/E/F).
+  Proven by AE log `01:18:36 RADE_WAV_TAP: wrote ...rade_tap_E_24k_stereo_full_session.wav`.
+- Gotcha found: `writeWavFloat` does NOT create the tap dir — **`build/rade_taps/` must
+  exist first** or every write silently `qWarning`s and fails. Created it; taps then wrote.
+- Radio: Flex 6300, ANT2 -> dummy load, 20 W, DIGU. Safe TX. Good setup.
+
+**What's BLOCKED — audio not reaching AE's mic:**
+- Symptom: no AE mic/Level meter movement on TX; Tap E only **0.204 s** (RMS 0.35 — real
+  modem signal, but just the EOO frame + ~nothing, because `m_tapVoiceAccum` got almost no
+  voice frames = encoder received ~no input audio).
+- Root cause: the WAV isn't flowing through VB-CABLE into AE. **Independent cable loopback
+  test returned a 44-byte (header-only, silent) recording** — nothing traverses CABLE
+  Input -> CABLE Output when played via `System.Media.SoundPlayer` / MCI.
+- The real issue: `SoundPlayer`/MCI don't honour the CABLE device routing (they hit the
+  primary endpoint, not CABLE Input) despite CABLE being the Windows default. NAudio 2.2.1
+  net472 single-DLL won't load in PS 5.1 (ReflectionTypeLoadException — needs its split
+  assemblies).
+
+**FIX FOR NEXT SESSION (10 min, clear head):**
+- Don't script the playback. Open the fixture WAV in a REAL media player (VLC / Films & TV /
+  Windows Media Player) whose output is set to **CABLE Input** (or default-to-CABLE + speakers
+  silent). Confirm AE's mic meter moves when it plays.
+- Timing: key MOX, wait ~2 s for RADE to engage, THEN play the full 3.1 s WAV, hold ~1 s,
+  unkey (EOO writes Tap E). Tap E should then be ~3+ s of speech-derived modem signal.
+- Verify Tap E with: parse float WAV (fmt tag 3), check dur ~3 s and RMS > 0.05.
+- `fixtures/rade_src_s0_david_r0_16k.wav` is the deterministic source (3.13 s, sha-stable).
+- Partial 0.2 s proof-of-concept archived at `AetherSDR/build/rade_taps/attempt2_partial/`.
+- ALSO: VB-CABLE is currently the Windows DEFAULT playback -> system audio is going to the
+  cable (speakers silent). Flip default back to Realtek when done capturing.
