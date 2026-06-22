@@ -69,6 +69,15 @@ AE has **zero synthetic spectrum test coverage** for a fast-churning waterfall c
 
 **"1 Aether, many radios" (Nigel, 2026-06-15):** because each emulated radio is just a discovery + control + VITA stream with its own serial/IP/port/stream-ids, the sim can advertise **N radios at once** (multiple instances, or one process serving many). That makes it a **multi-radio test bench (#3445) with zero hardware** — nobody can exercise AE's multi-radio support today without a rack of physical rigs. Design discovery + stream-id allocation to allow several radios to coexist on one host when we move past Phase 0.
 
+### 9.1 What flex-sim tests — and what it can't (the data/render boundary)
+flex-sim is a **data-correctness** rig: it injects *known* spectrum data (bins, levels, frequencies) and verifies AE **decodes and maps** it faithfully — the dB scale, frequency mapping, S-meter, auto-black, level→colour. The ruler suite (`run_tests.py`) certifies exactly this class.
+
+It is **not** a **render-correctness** rig. Bugs that live *downstream of the data* — in compositing, rasterization, GPU-vs-software parity, z-order, anti-aliasing, line-width drawing — are invisible to flex-sim, because they don't depend on what the signal *is*. **Issue #3731** is the canonical example: a GPU-path z-order bug painted the panadapter **grid on top of the FFT trace** ("comb of vertical lines on the peaks"). flex-sim would send a perfect two-tone and the comb would appear *identically* — the defect ignores the data entirely. That bug needed a **golden-image** (pixel visual-diff) check, not a data check.
+
+So the clean line: **flex-sim answers "is the data right?"; a golden-*image* rig answers "is the picture right?"** They're complementary, not the same tool. This is the boundary to keep in mind when scoping coverage — and it's *why* Phase 3's "golden-image asserts" is a distinct piece of work, not just more ruler patterns.
+
+**Where flex-sim still helps the render rig:** it's the ideal **deterministic signal *source*** for capturing golden images. A known two-tone / `noise_cal` bed / `test_card` is a far better visual-diff subject than whatever live band noise happens to be on air — reproducible frame in, reproducible picture out. So flex-sim is the *stimulus* for a render-diff harness even though it can't do the diffing itself: data-rig and image-rig share flex-sim as their common, trustworthy input.
+
 ## 10. Open decisions (need Nigel)
 1. **Name:** `flex-sim` / `flex-sim` / `spectrum-bench` / `vita-forge` / other?
 2. **Stack:** confirm C++/Qt for the real tool, with a Python protocol-spike first? (recommended)
