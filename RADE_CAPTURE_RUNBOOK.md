@@ -106,3 +106,35 @@ Golden clip committed: `fixtures/rade_golden_s0_birchcanoe_ae2ade8d4c.wav` (+ .j
 
 **Remaining (next): step 4 — replay it via flex-sim as RX, confirm AE RADE-decodes the
 sentence (the actual decode fixture / intelligibility check).**
+
+## Replay attempt (2026-06-22 ~01:48) — float-WAV path WORKS, blocked by same-host UDP prime
+
+**Built + verified (committed):** WavPlayer now reads IEEE-float WAVs (RADE Tap-E is
+float32 — `wave.open` rejects it). Golden clip reads at 24k/2ch/float, RMS 0.61,
+ratio 1.0 (no resample). Replay *machinery* is done.
+
+**Live decode BLOCKED — flex-sim same-host UDP prime gap (NOT a RADE/clip issue):**
+- AE connects to flex-sim fine, sets up RADE (DIGU, slice tx=1), and DOES request the
+  audio: `stream create type=remote_audio_rx compression=none`, announces `client udpport
+  58724`. Control path 100% OK.
+- BUT: flex-sim logs `no UDP prime in 12s — AE never opened the data path; cannot stream`.
+  REPRODUCIBLE across reconnects.
+- Network state confirmed: flex-sim prime listener bound `UDP 127.0.0.1:5992` (ok), AE bound
+  `UDP 127.0.0.1:58724` (its announced rx port, ok), AND **AE holds `UDP 0.0.0.0:4992`**.
+- Root cause (strong hypothesis): on ONE Windows host, AE's prime/data plane assumes the
+  data port == discovery port (4992) — which AE itself owns — so the prime never reaches
+  flex-sim's advertised :5992. flex-sim was validated in WSL2 where AE+flex-sim had SEPARATE
+  network stacks (both could use 4992 on different IPs); single-host loopback breaks that.
+- Code: `prime_loop` (flex_sim.py ~L731) binds `(self.ip, self.port)` = 127.0.0.1:5992 and
+  only accepts prime from `ae_peer_ip` (127.0.0.1 — matches, not the filter's fault).
+
+**FIXES TO TRY NEXT SESSION (pick one, needs iteration):**
+1. Run flex-sim on a genuinely SEPARATE IP from AE so both can use 4992 (e.g. flex-sim on a
+   second host / VM / the LAN IP, AE stays on this box) — matches the validated WSL2 topology.
+2. Make flex-sim ALSO listen for the prime on AE's announced `client udpport` value, or bind
+   the prime on 0.0.0.0 and/or additionally on :4992 if free.
+3. Inspect AE source for where it sends the remote_audio_rx prime (which dest port) to confirm
+   the 4992-assumption before coding.
+
+**Everything else is GREEN:** golden clip captured + committed, replay reader works. Only the
+flex-sim<->AE audio transport on one host remains.
