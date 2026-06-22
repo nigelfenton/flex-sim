@@ -84,3 +84,25 @@ SAPI WAV (known sentence)
 - Partial 0.2 s proof-of-concept archived at `AetherSDR/build/rade_taps/attempt2_partial/`.
 - ALSO: VB-CABLE is currently the Windows DEFAULT playback -> system audio is going to the
   cable (speakers silent). Flip default back to Realtek when done capturing.
+
+## Capture session 2 (2026-06-22 ~01:33) — ✅ SOLVED, golden clip captured
+
+**THE FIX: set AE's mic source to PC (not MIC).** That was the entire blocker. With
+MIC selected, AE listens to a hardware mic — the cable audio never reaches the encoder.
+With **PC** selected, AE takes TX audio from the PC/DAX path = CABLE Output = our WAV.
+
+Observations that confirmed it:
+- MIC source -> MOX keys radio, real RF. PC source -> AE shows TX on screen, radio does
+  NOT key, no RF — and that is FINE: RADE encodes host-side, Tap E is written before the
+  radio, so **no real RF is needed to capture the golden clip.**
+- Result: Tap E = **430,892 bytes / 2.24 s**, 12/12 windows sustained modem signal,
+  RMS 0.59. A complete RADE encoding of the birch-canoe sentence.
+
+Working playback path (session 2): **Audacity** with Playback Device explicitly set to
+**CABLE Input (VB-Audio)** -> CABLE Output -> AE PC mic. (Audacity respects the device
+choice where SoundPlayer/MCI did not — that was session 1's red herring.)
+
+Golden clip committed: `fixtures/rade_golden_s0_birchcanoe_ae2ade8d4c.wav` (+ .json manifest).
+
+**Remaining (next): step 4 — replay it via flex-sim as RX, confirm AE RADE-decodes the
+sentence (the actual decode fixture / intelligibility check).**
