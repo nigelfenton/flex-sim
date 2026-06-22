@@ -231,3 +231,39 @@ diff `third_party/radae` before assuming a re-capture is needed.)
   written before the radio. (Real 6300 + ANT2 dummy load was used but RF is unnecessary.)
 - **VB-CABLE becomes the Windows default playback** during setup → system audio goes silent
   (down the cable). Flip default back to **Realtek** when done; also reset Audacity's device.
+
+## RADE RX through flex-sim — PROVEN 2026-06-22 (transport + modem decode)
+
+End-to-end RADE *RX* via flex-sim now works and is reproducible. AE on aurora13
+(SHA `bec97e9e`), flex-sim on shack-hub (`.51`, separate IP so no `:4992` clash).
+
+**What works (proven, not theory):**
+- **dax_rx handshake:** AE arms RADE → `stream create type=dax_rx dax_channel=1`.
+  flex-sim now answers with a `stream <id> type=dax_rx dax_channel=1 client_handle=<ours>`
+  status line (→ AE `registerDaxStream`) and streams the golden clip on the DAX id.
+  Was a no-op stub before. (flex_sim.py dax_rx branch; AE TciServer.cpp:132-186.)
+- **Full-BW float32 on the DAX path:** AE sets `send_reduced_bw_dax=1`, but the RADE
+  OFDM modem needs full bandwidth → flex-sim forces full-BW float32 on dax_rx, ignoring
+  the reduced flag. (Without this the modem barely locks.)
+- **Modem RX is solid:** the LDPC+CRC **EOO callsign decodes perfectly** —
+  `RADE EOO callsign received: "G0JKN0W3"` — **393 valid decodes** in one session,
+  short (2.24s) and long (17.96s) clips alike. Modem stays synced the full clip length.
+- **RX decode tap added to AE** (`#ifdef RADE_WAV_TAP`): Tap G = 16k mono FARGAN speech,
+  Tap H = 24k stereo RX output, flushed on RX EOO. (RADEEngine.cpp feedRxAudio + .h.)
+
+**OPEN FRONTIER — decoded VOICE is near-silent (pre-existing, NOT introduced here):**
+- Tap G voice is essentially silent across BOTH clip lengths: short clip RMS 0.0045 (6%
+  active); long 17.4s clip RMS **0.0002 (0% active)** — longer made it *quieter*, so it is
+  NOT a clip-length / loop-discontinuity problem.
+- **The encoder side is healthy:** the SOURCE speech (RMS 0.078) produced a strong full-length
+  modem signal (TX Tap E/F RMS ~0.61). So voice goes IN and the modem carries it.
+- **Therefore the issue is AE's RX voice path** (`RADEEngine::feedRxAudio`): the modem
+  demodulates (callsign proves it) but the voice-feature → FARGAN synthesis yields ~no audio.
+- ⚠️ Audible RADE *voice* decode was **never confirmed** in this whole effort (line 43's
+  "Intelligible = PASS" was always an unchecked goal). This is the project's standing frontier,
+  now cleanly reproducible — next step is solo debugging of FARGAN feature flow inside AE,
+  NOT more captures. Candidate: a too-clean host-generated signal vs a neural decoder tuned
+  for channel-conditioned input; or a feature-accumulation/warmup bug in feedRxAudio.
+- Proof artifacts: `fixtures/rade_rx_decode_proof_2026-06-22/` (short + long Tap G/E + EOO logs).
+- Golden clips: `rade_golden_s0_birchcanoe_ae2ade8d4c.wav` (2.24s) +
+  `rade_golden_s0_birchcanoe_x4cont_aebec97e9e.wav` (17.96s, real-6300 capture).

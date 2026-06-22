@@ -1,0 +1,5 @@
+[12:33:07.095] DBG aether.rade: RADE EOO callsign received: "G0JKN0W3"
+[12:33:09.380] DBG aether.rade: RADE EOO callsign received: "G0JKN0W3"
+[12:33:11.569] DBG aether.rade: RADE EOO callsign received: "G0JKN0W3"
+[12:33:13.837] DBG aether.rade: RADE EOO callsign received: "G0JKN0W3"
+[12:33:16.112] DBG aether.rade: RADE EOO callsign received: "G0JKN0W3"
