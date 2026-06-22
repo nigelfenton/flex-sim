@@ -60,7 +60,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES_DIR = os.path.join(HERE, "fixtures")
 REPORTS_DIR  = os.path.join(HERE, "reports")
 
-FLEX_SIM_VERSION = "0.1.1"
+FLEX_SIM_VERSION = "0.2.0"
 
 DISCOVERY_PORT = 4992        # AE always listens for discovery here (fixed); we broadcast TO it
 DEFAULT_PORT = 4992          # flex-sim's own control (TCP) + VITA-prime (UDP) port; override with --port
