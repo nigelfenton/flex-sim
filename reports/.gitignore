@@ -1,0 +1,4 @@
+# Generated test reports — keep the directory, ignore the artefacts.
+ruler-report_*.html
+ruler-report_*.json
+_preview.png
