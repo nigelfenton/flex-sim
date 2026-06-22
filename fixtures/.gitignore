@@ -1,0 +1,4 @@
+# Generated RADE source-speech fixtures — keep the dir, ignore the artefacts.
+# (Regenerate deterministically with rade_speech_gen.py.)
+rade_src_*.wav
+rade_src_*.json
