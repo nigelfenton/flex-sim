@@ -131,6 +131,21 @@ def main():
             assert not spurs, f"intermod spur(s) present at bins {spurs[:8]} (sim path must be linear)"
             print(f"[{PATTERN}] two equal tones at bins {sorted(strong)} "
                   f"(±{off0} about {ctr}), floor {floor}, NO spurs — ruler verified")
+        elif PATTERN == "noise_cal":
+            # Calibrated bed: full-span noise whose ripple is TIGHT in absolute pixel
+            # terms (the whole point — a flat reference, not the ±12 dB textured `noise`).
+            # The ±1.5 dB ripple maps to only a few pixels, so the right test is "the
+            # full pixel spread is small," NOT a relative-sigma outlier hunt (which would
+            # paradoxically punish a tighter bed). pixel/dBm scale here ~ rows/100 dB.
+            import statistics
+            mean_px = statistics.mean(bins)
+            full_spread = max(bins) - min(bins)            # total pixel excursion
+            assert full_spread <= 40, \
+                f"noise_cal ripple too wide: {full_spread} px peak-to-peak (expect tight bed)"
+            assert statistics.pstdev(bins) < 12, \
+                f"noise_cal stdev {statistics.pstdev(bins):.1f} px — not a flat bed"
+            print(f"[{PATTERN}] flat bed: mean px {mean_px:.0f}, "
+                  f"peak-to-peak {full_spread} px, stdev {statistics.pstdev(bins):.1f} — calibrated")
         elif PATTERN == "noise_floor":
             assert lo == hi, "noise_floor should be flat"
 

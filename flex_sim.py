@@ -50,6 +50,7 @@ Patterns (each is a test signal; the control panel explains what to look for):
   staircase     center carrier stepping floor->max (colormap ladder)
   test_card     17 carriers S1..S9 (1/2-S steps) on a steppable noise floor (auto-black)
   noise         random noise band, white->pink tilt
+  noise_cal     flat noise at EXACT dBm for filter testing (output = filter response); width narrows -> band-limited
   tx_blank      periodic real TX gap -> repro #2126 / #1916
 Also handles AE's own CWX keyer (cwx send/wpm/qsk_enabled) for authentic CW TX.
 """
@@ -93,6 +94,7 @@ STEP_DT = 1.0
 IMPULSE_PERIOD, IMPULSE_WIDTH = 2.0, 0.15
 COMB_TONES = 8
 TWO_TONE_SPACING_HZ = 2000.0                       # two-tone ruler: tone separation (700/1900 Hz pair = 2 kHz is the SSB IMD convention's close cousin; whole-span-independent)
+NOISE_CAL_RIPPLE_DB = 1.5                           # noise_cal: ± bounded ripple about the exact mean (small enough the level reads true)
 TXBLANK_PERIOD, TXBLANK_GAP = 6.0, 2.0
 STAIRCASE_STEPS, STAIRCASE_DWELL = 10, 0.6        # 0->max amplitude ladder
 SIGNAL_WIDTH_KHZ = 10.0                            # synthesized carrier/signal width (kHz)
@@ -267,6 +269,7 @@ class PatternCtx:
         self.sig_level = max_dbm - 5.0        # signal peak level (live: signal-level slider)
         self.sig_half = 2                     # half-width of a synthesized signal, in bins
         self.two_tone_half_bins = 1           # two-tone ruler: half the tone spacing, in bins
+        self.noise_cal_full = True            # noise_cal: full-span bed (the standard); False = band-limit by width
         self.noise_color = 0.0                # noise tilt dB across band (0=white, >0=pink)
         self.cw_keydown = False               # CW keyer: element key-down this frame
         self.cw_in_message = False            # CW keyer: inside the message (TX over), not the tail gap
@@ -275,6 +278,18 @@ class PatternCtx:
 
 def _flat(ctx, dbm):
     return [dbm] * ctx.n
+
+
+def _hash01(n):
+    # Deterministic [0,1) from an int (cheap integer hash). Lets noise_cal be
+    # reproducible per (frame, bin) so a golden capture repeats, while looking random.
+    n &= 0xFFFFFFFF
+    n = (n ^ 61) ^ (n >> 16)
+    n = (n + (n << 3)) & 0xFFFFFFFF
+    n ^= (n >> 4)
+    n = (n * 0x27d4eb2d) & 0xFFFFFFFF
+    n ^= (n >> 15)
+    return (n & 0xFFFFFFFF) / 4294967296.0
 
 
 def pat_noise_floor(ctx, t):
@@ -352,6 +367,36 @@ def pat_noise(ctx, t):
         frac = (b - lo) / span                            # 0 low edge -> 1 high edge
         env = ctx.sig_level - ctx.noise_color * frac      # spectral tilt
         out[b] = env - random.uniform(0.0, 12.0)          # per-bin random texture
+    return out
+
+
+def pat_noise_cal(ctx, t):
+    # Calibrated noise bed for FILTER testing. Unlike `noise` (textured ±12 dB random,
+    # for looks), this holds an EXACT mean of ctx.sig_level dBm across the band with only
+    # a small bounded ripple (±NOISE_CAL_RIPPLE_DB) so the level reads true. Feed it
+    # through AE's filter and the output IS the filter's frequency response: bins inside
+    # the passband sit at sig_level, bins outside drop to the floor, the edges trace the
+    # roll-off — the whole curve in one frame (a tone shows one point; flat noise the lot).
+    #
+    # Full-span by default (noise_cal_full=True) — the STANDARD bed: noise everywhere,
+    # so AE's filter carves the visible shape. Clear the flag (panel slider) to BAND-LIMIT
+    # to sig_width_khz for ad-hoc/unknown tests — itself a filter test signal (watch AE's
+    # filter chew the edges as you cross its width). noise_color tilts white->pink.
+    # Deterministic per (frame, bin) so a golden capture is reproducible, yet looks noisy.
+    if ctx.noise_cal_full:                                 # standard: fill the whole span
+        lo, hi = 0, ctx.n - 1
+    else:                                                  # ad-hoc: band-limit to the width
+        lo = max(0, ctx.center - ctx.sig_half)
+        hi = min(ctx.n - 1, ctx.center + ctx.sig_half)
+    out = [ctx.floor] * ctx.n
+    span = max(1, hi - lo)
+    frame = int(t * 1000)                                  # stable within a frame, varies across
+    for b in range(lo, hi + 1):
+        frac = (b - lo) / span                             # 0 low edge -> 1 high edge
+        mean = ctx.sig_level - ctx.noise_color * frac      # exact mean (tilt if pink)
+        # bounded zero-mean ripple, seeded by (frame,bin) -> reproducible, noise-like
+        ripple = (_hash01(frame * 131071 + b) - 0.5) * 2.0 * NOISE_CAL_RIPPLE_DB
+        out[b] = mean + ripple
     return out
 
 
@@ -508,7 +553,8 @@ PATTERNS = {
     "noise_floor": pat_noise_floor, "ramp": pat_ramp, "cal_tones": pat_cal_tones,
     "swept_carrier": pat_swept_carrier, "comb": pat_comb, "two_tone": pat_two_tone,
     "step": pat_step, "impulse": pat_impulse, "tx_blank": pat_tx_blank,
-    "staircase": pat_staircase, "noise": pat_noise, "test_card": pat_test_card,
+    "staircase": pat_staircase, "noise": pat_noise, "noise_cal": pat_noise_cal,
+    "test_card": pat_test_card,
 }
 AUTO_TX_PATTERNS = {"tx_blank", "cw"}     # patterns that drive TX state themselves
 
@@ -538,6 +584,7 @@ class Radio:
         self.noise_floor_dbm = -120.0   # live (control panel, dBm; ~S1)
         self.sig_level_dbm = S9_DBM     # live (control panel, dBm; default S9 = -73)
         self.noise_color = 0.0          # live (noise tilt: 0=white, >0=pink)
+        self.noise_cal_full = True      # live: noise_cal full-span (standard) vs width-limited
         self.vita_dest = None
         self.run = True
         self.send_lock = threading.Lock()   # serialize TCP writes: stream thread (status) vs command thread (replies)
@@ -1142,6 +1189,7 @@ class Radio:
             binbw_hz = (self.span_mhz * 1e6) / self.bins            # track AE's live span
             ctx.sig_half = max(1, int(round((self.sig_width_khz * 1000.0) / binbw_hz / 2)))
             ctx.two_tone_half_bins = max(1, int(round((TWO_TONE_SPACING_HZ / binbw_hz) / 2)))  # two-tone ruler spacing in bins
+            ctx.noise_cal_full = self.noise_cal_full        # noise_cal: full-span (standard) vs band-limited
             if self.cwx_active:                                    # AE-initiated CWX overrides the pattern
                 levels, keyed = self._cwx_frame(ctx, now)
             else:
@@ -1251,7 +1299,8 @@ step:"Whole-span square wave in time. Temporal response / waterfall scroll timin
 impulse:"Brief full-span flash each period. Transient response / paced fallback (#3182).",
 tx_blank:"Periodic real TX gap (keys interlock + power). Watch the waterfall during and after TX — #2126 (flicker) / #1916 (disappears).",
 staircase:"Centre carrier stepping floor→max in 10 even steps. Reads AE's colormap / black-threshold as a ladder.",
-noise:"Random noise band, white→pink tilt. Floor texture and colour mapping."
+noise:"Random noise band, white→pink tilt. Floor texture and colour mapping.",
+noise_cal:"Flat noise at the EXACT signal level (small ±1.5 dB ripple) — a <b>filter-test bed</b>. Put AE's RX filter on it: the noise output traces the filter's response (passband sits at level, stopband drops to floor, edges show the roll-off — the whole curve at once). Narrow the width below the span for band-limited noise that the filter chews at the edges. noise_color tilts white→pink."
 }};
 function setp(p){{pat.value=p;upd();}}
 function sendcw(q){{qskv=q;pat.value='cw';upd();}}
