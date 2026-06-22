@@ -196,26 +196,87 @@ def audio_packet(stream_id, seq, samples, reduced_bw=False):
     return header + payload
 
 
+class _FloatWavReader:
+    """Minimal WAV reader for IEEE-float (fmt tag 3) files, exposing the slice of
+    the stdlib `wave.Wave_read` interface WavPlayer needs. Used as a fallback when
+    `wave.open` rejects a float WAV (e.g. RADE Tap-E clips: 24k stereo float32)."""
+
+    def __init__(self, path):
+        with open(path, 'rb') as f:
+            data = f.read()
+        if data[:4] != b'RIFF' or data[8:12] != b'WAVE':
+            raise wave.Error("not a RIFF/WAVE file")
+        # walk chunks to find 'fmt ' and 'data'
+        pos, fmt, dpos, dlen = 12, None, None, 0
+        while pos + 8 <= len(data):
+            cid = data[pos:pos+4]
+            clen = struct.unpack('<I', data[pos+4:pos+8])[0]
+            body = pos + 8
+            if cid == b'fmt ':
+                fmt = struct.unpack('<HHIIHH', data[body:body+16])
+            elif cid == b'data':
+                dpos, dlen = body, clen
+            pos = body + clen + (clen & 1)         # chunks are word-aligned
+        if fmt is None or dpos is None:
+            raise wave.Error("missing fmt/data chunk")
+        tag, ch, sr, _byterate, _ba, bits = fmt
+        self.is_float = (tag == 3)
+        if not self.is_float:
+            raise wave.Error(f"_FloatWavReader only handles float (tag 3), got tag {tag}")
+        self._ch, self._sr, self._sw = ch, sr, bits // 8
+        self._frame_bytes = self._ch * self._sw
+        self._data = data[dpos:dpos+dlen]
+        self._cur = 0                              # byte cursor into _data
+
+    def getnchannels(self): return self._ch
+    def getsampwidth(self):  return self._sw
+    def getframerate(self):  return self._sr
+
+    def readframes(self, n):
+        nb = n * self._frame_bytes
+        chunk = self._data[self._cur:self._cur + nb]
+        self._cur += len(chunk)
+        return chunk
+
+    def rewind(self): self._cur = 0
+    def close(self):  pass
+
+
 class WavPlayer:
     """Reads a WAV file and returns resampled mono float samples at AUDIO_RATE.
 
-    Supports 8/16/32-bit PCM, any channel count (mixed to mono), and any
-    sample rate (linear-interpolation resample to 24 kHz).  Loops at EOF.
+    Supports 8/16/32-bit PCM **and 32-bit IEEE float** (e.g. RADE Tap-E golden
+    clips), any channel count (mixed to mono), any sample rate (linear-interp
+    resample to 24 kHz).  Loops at EOF.
     """
 
     def __init__(self, path):
-        self._wf = wave.open(path, 'rb')
-        self.n_ch = self._wf.getnchannels()
-        self.sw   = self._wf.getsampwidth()   # bytes per sample
-        self.rate = self._wf.getframerate()
+        # Python's wave module handles PCM but raises on IEEE-float (fmt tag 3) —
+        # which is exactly what RADE Tap E emits. Try wave first (keeps PCM
+        # behaviour identical); on failure, fall back to a manual float-aware reader.
+        self._is_float = False
+        try:
+            self._wf = wave.open(path, 'rb')
+            self.n_ch = self._wf.getnchannels()
+            self.sw   = self._wf.getsampwidth()
+            self.rate = self._wf.getframerate()
+        except (wave.Error, EOFError):
+            self._wf = _FloatWavReader(path)
+            self.n_ch = self._wf.getnchannels()
+            self.sw   = self._wf.getsampwidth()
+            self.rate = self._wf.getframerate()
+            self._is_float = self._wf.is_float
         self._ratio = self.rate / AUDIO_RATE   # src samples per output sample
         self._buf   = []     # decoded mono floats not yet consumed
         self._phase = 0.0    # fractional carry-over into next call
-        log(f"[wav] opened: {self.rate}Hz {self.n_ch}ch {self.sw*8}bit "
-            f"→ {AUDIO_RATE}Hz mono  (ratio {self._ratio:.4f})")
+        log(f"[wav] opened: {self.rate}Hz {self.n_ch}ch {self.sw*8}bit"
+            f"{' float' if self._is_float else ''} -> {AUDIO_RATE}Hz mono "
+            f"(ratio {self._ratio:.4f})")
 
     # ------------------------------------------------------------------
     def _sample_to_float(self, raw):
+        if self._is_float:                                     # 32-bit IEEE float
+            return struct.unpack('<f', raw)[0]
         if self.sw == 2:
             return int.from_bytes(raw, 'little', signed=True) / 32768.0
         if self.sw == 4:
