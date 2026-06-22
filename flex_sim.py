@@ -103,6 +103,9 @@ TXBLANK_PERIOD, TXBLANK_GAP = 6.0, 2.0
 STAIRCASE_STEPS, STAIRCASE_DWELL = 10, 0.6        # 0->max amplitude ladder
 SIGNAL_WIDTH_KHZ = 10.0                            # synthesized carrier/signal width (kHz)
 CW_TEXT, CW_WPM, CW_TAIL_GAP = "CQ CQ CQ TST CQ CQ CQ TST", 20, 2.0   # CW keyer (Morse) pattern
+SSB_LO_HZ, SSB_HI_HZ = 300.0, 2700.0          # SSB-lookalike occupied band, offset from the (suppressed) carrier
+SSB_SYLLABLE_HZ = 4.0                          # ~4 syllables/sec — the voice envelope swell/dip rate
+SSB_WORD_GAP_S = 0.45                          # brief inter-word pauses (signal drops toward the floor)
 CWX_TAIL_S = 0.6            # hold TX this long after the last CWX element so AE's keyer drains first
 WF_FLOOR_VAL, WF_PEAK_VAL = 70.0, 235.0   # AE int16/128 intensity for our [min_dbm,max_dbm] range:
                                           # low dBm -> ~black, high dBm -> bright. (Waterfall colour
@@ -442,6 +445,55 @@ def pat_noise(ctx, t):
     return out
 
 
+def pat_ssb(ctx, t):
+    # An SSB-VOICE LOOKALIKE — not a calibration ruler, just something that *reads*
+    # like real on-air USB on the waterfall: a band offset above the (suppressed)
+    # carrier, ~300-2700 Hz wide, with a syllabic envelope (swells + word gaps) and
+    # formant-like energy that drifts within the band. Deterministic-ish via t so it
+    # animates smoothly frame to frame; uses random for live texture (not for golden
+    # captures — this pattern is for looks, not measurement).
+    out = [ctx.floor] * ctx.n
+    # Map the SSB band (Hz offset) to bins. The stream loop sets ctx.sig_half from the
+    # width slider, but SSB has its OWN fixed ~2.4 kHz band, so derive bins from the
+    # span the caller encoded into sig_half's reference. We approximate using the same
+    # bins-per-Hz the caller used for two_tone (ctx carries two_tone_half_bins for 2 kHz).
+    hz_per_bin = (TWO_TONE_SPACING_HZ / 2.0) / max(1, ctx.two_tone_half_bins)
+    lo_bin = ctx.center + int(SSB_LO_HZ / hz_per_bin)        # USB: band sits ABOVE the carrier
+    hi_bin = ctx.center + int(SSB_HI_HZ / hz_per_bin)
+    lo = max(0, min(ctx.n - 1, lo_bin))
+    hi = max(0, min(ctx.n - 1, hi_bin))
+    if hi <= lo:
+        return out
+    span = hi - lo
+
+    # --- voice envelope: syllabic swell, occasional word gaps (drops toward floor) ---
+    syl = 0.5 + 0.5 * math.sin(2 * math.pi * SSB_SYLLABLE_HZ * t)      # 0..1 syllable swell
+    syl *= 0.6 + 0.4 * math.sin(2 * math.pi * 1.3 * t + 1.1)           # slower amplitude drift
+    word_phase = (t % (1.0 / 0.7)) * 0.7                               # ~0.7 "words"/s cycle
+    in_gap = (word_phase % 1.0) < (SSB_WORD_GAP_S * 0.7)               # brief inter-word silence
+    env = 0.12 if in_gap else (0.55 + 0.45 * max(0.0, syl))           # overall loudness 0..1
+
+    # `peak_dbm` is where a loud syllable on a formant should sit (the signal-level slider).
+    peak_dbm = ctx.sig_level
+    # How far DOWN from the peak the quiet parts of the band sag (dB of speech dynamic range).
+    SSB_DR = 24.0
+
+    # --- two drifting "formant" centres so energy clumps + moves like speech ---
+    f1 = 0.30 + 0.18 * math.sin(2 * math.pi * 0.9 * t)                 # 0..1 within band
+    f2 = 0.62 + 0.20 * math.sin(2 * math.pi * 0.6 * t + 2.0)
+    for b in range(lo, hi + 1):
+        x = (b - lo) / span                                           # 0..1 across the band
+        edge = max(0.0, min(x / 0.12, (1 - x) / 0.12, 1.0))          # taper first/last ~12% (filter skirts)
+        g1 = math.exp(-((x - f1) ** 2) / (2 * 0.06 ** 2))            # formant clumps
+        g2 = 0.8 * math.exp(-((x - f2) ** 2) / (2 * 0.08 ** 2))
+        shape = max(0.0, min(1.0, (0.35 + 0.85 * (g1 + g2)))) * edge  # 0..1 spectral shape
+        # Level in dB BELOW the peak: loud-syllable * on-a-formant = at the peak; else sags.
+        below = SSB_DR * (1.0 - env * shape)
+        level = peak_dbm - below - random.uniform(0.0, 4.0)          # live per-bin texture
+        out[b] = max(ctx.floor, level)
+    return out
+
+
 def pat_noise_cal(ctx, t):
     # Calibrated noise bed for FILTER testing. Unlike `noise` (textured ±12 dB random,
     # for looks), this holds an EXACT mean of ctx.sig_level dBm across the band with only
@@ -626,7 +678,7 @@ PATTERNS = {
     "swept_carrier": pat_swept_carrier, "comb": pat_comb, "two_tone": pat_two_tone,
     "step": pat_step, "impulse": pat_impulse, "tx_blank": pat_tx_blank,
     "staircase": pat_staircase, "noise": pat_noise, "noise_cal": pat_noise_cal,
-    "test_card": pat_test_card,
+    "test_card": pat_test_card, "ssb": pat_ssb,
 }
 AUTO_TX_PATTERNS = {"tx_blank", "cw"}     # patterns that drive TX state themselves
 
@@ -1676,6 +1728,7 @@ impulse:"Brief full-span flash each period. Transient response / paced fallback 
 tx_blank:"Periodic real TX gap (keys interlock + power). Watch the waterfall during and after TX — #2126 (flicker) / #1916 (disappears).",
 staircase:"Centre carrier stepping floor→max in 10 even steps. Reads AE's colormap / black-threshold as a ladder.",
 noise:"Random noise band, white→pink tilt. Floor texture and colour mapping.",
+ssb:"An <b>SSB voice lookalike</b> — a ~2.4 kHz band offset above the VFO (USB-style) with a syllabic swell, word-gap pauses and drifting formants, so the waterfall <i>reads</i> like someone talking on HF. For looks/demo, not a ruler. <b>Tip:</b> narrow AE's span (zoom to a few kHz) to see the speech detail — at a wide span it's only ~20 bins. Signal-level slider sets how loud it sits.",
 noise_cal:"Flat noise at the EXACT signal level (small ±1.5 dB ripple) — a <b>filter-test bed</b>. Put AE's RX filter on it: the noise output traces the filter's response (passband sits at level, stopband drops to floor, edges show the roll-off — the whole curve at once). Narrow the width below the span for band-limited noise that the filter chews at the edges. noise_color tilts white→pink."
 }};
 function setp(p){{pat.value=p;upd();}}
@@ -1818,6 +1871,7 @@ upd();
 # Pattern groups for the dropdown (presentation only — the HINTS map explains each).
 # Any pattern not listed here falls into "Other" so new patterns still show up.
 PATTERN_GROUPS = [
+    ("Realistic (looks like on-air)", ["ssb"]),
     ("Calibration rulers", ["carrier", "two_tone", "noise_cal", "cal_tones", "comb", "test_card"]),
     ("Diagnostic / stress", ["ramp", "swept_carrier", "step", "impulse", "staircase", "tx_blank", "noise"]),
     ("Keying", ["cw"]),
