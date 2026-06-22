@@ -1,0 +1,21 @@
+{
+  "purpose": "RADE golden DECODE fixture — replay via flex-sim as RX; AE's RADE decoder should recover the sentence (intelligibility pass/fail).",
+  "kind": "captured artefact (NOT regenerable without the capture rig — commit it)",
+  "sentence_index": 0,
+  "sentence_text": "The birch canoe slid on the smooth planks.",
+  "source_speech": "rade_src_s0_david_r0_16k.wav (deterministic SAPI: voice David, rate 0, 16 kHz mono)",
+  "captured_from": "AetherSDR RADE_WAV_TAP Tap E (rade_tap_E_24k_stereo_full_session)",
+  "ae_build_sha": "2ade8d4c",
+  "ae_version": "26.6.3",
+  "captured_utc": "2026-06-22T05:33Z",
+  "format": { "channels": 2, "sample_rate_hz": 24000, "sample_format": "float32", "bytes": 430892, "duration_s": 2.24 },
+  "content_check": { "rms": 0.5931, "peak": 1.079, "active_windows": "12/12", "verdict": "sustained RADE modem signal (real speech encoded)" },
+  "capture_notes": [
+    "RADE TX input must be the PC/DAX source (set mic source to PC in AE), NOT a hardware mic.",
+    "RADE encodes host-side: Tap E is written before the radio, so NO real RF is required to capture.",
+    "build/rade_taps/ must exist first — AE's writeWavFloat does not create it.",
+    "Source audio fed in via Audacity -> CABLE Input (VB-Audio) -> CABLE Output -> AE PC mic.",
+    "Clip depends on the RADE encoder version — re-capture if the AE radae vendor changes (hence the SHA in the name)."
+  ],
+  "replay": "flex-sim streams this as 24k-stereo RX audio (matches its audio path); AE in RADE RX should decode the sentence."
+}
