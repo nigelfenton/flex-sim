@@ -32,6 +32,10 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 EMU = os.path.join(HERE, "flex_sim.py")
 
+# The mock-AE loopback uses its OWN port so the suite can run alongside a live
+# flex-sim service (which holds :4992). Overridable via --loopback-port. (#panel-runner)
+LOOPBACK_PORT = 4993
+
 # Protocol constants (mirror loopback_test.py / PROTOCOL.md).
 PAN_ID, WF_ID, METER_SID = 0x40000000, 0x42000000, 0x46000000
 PCC_FFT, PCC_WF, PCC_METER = 0x8003, 0x8004, 0x8002
@@ -73,9 +77,13 @@ def decode_meter(pkt):
 # One emulator session: spawn, handshake, prime, collect one FFT + meter frame.
 # Returns (fft_bins, meter_dbm, emulator_log) or raises on protocol failure.
 # ---------------------------------------------------------------------------
-def capture_frame(pattern):
+def capture_frame(pattern, port=LOOPBACK_PORT):
+    # --ctl-port 0 = let the OS pick a free ephemeral port for the emu's (unused)
+    # control panel, so the spawned loopback emu never collides with a live
+    # flex-sim service's panel on :8731. (#panel-runner)
     proc = subprocess.Popen(
-        [sys.executable, EMU, "--ip", "127.0.0.1", "--pattern", pattern],
+        [sys.executable, EMU, "--ip", "127.0.0.1", "--port", str(port),
+         "--ctl-port", "0", "--pattern", pattern],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         time.sleep(1.4)
@@ -84,13 +92,13 @@ def capture_frame(pattern):
         udp.settimeout(5.0)
         udp_port = udp.getsockname()[1]
 
-        tcp = socket.create_connection(("127.0.0.1", 4992), timeout=5.0)
+        tcp = socket.create_connection(("127.0.0.1", port), timeout=5.0)
         f = tcp.makefile("rwb", buffering=0)
         ver, han = f.readline().decode().strip(), f.readline().decode().strip()
         if not (ver.startswith("V") and han.startswith("H")):
             raise RuntimeError(f"bad handshake: {ver!r} {han!r}")
 
-        udp.sendto(b"\x00", ("127.0.0.1", 4992))            # prime -> vita_dest
+        udp.sendto(b"\x00", ("127.0.0.1", port))            # prime -> vita_dest
         seq = 1
         for c in AE_CMDS[:11] + [f"client udpport {udp_port}"] + AE_CMDS[11:]:
             f.write(f"C{seq}|{c}\n".encode())
@@ -239,15 +247,17 @@ RULERS = [
 ]
 
 
-def run_all(only=None):
+def run_all(only=None, port=LOOPBACK_PORT):
     """Run the ruler suite. `only` = optional iterable of pattern names to run a
-    subset (the control panel's per-ruler picker uses this); None = all rulers."""
+    subset (the control panel's per-ruler picker uses this); None = all rulers.
+    `port` = the loopback port for the mock-AE emu (off :4992 so it coexists with
+    a live flex-sim service)."""
     rulers = RULERS if not only else [(p, c) for p, c in RULERS if p in set(only)]
     results = []
     for pattern, check in rulers:
         print(f"  running {pattern} ...", end=" ", flush=True)
         try:
-            bins, mdbm = capture_frame(pattern)
+            bins, mdbm = capture_frame(pattern, port)
             res = check(bins, mdbm)
         except Exception as e:
             res = {"pattern": pattern, "title": pattern, "passed": False,
@@ -362,6 +372,9 @@ def main():
     ap.add_argument("--only", default=None,
                     help="comma-separated ruler names to run a subset "
                          f"(available: {','.join(p for p, _ in RULERS)})")
+    ap.add_argument("--loopback-port", type=int, default=LOOPBACK_PORT,
+                    help=f"port for the mock-AE loopback emu (default {LOOPBACK_PORT}, "
+                         "off :4992 so it coexists with a live flex-sim service)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -378,7 +391,7 @@ def main():
 
     n_rulers = len(only) if only else len(RULERS)
     print(f"flex-sim ruler suite — {n_rulers} ruler(s)" + (f" [{','.join(only)}]" if only else ""))
-    results = run_all(only)
+    results = run_all(only, args.loopback_port)
     meta = {"timestamp": pretty, "emu_version": emu_version(),
             "pan_min_dbm": PAN_MIN_DBM, "pan_max_dbm": PAN_MAX_DBM, "bins": BINS}
 
