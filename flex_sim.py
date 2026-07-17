@@ -73,7 +73,9 @@ SERIAL, MODEL, VERSION = "EMULATE01", "FLEX-6600", "3.3.28.0"
 MODELS = {                       # model -> caps; slice count drives the multi-slice axis later
     "FLEX-6300": {"slices": 2, "scu": 1}, "FLEX-6400": {"slices": 2, "scu": 1},
     "FLEX-6500": {"slices": 4, "scu": 1}, "FLEX-6600": {"slices": 4, "scu": 2},
-    "FLEX-6700": {"slices": 8, "scu": 2}, "FLEX-8600": {"slices": 8, "scu": 2},
+    "FLEX-6700": {"slices": 8, "scu": 2},
+    # FLEX-8000 series per flexradio.com/comparison: 8400 = 2 slice / 1 SCU, 8600 = 4 slice / 2 SCU
+    "FLEX-8400": {"slices": 2, "scu": 1}, "FLEX-8600": {"slices": 4, "scu": 2},
 }
 
 CENTER_MHZ, SPAN_MHZ, BINS, FPS = 14.100, 0.250, 1024, 20
