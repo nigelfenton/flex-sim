@@ -67,7 +67,7 @@ python3 flex_sim.py --radios 10 \
 `http://<flex-sim-ip>:8731/` — pick a pattern (the hint box says what it exercises in AetherSDR), set the noise floor / signal level in **dBm (with S-units)**, signal width and noise colour; key **TX** (forward-power + SWR meters); send **CW** (normal / full break-in, driven from AetherSDR's own CWX keyer). Scroll down for the **[HF noise bench](#hf-noise-bench--test-aethersdrs-noise-reduction)** (live noise for testing noise reduction).
 
 ## Patterns
-`noise_floor` · `ramp` · `cal_tones` · `carrier` · `cw` · `swept_carrier` · `comb` · `step` · `impulse` · `staircase` · `noise` · `tx_blank`. The panel's hint box explains what each one exercises.
+`noise_floor` · `ramp` · `staircase` · `carrier` · `swept_carrier` · `comb` · `cal_tones` · `two_tone` · `noise_cal` · `test_card` · `noise` · `ssb` · `cw` · `step` · `impulse` · `tx_blank`. The panel's hint box explains what each one exercises. (See also the **[HF noise bench](#hf-noise-bench--test-aethersdrs-noise-reduction)** for layered live noise, separate from these single patterns.)
 
 ## HF noise bench — test AetherSDR's noise reduction
 A **live audio mixer** that feeds AetherSDR the RX audio its noise reduction actually
