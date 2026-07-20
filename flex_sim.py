@@ -1840,9 +1840,14 @@ class Radio:
                 # match what you hear. span_hz here is the audio Hz -> bin mapping;
                 # the noise sits within a few kHz of the VFO like real RX audio.
                 if self.noise_mixer.any_enabled() and want_tx is None:
-                    audio_span_hz = 8000.0        # show +/-4 kHz of audio around the VFO
+                    # Map audio Hz -> bins through AE's LIVE span (binbw_hz), not a
+                    # fixed span, so a tone lands at its TRUE on-screen frequency.
+                    # display_span_hz = binbw_hz * bins = AE's actual visible span.
+                    # (At a wide span a 1 kHz-from-VFO tone correctly sits almost on
+                    # the VFO; zoom AE in to a few kHz to see the tones spread out.)
+                    display_span_hz = binbw_hz * ctx.n
                     levels = self.noise_mixer.spectrum(
-                        ctx.n, self.noise_floor_dbm, audio_span_hz, ctx.center)
+                        ctx.n, self.noise_floor_dbm, display_span_hz, ctx.center)
             if levels is not None and tc != last_tc:               # one pan/wf row per waterfall tick
                 pixels = [self.dbm_to_pixel(d) for d in levels]     # generated once; each stacked panadapter
                 intens = [self.dbm_to_wf_raw(d) for d in levels]    # shows it, centred on ITS slice (low_hz).
