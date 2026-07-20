@@ -2448,30 +2448,44 @@ var NOISE_CH=[
  ['woodpecker','Woodpecker','prf','pps',2,50,1]];
 var NOISE_PRESETS=['quiet-20m','night-40m','storm','noisy-qth','birdie-hell','voice-in-noise','cw-in-noise'];
 function nset(k,v){{fetch('/set?noise_'+k+'='+v).then(()=>setTimeout(pollNoise,80));}}
+// Build via DOM APIs + event LISTENERS (no inline on*="..." handlers) so there
+// are no nested single-quotes to survive the Python f-string -- that mangling
+// (\' -> '') was silently killing this whole function and leaving the grid empty.
+function nEl(tag,attrs){{var e=document.createElement(tag);for(var k in attrs)e.setAttribute(k,attrs[k]);return e;}}
 function buildNoise(){{
   var g=document.getElementById('noisebench');g.innerHTML='';
   NOISE_CH.forEach(function(c){{
     var name=c[0],lbl=c[1],knob=c[2];
-    var cb='<input type=checkbox id=nc_'+name+' onchange="nset(\''+name+'\',this.checked?1:0)">';
-    var lv='<input type=range id=nl_'+name+' min=-60 max=0 step=1 style="width:100%" '+
-           'oninput="document.getElementById(\'nlv_'+name+'\').textContent=this.value;'+
-           'nset(\''+name+'_level\',this.value)"> ';
-    var lvtxt='<span id=nlv_'+name+' style="font-family:monospace;color:#5cf;min-width:34px;display:inline-block">-</span> dB';
-    var kn='';
+    // column 1: toggle + label
+    var lab=nEl('label',{{style:'margin:0;font-size:13px'}});
+    var cb=nEl('input',{{type:'checkbox',id:'nc_'+name}});
+    cb.addEventListener('change',function(){{nset(name,this.checked?1:0);}});
+    lab.appendChild(cb);lab.appendChild(document.createTextNode(' '+lbl));
+    // column 2: level slider + readout
+    var d2=nEl('div',{{style:'display:flex;align-items:center;gap:6px'}});
+    var ls=nEl('input',{{type:'range',id:'nl_'+name,min:-60,max:0,step:1,style:'width:100%'}});
+    var lv=nEl('span',{{id:'nlv_'+name,style:'font-family:monospace;color:#5cf;min-width:34px;display:inline-block'}});
+    lv.textContent='-';
+    ls.addEventListener('input',function(){{lv.textContent=this.value;nset(name+'_level',this.value);}});
+    d2.appendChild(ls);d2.appendChild(lv);d2.appendChild(document.createTextNode(' dB'));
+    // column 3: optional knob
+    var d3=nEl('div',{{style:'white-space:nowrap'}});
     if(knob){{var kk=knob.replace(',',''),mn=c[4],mx=c[5],st=c[6];
-      kn='<span style="font-size:12px;color:#888">'+c[3]+' </span>'+
-         '<input type=range id=nk_'+name+' min='+mn+' max='+mx+' step='+st+' style="width:70px" '+
-         'oninput="document.getElementById(\'nkv_'+name+'\').textContent=this.value;'+
-         'nset(\''+name+'_'+kk+'\',this.value)"> '+
-         '<span id=nkv_'+name+' style="font-family:monospace;color:#8cf">-</span>';}}
-    g.innerHTML+='<label style="margin:0;font-size:13px">'+cb+' '+lbl+'</label>'+
-                 '<div style="display:flex;align-items:center;gap:6px">'+lv+lvtxt+'</div>'+
-                 '<div style="white-space:nowrap">'+kn+'</div>';
+      var kl=nEl('span',{{style:'font-size:12px;color:#888'}});kl.textContent=c[3]+' ';
+      var ks=nEl('input',{{type:'range',id:'nk_'+name,min:mn,max:mx,step:st,style:'width:70px'}});
+      var kv=nEl('span',{{id:'nkv_'+name,style:'font-family:monospace;color:#8cf'}});kv.textContent='-';
+      ks.addEventListener('input',function(){{kv.textContent=this.value;nset(name+'_'+kk,this.value);}});
+      d3.appendChild(kl);d3.appendChild(ks);d3.appendChild(document.createTextNode(' '));d3.appendChild(kv);
+    }}
+    g.appendChild(lab);g.appendChild(d2);g.appendChild(d3);
   }});
-  var p=document.getElementById('presets');
-  NOISE_PRESETS.forEach(function(nm){{p.innerHTML+='<button onclick="fetch(\'/set?noise_preset='+nm+
-    '\').then(()=>setTimeout(pollNoise,120))" style="background:#234;color:#bdf;border:1px solid #456;'+
-    'border-radius:4px;padding:4px 8px;margin:2px;cursor:pointer;font-size:12px">'+nm+'</button>';}});
+  var p=document.getElementById('presets');p.innerHTML='';
+  NOISE_PRESETS.forEach(function(nm){{
+    var b=nEl('button',{{style:'background:#234;color:#bdf;border:1px solid #456;border-radius:4px;padding:4px 8px;margin:2px;cursor:pointer;font-size:12px'}});
+    b.textContent=nm;
+    b.addEventListener('click',function(){{fetch('/set?noise_preset='+nm).then(function(){{setTimeout(pollNoise,120);}});}});
+    p.appendChild(b);
+  }});
   pollNoise();
 }}
 function pollNoise(){{fetch('/state').then(r=>r.json()).then(function(arr){{
