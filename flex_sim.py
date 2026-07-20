@@ -949,14 +949,27 @@ class NoiseMixer:
         return acc
 
     def set_notches(self, notches):
-        """Set TNF notches. `notches` = list of (audio_hz, width_hz) offsets from
-        the VFO; only those inside the audio band are kept."""
+        """Set the notch list (TNF + ANF). `notches` = list of (audio_hz, width_hz)
+        offsets from the VFO; only those inside the audio band are kept."""
         self._notch_hz = []
         self._notch_width_hz = {}
         for f, w in notches:
             if abs(f) < self.rate / 2:
                 self._notch_hz.append(f)
                 self._notch_width_hz[round(f)] = w
+
+    def auto_notch_tones(self):
+        """ANF detection: the audio-Hz offsets of steady TONAL channels currently
+        active (birdie carrier, CW tone). A real Auto-Notch Filter finds these by
+        their narrow spectral signature; the sim knows them directly. Broadband /
+        impulse noise is NOT returned -- ANF can't catch those, same as hardware.
+        Returned as (hz, width_hz) so they slot straight into set_notches()."""
+        tones = []
+        for name in ("birdie", "cw"):
+            ch = self.channels[name]
+            if ch["enabled"]:
+                tones.append((ch.get("hz", 1000.0), 120.0))   # ~120 Hz ANF notch
+        return tones
 
     def _apply_notch(self, buf, f_hz, q=8.0):
         """One-pole-pair biquad notch at f_hz, with per-notch state carried across
@@ -1528,6 +1541,15 @@ class Radio:
                     self.slices[idx]["mode"] = kvs["mode"]
                     if self.slices[idx].get("active"):
                         self.slice_mode = kvs["mode"]
+                # ANF (Auto-Notch Filter) — radio-side, like TNF. AE sends
+                # 'slice set N anf=1'; the RADIO is expected to auto-detect steady
+                # tonal interference and notch it. We emulate: with anf on, the sim
+                # auto-notches its own tonal channels (birdie/cw carriers) out of
+                # BOTH audio and display -- exactly what a real ANF does. Impulse
+                # and broadband noise are untouched (ANF can't catch those either).
+                if "anf" in kvs:
+                    self.slices[idx]["anf"] = (kvs["anf"] == "1")
+                    log(f"[slice] {idx} anf={kvs['anf']}")
             self.reply(conn, seq)
         elif c.startswith("slice remove"):
             idx = self._slice_index_from(c)
@@ -1971,14 +1993,20 @@ class Radio:
                 # scene (audio path already streams the mix). So the waterfall/pan
                 # match what you hear. span_hz here is the audio Hz -> bin mapping;
                 # the noise sits within a few kHz of the VFO like real RX audio.
-                # Push live TNF notches into the shared mixer: each TNF's RF freq
-                # becomes an audio Hz offset from the slice VFO. The mixer applies
-                # them to BOTH the audio (mix(), in the audio thread) and the
-                # display (spectrum(), below) -- one source of truth.
+                # Push live notches into the shared mixer -> applied to BOTH audio
+                # (mix(), audio thread) and display (spectrum(), below), one source
+                # of truth. TWO sources combine:
+                #   TNF (manual, user-placed): each TNF's RF freq -> audio Hz offset.
+                #   ANF (auto): if the active slice has anf on, auto-notch the mix's
+                #     tonal channels (birdie/cw) -- the sim's emulation of a radio's
+                #     Auto-Notch Filter finding steady carriers.
                 vfo_mhz = self.slice_freq
-                self.noise_mixer.set_notches(
-                    [((t["freq"] - vfo_mhz) * 1.0e6, t["width"])
-                     for t in self.tnfs.values()])
+                notches = [((t["freq"] - vfo_mhz) * 1.0e6, t["width"])
+                           for t in self.tnfs.values()]
+                active = self.slices.get(self.active_slice)
+                if active and active.get("anf"):
+                    notches += self.noise_mixer.auto_notch_tones()
+                self.noise_mixer.set_notches(notches)
                 if self.noise_mixer.any_enabled() and want_tx is None:
                     # Map audio Hz -> bins through AE's LIVE span (binbw_hz), not a
                     # fixed span, so a tone lands at its TRUE on-screen frequency.
