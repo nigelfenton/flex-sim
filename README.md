@@ -64,10 +64,49 @@ python3 flex_sim.py --radios 10 \
 ```
 
 ## Control panel
-`http://<flex-sim-ip>:8731/` — pick a pattern (the hint box says what it exercises in AetherSDR), set the noise floor / signal level in **dBm (with S-units)**, signal width and noise colour; key **TX** (forward-power + SWR meters); send **CW** (normal / full break-in, driven from AetherSDR's own CWX keyer).
+`http://<flex-sim-ip>:8731/` — pick a pattern (the hint box says what it exercises in AetherSDR), set the noise floor / signal level in **dBm (with S-units)**, signal width and noise colour; key **TX** (forward-power + SWR meters); send **CW** (normal / full break-in, driven from AetherSDR's own CWX keyer). Scroll down for the **[HF noise bench](#hf-noise-bench--test-aethersdrs-noise-reduction)** (live noise for testing noise reduction).
 
 ## Patterns
 `noise_floor` · `ramp` · `cal_tones` · `carrier` · `cw` · `swept_carrier` · `comb` · `step` · `impulse` · `staircase` · `noise` · `tx_blank`. The panel's hint box explains what each one exercises.
+
+## HF noise bench — test AetherSDR's noise reduction
+A **live audio mixer** that feeds AetherSDR the RX audio its noise reduction actually
+processes, so you can hear NR2 / RN2 / NR4 / DFNR / BNR (and the noise blanker) work
+against realistic HF noise — and **see** it on the waterfall.
+
+Open the control panel and scroll to **HF Noise Bench**. Each channel has an on/off
+toggle and a level slider (dB); some add a knob. Turn on any combination — they mix
+**additively**, and the waterfall shows the same scene you hear (zoom AetherSDR in to a
+few kHz to see the tones spread at their true frequencies).
+
+- **Noise** (all generated live, never a recording): `white`, `pink` (band hiss),
+  `qrn` (lightning-impulse crackle), `powerline` (mains buzz), `crashes` (static
+  bursts), `birdie` (carrier heterodyne), `hash` (switching-supply), `woodpecker`.
+- **Wanted signal** (what NR should preserve): `cw` (a keyed tone) and `voice`.
+- **Scene presets** (one click): `quiet-20m`, `night-40m`, `storm`, `noisy-qth`,
+  `birdie-hell`, `voice-in-noise`, `cw-in-noise` — plus **All off**.
+
+**Try it:** load `storm`, then toggle **NR2** in AetherSDR — the hiss drops. Load a
+single `birdie`, place a **waterfall notch (TNF)** on it — the line *and* the tone
+vanish. Load `voice-in-noise` and compare **RN2** (voice-tuned) vs NR2 on speech.
+
+**Voice needs a WAV.** The `voice` channel plays an audio file (the noise is
+synthesised). Make one from any text with the bundled tool, then point the bench at it:
+```
+python tools/make_voice_wav.py --text "The birch canoe slid on the smooth planks." --out fixtures/voice.wav
+# panel: paste the path in the WAV box, or:
+#   http://<ip>:8731/set?noise_voice=1&noise_voice_wav=<abs path to voice.wav>
+```
+The tool uses Windows SAPI text-to-speech (Windows only; on other OSes supply your own
+WAV). Whatever text you choose stays on your machine — generated WAVs are gitignored.
+
+**Every control is also an HTTP hook** (drive it from a script or an AI agent):
+`/set?noise_<chan>=1|0`, `_level=<dB>`, `_<knob>=<val>`, `noise_preset=<name>`,
+`noise_reset=1`; `/state` returns the full mixer snapshot.
+
+> Same-machine tip: run the sim on a non-standard port (`--port 5992`) so it doesn't
+> clash with AetherSDR's `4992`, and connect from AetherSDR's **radio list** (not
+> "Connect by IP", which assumes port 4992).
 
 ## Offline self-test
 ```
