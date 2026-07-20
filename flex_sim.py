@@ -1014,20 +1014,41 @@ class NoiseMixer:
         def scr(level_db, headroom=90.0):
             return floor_dbm + headroom + level_db
 
+        # Per-bin dB deviation of REAL noise: each FFT bin's power is exponentially
+        # distributed, so in dB it's 10*log10(exp) -- a spiky "grass" with a long
+        # DOWNWARD tail (occasional +7, deep dropouts to -15 and below). Its low
+        # tail must sit ON the display floor so noise rises FROM the floor upward,
+        # not as a band floating above it. (G0JKN: noise was "around a level, not
+        # from 0" -- the old scr()+90 anchoring left a big dead gap below it.)
+        def noise_bin_db():
+            u = self.rng.random()
+            if u <= 0.0:
+                u = 1e-9
+            return 10.0 * math.log10(-math.log(u))
+
+        # A noise channel BECOMES THE FLOOR: its grass BOTTOMS OUT on the display
+        # floor and rises up from there, exactly like turning on noise lifts a real
+        # radio's baseline. We anchor the noise's LOW tail at floor_dbm: the mean
+        # sits `height` above the floor and the deep exponential dropouts reach down
+        # to it. height scales with level_db (louder noise = higher grass).
+        #   noise_bin_db() spans about -15..+7 (median ~-2.5); floor it at 0 so the
+        #   dropouts land ON the floor rather than below it.
+        def noise_grass(level_db):
+            height = 8.0 + (level_db + 60.0) * 0.6      # -60->8dB .. 0->44dB tall
+            return floor_dbm + max(0.0, height + noise_bin_db())
+
         for name, ch in self.channels.items():
             if not ch["enabled"]:
                 continue
             lvl = ch["level_db"]
             if name == "white":
-                base = scr(lvl) - 12.0
                 for b in range(n):
-                    add_db(b, base + self.rng.uniform(-3.0, 3.0))
+                    add_db(b, noise_grass(lvl))
             elif name == "pink":
-                # sloped floor: more power low (left), tapering up-band
-                peak = scr(lvl) - 8.0
+                # sloped: taller (louder) at the low edge, tapering up-band
                 for b in range(n):
                     frac = b / max(1, n - 1)
-                    add_db(b, peak - 18.0 * frac + self.rng.uniform(-3.0, 3.0))
+                    add_db(b, noise_grass(lvl) - 14.0 * frac)
             elif name == "qrn":
                 # impulse = broadband vertical streak, only on frames one fires
                 if self.rng.random() < min(0.9, ch.get("rate", 12.0) / 20.0):
@@ -1048,9 +1069,9 @@ class NoiseMixer:
                 for h in range(1, 12, 2):
                     add_db(bin_of(f0 * h), scr(lvl) - 3.0 * (h // 2))
             elif name == "hash":
-                # broadband clumps
+                # broadband clumps — real noise texture (grassy, not a ribbon)
                 for b in range(n):
-                    add_db(b, scr(lvl) - 6.0 + self.rng.uniform(-4.0, 4.0))
+                    add_db(b, scr(lvl) - 6.0 + noise_bin_db())
             elif name == "woodpecker":
                 if self.rng.random() < 0.5:
                     top = scr(lvl)
