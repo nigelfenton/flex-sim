@@ -6,3 +6,6 @@ __pycache__/
 build/
 dist/
 *.spec
+
+# local noise-bench voice script (may hold copyrighted text) — never commit
+voice_lines.txt
