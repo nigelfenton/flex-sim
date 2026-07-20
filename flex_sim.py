@@ -685,6 +685,323 @@ PATTERNS = {
 AUTO_TX_PATTERNS = {"tx_blank", "cw"}     # patterns that drive TX state themselves
 
 
+# ===========================================================================
+# HF NOISE BENCH — additive audio mixer for testing AE's noise reduction.
+#
+# AE's NR (RN2/NR2/NR4/DFNR/BNR/MacNR) runs on the remote_audio_rx audio path
+# (AudioEngine.cpp processMixedRxAudioData -> NR block). This bench builds the
+# audio it hears as a LINEAR SUM of independently-toggleable channels:
+#
+#   frame = Σ enabled signal channels  +  Σ enabled noise channels   (then clip)
+#
+# Everything is GENERATED ON THE SPOT — no recordings for the noise (its whole
+# point is non-repeating randomness). Only the voice channel plays a WAV.
+#
+# Each generator has signature gen(st, ch, n) -> list[float] of length n:
+#   st  = the Radio's NoiseMixer state (rate, phase counters, RNG helpers)
+#   ch  = this channel's dict (level_db + any per-channel knobs)
+#   n   = frames to produce (== AUDIO_FRAMES)
+# It returns samples at UNITY reference; the mixer scales by 10**(level_db/20).
+# level_db is dBFS-ish: 0 = full reference amplitude, -20 = /10, etc.
+# ===========================================================================
+
+NOISE_REF_AMP = 0.18          # unity-reference RMS-ish amplitude (headroom for summing)
+_PINK_ROWS    = 16            # Voss-McCartney octave rows
+
+
+def _db2lin(db):
+    return 10.0 ** (db / 20.0)
+
+
+# ---- signal channels (the WANTED signal NR must PRESERVE) -----------------
+
+def sig_voice(st, ch, n):
+    """Voice from a looped WAV (the only recorded source). Falls silent if no
+    WAV is loaded — the mixer just skips it then."""
+    wav = st.voice_wav
+    if wav is None:
+        return [0.0] * n
+    return wav.read(n)          # WavPlayer already returns mono float at AUDIO_RATE
+
+
+def sig_cw(st, ch, n):
+    """A separate keyed CW tone at cw_hz, sending a repeating callsign-ish id so
+    NR has a tonal signal to preserve. Envelope-shaped keying (no clicks)."""
+    hz   = ch.get("hz", 700.0)
+    wpm  = ch.get("wpm", 18.0)
+    dit  = 1.2 / wpm                                   # seconds per dit
+    # element pattern for a short id (· — · ·  = 'L' feel); loop it
+    elems = ch.setdefault("_elems", [1, 3, 1, 1, 3, 0, 0])  # 1=dit 3=dah 0=gap(=1 dit)
+    out = []
+    for i in range(n):
+        tt = (st.cw_phase + i) / st.rate
+        # position within the keying pattern
+        unit = dit
+        total = sum((e if e else 1) for e in elems) * unit
+        pos = tt % total
+        acc = 0.0; key = 0.0
+        for e in elems:
+            dur = (e if e else 1) * unit
+            if acc <= pos < acc + dur:
+                key = 1.0 if e else 0.0
+                # raised-cosine edges (5 ms) to kill key clicks
+                edge = 0.005
+                into = pos - acc; left = acc + dur - pos
+                if e:
+                    if into < edge: key = 0.5 - 0.5 * math.cos(math.pi * into / edge)
+                    elif left < edge: key = 0.5 - 0.5 * math.cos(math.pi * left / edge)
+                break
+            acc += dur
+        out.append(key * math.sin(2 * math.pi * hz * tt))
+    st.cw_phase += n
+    return out
+
+
+# ---- noise channels (all live DSP, non-repeating) -------------------------
+
+def noi_white(st, ch, n):
+    """Flat AWGN — the thermal baseline."""
+    g = st.rng.gauss
+    return [g(0.0, NOISE_REF_AMP) for _ in range(n)]
+
+
+def noi_pink(st, ch, n):
+    """1/f pink noise (Voss-McCartney) — the atmospheric band-hiss floor."""
+    rows = st._pink_rows
+    key  = st._pink_key
+    out  = []
+    for _ in range(n):
+        st._pink_ctr = (st._pink_ctr + 1) & ((1 << _PINK_ROWS) - 1)
+        diff = key ^ st._pink_ctr
+        for r in range(_PINK_ROWS):
+            if diff & (1 << r):
+                rows[r] = st.rng.uniform(-1.0, 1.0)
+        key = st._pink_ctr
+        out.append(sum(rows) / _PINK_ROWS * NOISE_REF_AMP * 3.0)
+    st._pink_key = key
+    return out
+
+
+def noi_qrn(st, ch, n):
+    """Atmospheric impulse crackle (lightning static) — Poisson-timed sharp
+    impulses with fast exponential decay. rate = impulses/sec."""
+    rate = ch.get("rate", 12.0)
+    p    = rate / st.rate                              # per-sample trigger prob
+    out  = []
+    for _ in range(n):
+        if st.rng.random() < p:
+            st._qrn_env = 1.0
+            st._qrn_sign = 1.0 if st.rng.random() < 0.5 else -1.0
+        v = st._qrn_sign * st._qrn_env * (0.6 + 0.4 * st.rng.random())
+        st._qrn_env *= 0.86                            # ~ a few ms tail at 24 k
+        out.append(v * NOISE_REF_AMP * 5.0)
+    return out
+
+
+def noi_powerline(st, ch, n):
+    """Mains buzz — fundamental + odd harmonics (the classic power-line raster).
+    freq = 50 or 60 Hz."""
+    f0 = ch.get("freq", 60.0)
+    out = []
+    for i in range(n):
+        tt = (st.pl_phase + i) / st.rate
+        v = 0.0
+        for h in (1, 3, 5, 7, 9, 11):
+            v += (1.0 / h) * math.sin(2 * math.pi * f0 * h * tt)
+        out.append(v * NOISE_REF_AMP * 0.5)
+    st.pl_phase += n
+    return out
+
+
+def noi_crashes(st, ch, n):
+    """Static crashes — big correlated bursts of band-limited noise (storm
+    front). Rare, long-tailed. rate = crashes/sec."""
+    rate = ch.get("rate", 0.4)
+    p    = rate / st.rate
+    out  = []
+    for _ in range(n):
+        if st.rng.random() < p:
+            st._crash_env = 1.0
+        # low-passed noise (one-pole) for a rushing rather than hissing texture
+        st._crash_lp = 0.6 * st._crash_lp + 0.4 * st.rng.gauss(0.0, 1.0)
+        out.append(st._crash_lp * st._crash_env * NOISE_REF_AMP * 4.0)
+        st._crash_env *= 0.9995                        # long decay (~150 ms)
+    return out
+
+
+def noi_birdie(st, ch, n):
+    """A steady carrier heterodyne — a pure tone birdie for notch/auto-notch
+    testing. hz = audio pitch of the het."""
+    hz = ch.get("hz", 1000.0)
+    out = []
+    for i in range(n):
+        tt = (st.birdie_phase + i) / st.rate
+        out.append(math.sin(2 * math.pi * hz * tt) * NOISE_REF_AMP * 1.2)
+    st.birdie_phase += n
+    return out
+
+
+def noi_hash(st, ch, n):
+    """Switching-supply / digital hash — broadband noise gated into clumps with
+    a fast repetition rate (SMPS whine + broadband splatter)."""
+    prf = ch.get("prf", 120.0)                         # clump repetition (Hz)
+    out = []
+    for i in range(n):
+        tt = (st.hash_phase + i) / st.rate
+        gate = 1.0 if (tt * prf) % 1.0 < 0.4 else 0.15
+        out.append(st.rng.gauss(0.0, 1.0) * gate * NOISE_REF_AMP * 2.0)
+    st.hash_phase += n
+    return out
+
+
+def noi_woodpecker(st, ch, n):
+    """Pulsed wideband rasp (over-the-horizon-radar flavour) — noise bursts at a
+    low PRF. prf = pulses/sec."""
+    prf = ch.get("prf", 10.0)
+    out = []
+    for i in range(n):
+        tt = (st.wood_phase + i) / st.rate
+        on = (tt * prf) % 1.0 < 0.5                     # ~50% duty rasp
+        out.append((st.rng.gauss(0.0, 1.0) if on else 0.0) * NOISE_REF_AMP * 3.0)
+    st.wood_phase += n
+    return out
+
+
+# Registry: name -> (generator, is_signal, default channel dict).
+# default dict carries level_db (starts DISABLED via enabled=False) + knobs.
+NOISE_CHANNELS = {
+    # signal channels (wanted)
+    "voice":      (sig_voice,      True,  {"enabled": False, "level_db": -14.0}),
+    "cw":         (sig_cw,         True,  {"enabled": False, "level_db": -16.0, "hz": 700.0, "wpm": 18.0}),
+    # noise channels
+    "white":      (noi_white,      False, {"enabled": False, "level_db": -26.0}),
+    "pink":       (noi_pink,       False, {"enabled": False, "level_db": -24.0}),
+    "qrn":        (noi_qrn,        False, {"enabled": False, "level_db": -18.0, "rate": 12.0}),
+    "powerline":  (noi_powerline,  False, {"enabled": False, "level_db": -22.0, "freq": 60.0}),
+    "crashes":    (noi_crashes,    False, {"enabled": False, "level_db": -16.0, "rate": 0.4}),
+    "birdie":     (noi_birdie,     False, {"enabled": False, "level_db": -28.0, "hz": 1000.0}),
+    "hash":       (noi_hash,       False, {"enabled": False, "level_db": -24.0, "prf": 120.0}),
+    "woodpecker": (noi_woodpecker, False, {"enabled": False, "level_db": -22.0, "prf": 10.0}),
+}
+
+
+class NoiseMixer:
+    """Per-radio additive mixer state. Holds each channel's live dict, phase
+    counters for the deterministic tone/buzz generators, and RNG scratch for the
+    stochastic ones. mix(n) returns a summed, soft-clipped mono float block."""
+
+    def __init__(self, voice_wav=None):
+        import copy
+        self.rate = AUDIO_RATE
+        self.channels = {name: copy.deepcopy(defs)
+                         for name, (_g, _s, defs) in NOISE_CHANNELS.items()}
+        self.voice_wav = voice_wav
+        self.rng = random.Random(0x5EED)   # own stream; reproducible per launch
+        # phase counters
+        self.cw_phase = self.pl_phase = self.birdie_phase = 0
+        self.hash_phase = self.wood_phase = 0
+        # generator scratch
+        self._pink_rows = [0.0] * _PINK_ROWS
+        self._pink_ctr = 0; self._pink_key = 0
+        self._qrn_env = 0.0; self._qrn_sign = 1.0
+        self._crash_env = 0.0; self._crash_lp = 0.0
+
+    def any_enabled(self):
+        return any(c["enabled"] for c in self.channels.values())
+
+    def mix(self, n):
+        acc = [0.0] * n
+        for name, (gen, _is_sig, _d) in NOISE_CHANNELS.items():
+            ch = self.channels[name]
+            if not ch["enabled"]:
+                continue
+            g = _db2lin(ch["level_db"])
+            block = gen(self, ch, n)
+            for i in range(n):
+                acc[i] += block[i] * g
+        # soft clip (tanh) to keep within float range without hard edges
+        for i in range(n):
+            acc[i] = math.tanh(acc[i])
+        return acc
+
+    def snapshot(self):
+        """JSON-safe view for /state readback + Claude/QA hooks."""
+        return {name: dict(ch) for name, ch in self.channels.items()}
+
+
+# Query params understood by the noise bench (shared by the web panel and the
+# Claude/QA hooks). Every channel is driven through the SAME /set surface:
+#
+#   /set?noise_<chan>=1|0                     enable / disable a channel
+#   /set?noise_<chan>_level=<dBFS>            set its level (e.g. -20)
+#   /set?noise_<chan>_<knob>=<val>            set a per-channel knob (rate/hz/freq/prf/wpm)
+#   /set?noise_voice_wav=<path>               WAV file for the voice channel
+#   /set?noise_reset=1                        disable every channel
+#   /set?noise_preset=<name>                  load a named scene (see NOISE_PRESETS)
+#
+# and /state returns radio.noise_mixer.snapshot() for readback / assertions.
+_NOISE_KNOBS = {"level", "rate", "hz", "freq", "prf", "wpm"}
+
+
+def apply_noise_params(radio, q):
+    mx = radio.noise_mixer
+    getf = lambda k: float(q[k][0])
+    if q.get("noise_reset", ["0"])[0] == "1":
+        for ch in mx.channels.values():
+            ch["enabled"] = False
+        log("[noise] all channels disabled")
+    if "noise_voice_wav" in q:
+        radio.noise_wav_path = q["noise_voice_wav"][0] or None
+        mx.voice_wav = None                       # force lazy re-open with new path
+        log(f"[noise] voice WAV -> {radio.noise_wav_path}")
+    if "noise_preset" in q:
+        load_noise_preset(radio, q["noise_preset"][0])
+    for key in list(q.keys()):
+        if not key.startswith("noise_"):
+            continue
+        parts = key[len("noise_"):].split("_")     # <chan> or <chan>_<knob>
+        chan = parts[0]
+        if chan not in mx.channels:
+            continue
+        ch = mx.channels[chan]
+        if len(parts) == 1:                        # noise_<chan> = enable toggle
+            ch["enabled"] = q[key][0] == "1"
+            log(f"[noise] {chan} {'ON' if ch['enabled'] else 'off'} "
+                f"({ch.get('level_db', 0):.0f} dB)")
+        elif parts[1] in _NOISE_KNOBS:
+            knob = "level_db" if parts[1] == "level" else parts[1]
+            try:
+                ch[knob] = getf(key)
+            except (ValueError, KeyError):
+                pass
+
+
+# Named scenes — reproducible for the QA suite, one-click in the panel.
+NOISE_PRESETS = {
+    "quiet-20m":  {"pink": -30},
+    "night-40m":  {"pink": -22, "qrn": -24, "crashes": -22},
+    "storm":      {"pink": -20, "qrn": -12, "crashes": -10},
+    "noisy-qth":  {"pink": -24, "powerline": -16, "hash": -18},
+    "birdie-hell":{"pink": -28, "birdie": -18, "powerline": -22},
+    "voice-in-noise": {"voice": -14, "pink": -22, "qrn": -20},
+    "cw-in-noise":    {"cw": -16, "pink": -24, "qrn": -22},
+}
+
+
+def load_noise_preset(radio, name):
+    mx = radio.noise_mixer
+    scene = NOISE_PRESETS.get(name)
+    if scene is None:
+        log(f"[noise] unknown preset '{name}'"); return
+    for ch in mx.channels.values():                # presets are absolute: start clean
+        ch["enabled"] = False
+    for chan, level in scene.items():
+        if chan in mx.channels:
+            mx.channels[chan]["enabled"] = True
+            mx.channels[chan]["level_db"] = level
+    log(f"[noise] preset '{name}' -> {', '.join(scene)}")
+
+
 class Radio:
     def __init__(self, ip, ae_ip, pattern="ramp", bins=BINS, fps=FPS, width_khz=SIGNAL_WIDTH_KHZ,
                  port=DEFAULT_PORT, radio_id=0, model=MODEL):
@@ -747,6 +1064,11 @@ class Radio:
         self.audio_reduced_bw = False  # set True when AE sends 'client set send_reduced_bw_dax=1'
         self.audio_source   = AUDIO_SRC_SILENCE  # default silent: SILENCE | TONE | NOISE | WAV
         self.audio_wav_path = None             # filesystem path to WAV file (used when source=wav)
+        # HF noise bench — additive mixer for AE noise-reduction testing. When
+        # ANY channel is enabled it OVERRIDES audio_source and streams the
+        # summed voice+CW+noise mix instead. voice channel plays this WAV.
+        self.noise_mixer    = NoiseMixer()
+        self.noise_wav_path = None             # WAV for the mixer's 'voice' channel
         # dax_rx stream state (RADE / digital decode path). AE arms this via
         # 'stream create type=dax_rx dax_channel=N' when a slice goes RADE/DIGU;
         # we register an id back so AE feeds these packets to its host-side decoder.
@@ -774,7 +1096,10 @@ class Radio:
                 "freq": round(self.slice_freq, 5), "mode": self.slice_mode, "tx": self.tx_on,
                 "pattern": self.pattern, "power_w": round(self.tx_power_w),
                 "meter_dbm": round(self.last_vfo_dbm, 1),
-                "slices": len(self.slices), "max_slices": self.max_slices}
+                "slices": len(self.slices), "max_slices": self.max_slices,
+                "noise": self.noise_mixer.snapshot(),           # HF noise bench state
+                "noise_active": self.noise_mixer.any_enabled(),
+                "noise_wav": self.noise_wav_path}
 
     def dbm_to_pixel(self, dbm):
         p = (self.max_dbm - dbm) / (self.max_dbm - self.min_dbm) * (self.y_pixels - 1)
@@ -1322,8 +1647,19 @@ class Radio:
                         log(f"[audio] WAV open failed ({e}), tone"); src = AUDIO_SRC_TONE; wav = None
 
                 any_muted = any(sl.get("muted") for sl in self.slices.values())
+                mixer = self.noise_mixer
                 if self.paused or any_muted:                       # Stop / slice mute: silence (stream stays
                     mono = [0.0] * AUDIO_FRAMES                     #   alive so Go resumes with continuous timing)
+                elif mixer.any_enabled():                          # NOISE BENCH overrides audio_source: stream the
+                    # additive voice+CW+noise mix. Keep the mixer's voice WAV in
+                    # sync with the requested path (lazy open, hot-swappable).
+                    if mixer.voice_wav is None and self.noise_wav_path:
+                        try:
+                            mixer.voice_wav = WavPlayer(self.noise_wav_path)
+                        except Exception as e:
+                            log(f"[noise] voice WAV open failed ({e})")
+                            self.noise_wav_path = None
+                    mono = mixer.mix(AUDIO_FRAMES)
                 elif src == AUDIO_SRC_WAV and wav:
                     mono = wav.read(AUDIO_FRAMES)
                 elif src == AUDIO_SRC_NOISE:
@@ -1695,6 +2031,16 @@ h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=rang
 <br>Takes effect on next audio stream start (reconnect AE if already connected).</div>
 </div>
 <hr style="border-color:#333;margin:20px 0">
+<h3 style="color:#5cf;margin:0 0 4px">HF Noise Bench <span style="color:#888;font-size:12px;font-weight:normal">— additive audio for testing AE's noise reduction</span></h3>
+<div style="font-size:12px;color:#888;margin-bottom:10px">Each channel is generated live (never a recording) and <b>sums into the audio AE hears</b> on its RX audio path — the same buffer RN2/NR2/NR4/BNR clean up. Toggle any combination; set levels in dBFS. When any channel is on it overrides the Audio-source picker above.</div>
+<div style="margin-bottom:10px">
+  <span style="font-size:13px;color:#aaa">Scene presets:</span>
+  <span id=presets></span>
+  <button onclick="fetch('/set?noise_reset=1');setTimeout(pollNoise,120)" style="margin-left:6px;background:#511;color:#fcc;border:none;border-radius:4px;padding:4px 9px;cursor:pointer">All off</button>
+</div>
+<div id=noisebench style="display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;max-width:560px"></div>
+<div id=noise_voicewav style="margin-top:8px;font-size:12px;color:#888"></div>
+<hr style="border-color:#333;margin:20px 0">
 <details style="margin-top:4px">
 <summary style="color:#5cf;font-size:18px;font-weight:bold;cursor:pointer">Tests &amp; reports</summary>
 <div style="margin-top:12px">
@@ -1864,8 +2210,65 @@ function livePoll(){{fetch('/live-test/status').then(r=>r.json()).then(s=>{{
   box.innerHTML=h;
 }}).catch(()=>{{}});}}
 
-loadFixtures();loadRulers();loadReports();
-pollStatus();setInterval(pollStatus,1500);
+// ---- HF noise bench ----
+// [name, label, knob-or-null, knob-label, min, max, step]
+var NOISE_CH=[
+ ['voice','Voice (WAV)',null,'',0,0,0],
+ ['cw','CW tone','hz','Hz',300,1200,10],
+ ['white','White / AWGN',null,'',0,0,0],
+ ['pink','Pink / band hiss',null,'',0,0,0],
+ ['qrn','QRN impulse',',rate','imp/s',1,60,1],
+ ['powerline','Power-line buzz','freq','Hz',50,60,10],
+ ['crashes','Static crashes','rate','cr/s',0.1,3,0.1],
+ ['birdie','Birdie carrier','hz','Hz',300,3000,10],
+ ['hash','SMPS hash','prf','Hz',30,400,10],
+ ['woodpecker','Woodpecker','prf','pps',2,50,1]];
+var NOISE_PRESETS=['quiet-20m','night-40m','storm','noisy-qth','birdie-hell','voice-in-noise','cw-in-noise'];
+function nset(k,v){{fetch('/set?noise_'+k+'='+v).then(()=>setTimeout(pollNoise,80));}}
+function buildNoise(){{
+  var g=document.getElementById('noisebench');g.innerHTML='';
+  NOISE_CH.forEach(function(c){{
+    var name=c[0],lbl=c[1],knob=c[2];
+    var cb='<input type=checkbox id=nc_'+name+' onchange="nset(\''+name+'\',this.checked?1:0)">';
+    var lv='<input type=range id=nl_'+name+' min=-60 max=0 step=1 style="width:100%" '+
+           'oninput="document.getElementById(\'nlv_'+name+'\').textContent=this.value;'+
+           'nset(\''+name+'_level\',this.value)"> ';
+    var lvtxt='<span id=nlv_'+name+' style="font-family:monospace;color:#5cf;min-width:34px;display:inline-block">-</span> dB';
+    var kn='';
+    if(knob){{var kk=knob.replace(',',''),mn=c[4],mx=c[5],st=c[6];
+      kn='<span style="font-size:12px;color:#888">'+c[3]+' </span>'+
+         '<input type=range id=nk_'+name+' min='+mn+' max='+mx+' step='+st+' style="width:70px" '+
+         'oninput="document.getElementById(\'nkv_'+name+'\').textContent=this.value;'+
+         'nset(\''+name+'_'+kk+'\',this.value)"> '+
+         '<span id=nkv_'+name+' style="font-family:monospace;color:#8cf">-</span>';}}
+    g.innerHTML+='<label style="margin:0;font-size:13px">'+cb+' '+lbl+'</label>'+
+                 '<div style="display:flex;align-items:center;gap:6px">'+lv+lvtxt+'</div>'+
+                 '<div style="white-space:nowrap">'+kn+'</div>';
+  }});
+  var p=document.getElementById('presets');
+  NOISE_PRESETS.forEach(function(nm){{p.innerHTML+='<button onclick="fetch(\'/set?noise_preset='+nm+
+    '\').then(()=>setTimeout(pollNoise,120))" style="background:#234;color:#bdf;border:1px solid #456;'+
+    'border-radius:4px;padding:4px 8px;margin:2px;cursor:pointer;font-size:12px">'+nm+'</button>';}});
+  pollNoise();
+}}
+function pollNoise(){{fetch('/state').then(r=>r.json()).then(function(arr){{
+  // single-radio panel: /state is a list; this radio is index 0 here
+  var st=Array.isArray(arr)?arr[0]:arr; if(!st||!st.noise)return;
+  NOISE_CH.forEach(function(c){{var name=c[0],ch=st.noise[name];if(!ch)return;
+    var cb=document.getElementById('nc_'+name);if(cb)cb.checked=!!ch.enabled;
+    var l=document.getElementById('nl_'+name);if(l){{l.value=ch.level_db;
+      document.getElementById('nlv_'+name).textContent=ch.level_db;}}
+    var kk=c[2]?c[2].replace(',',''):null;
+    if(kk&&ch[kk]!==undefined){{var k=document.getElementById('nk_'+name);
+      if(k){{k.value=ch[kk];document.getElementById('nkv_'+name).textContent=ch[kk];}}}}
+  }});
+  var vw=document.getElementById('noise_voicewav');
+  if(vw)vw.innerHTML=st.noise.voice&&st.noise.voice.enabled?
+    ('Voice channel uses WAV: <code>'+(st.noise_wav||'(none set — use the WAV path box above)')+'</code>'):'';
+}}).catch(()=>{{}});}}
+
+loadFixtures();loadRulers();loadReports();buildNoise();
+pollStatus();setInterval(pollStatus,1500);setInterval(pollNoise,2000);
 upd();
 </script></body></html>"""
 
@@ -1924,6 +2327,10 @@ def start_control_server(radio, port):
                     "tx": radio.tx_on,
                     "meter_dbm": round(radio.last_vfo_dbm, 1),
                 })
+            if u.path == "/state":
+                # List form (one radio) so the noise-bench JS is identical to the
+                # rack panel's /state — pollNoise() reads arr[0].
+                return self._json([radio.state()])
             # ---- test-bench routes (JSON / report files) ----
             if u.path == "/fixtures":
                 return self._json(list_fixtures())
@@ -1999,6 +2406,7 @@ def start_control_server(radio, port):
                     if "wav_path" in q:
                         radio.audio_wav_path = q["wav_path"][0] or None
                         log(f"[ctl] audio_wav_path -> {radio.audio_wav_path}")
+                    apply_noise_params(radio, q)
                 except ValueError:
                     pass
                 self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
