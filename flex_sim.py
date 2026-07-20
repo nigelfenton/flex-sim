@@ -138,7 +138,15 @@ AUDIO_SRC_WAV   = "wav"     # WAV file playback (looped)
 
 
 def log(*a):
-    print(time.strftime("%H:%M:%S"), *a, flush=True)
+    # Encoding-safe: on Windows the console is often cp1252, which raises
+    # UnicodeEncodeError on non-ASCII (→, —, …). A crash in log() from inside a
+    # worker thread (e.g. audio_loop) silently kills that thread and its stream,
+    # so NEVER let a log character take down a thread — fall back to ASCII.
+    try:
+        print(time.strftime("%H:%M:%S"), *a, flush=True)
+    except UnicodeEncodeError:
+        safe = [str(x).encode("ascii", "replace").decode("ascii") for x in a]
+        print(time.strftime("%H:%M:%S"), *safe, flush=True)
 
 
 def local_ip():
@@ -927,6 +935,89 @@ class NoiseMixer:
     def snapshot(self):
         """JSON-safe view for /state readback + Claude/QA hooks."""
         return {name: dict(ch) for name, ch in self.channels.items()}
+
+    def spectrum(self, n, floor_dbm, span_hz, center_bin):
+        """Render the ACTIVE noise scene as a dBm-per-bin display spectrum, so
+        the waterfall SHOWS what the audio mixer is producing.
+
+        This is an analytic render of each channel's known spectral signature
+        (not a live FFT of the audio — that would be pure-Python-slow and only
+        span the audio bandwidth). The audio path and this display path both
+        read the SAME channel levels, so a change in either is reflected in both.
+
+        n           bins in the row
+        floor_dbm   the configured display floor (quiet baseline)
+        span_hz     total display span in Hz (maps audio Hz -> bins)
+        center_bin  the VFO bin (audio 0 Hz sits here; +Hz to the right)
+        """
+        out = [floor_dbm] * n
+        hz_per_bin = span_hz / n if n else 1.0
+
+        def add_db(b, dbm):                       # power-sum a contribution into a bin
+            if 0 <= b < n:
+                a, x = out[b], dbm
+                hi, lo = (a, x) if a >= x else (x, a)
+                out[b] = hi + 10.0 * math.log10(1.0 + 10.0 ** ((lo - hi) / 10.0))
+
+        def bin_of(hz):                           # audio Hz -> display bin (USB: +Hz above VFO)
+            return int(center_bin + hz / hz_per_bin)
+
+        # Map a channel's level_db (dBFS-ish) to an on-screen dBm. Reference the
+        # display so a -20 dBFS channel sits a sensible distance above the floor.
+        def scr(level_db, headroom=90.0):
+            return floor_dbm + headroom + level_db
+
+        for name, ch in self.channels.items():
+            if not ch["enabled"]:
+                continue
+            lvl = ch["level_db"]
+            if name == "white":
+                base = scr(lvl) - 12.0
+                for b in range(n):
+                    add_db(b, base + self.rng.uniform(-3.0, 3.0))
+            elif name == "pink":
+                # sloped floor: more power low (left), tapering up-band
+                peak = scr(lvl) - 8.0
+                for b in range(n):
+                    frac = b / max(1, n - 1)
+                    add_db(b, peak - 18.0 * frac + self.rng.uniform(-3.0, 3.0))
+            elif name == "qrn":
+                # impulse = broadband vertical streak, only on frames one fires
+                if self.rng.random() < min(0.9, ch.get("rate", 12.0) / 20.0):
+                    top = scr(lvl) + 6.0
+                    for b in range(n):
+                        add_db(b, top + self.rng.uniform(-6.0, 2.0))
+            elif name == "crashes":
+                if self.rng.random() < 0.15:
+                    top = scr(lvl)
+                    for b in range(n):
+                        add_db(b, top + self.rng.uniform(-8.0, 2.0))
+            elif name == "birdie":
+                b = bin_of(ch.get("hz", 1000.0))
+                for d in (-1, 0, 1):
+                    add_db(b + d, scr(lvl) + (10.0 if d == 0 else -6.0))
+            elif name == "powerline":
+                f0 = ch.get("freq", 60.0)
+                for h in range(1, 12, 2):
+                    add_db(bin_of(f0 * h), scr(lvl) - 3.0 * (h // 2))
+            elif name == "hash":
+                # broadband clumps
+                for b in range(n):
+                    add_db(b, scr(lvl) - 6.0 + self.rng.uniform(-4.0, 4.0))
+            elif name == "woodpecker":
+                if self.rng.random() < 0.5:
+                    top = scr(lvl)
+                    for b in range(n):
+                        add_db(b, top + self.rng.uniform(-5.0, 3.0))
+            elif name == "cw":
+                b = bin_of(ch.get("hz", 700.0))
+                for d in (-1, 0, 1):
+                    add_db(b + d, scr(lvl) + (8.0 if d == 0 else -8.0))
+            elif name == "voice":
+                # SSB-ish band 300..2700 Hz above the VFO
+                for b in range(bin_of(300), bin_of(2700)):
+                    add_db(b, scr(lvl) - 6.0 + self.rng.uniform(-6.0, 3.0))
+        return out
 
 
 # Query params understood by the noise bench (shared by the web panel and the
@@ -1744,6 +1835,14 @@ class Radio:
                     self.tx_mox = want_tx
                     self.emit_transmit_status()
                 keyed = ctx.cw_keydown if self.pattern == "cw" else self.tx_on
+                # NOISE BENCH: when any channel is on, the DISPLAY shows the noise
+                # scene (audio path already streams the mix). So the waterfall/pan
+                # match what you hear. span_hz here is the audio Hz -> bin mapping;
+                # the noise sits within a few kHz of the VFO like real RX audio.
+                if self.noise_mixer.any_enabled() and want_tx is None:
+                    audio_span_hz = 8000.0        # show +/-4 kHz of audio around the VFO
+                    levels = self.noise_mixer.spectrum(
+                        ctx.n, self.noise_floor_dbm, audio_span_hz, ctx.center)
             if levels is not None and tc != last_tc:               # one pan/wf row per waterfall tick
                 pixels = [self.dbm_to_pixel(d) for d in levels]     # generated once; each stacked panadapter
                 intens = [self.dbm_to_wf_raw(d) for d in levels]    # shows it, centred on ITS slice (low_hz).
