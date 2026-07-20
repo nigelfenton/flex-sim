@@ -721,6 +721,13 @@ def _db2lin(db):
     return 10.0 ** (db / 20.0)
 
 
+def _tnf_width_hz(raw):
+    """AE sends TNF width in MHz (TnfModel.cpp:86, width/1e6). Convert to Hz,
+    tolerating an already-Hz value defensively (matches AE's own parser)."""
+    v = float(raw)
+    return int(round(v * 1.0e6)) if 0.0 < v < 1.0 else max(10, int(round(v)))
+
+
 # ---- signal channels (the WANTED signal NR must PRESERVE) -----------------
 
 def sig_voice(st, ch, n):
@@ -913,6 +920,10 @@ class NoiseMixer:
         self._pink_ctr = 0; self._pink_key = 0
         self._qrn_env = 0.0; self._qrn_sign = 1.0
         self._crash_env = 0.0; self._crash_lp = 0.0
+        # TNF (tracking notch) — audio Hz offsets to remove + per-notch biquad state
+        self._notch_hz = []
+        self._notch_width_hz = {}   # round(f_hz) -> width Hz (for the display dip)
+        self._notch_state = {}
 
     def any_enabled(self):
         return any(c["enabled"] for c in self.channels.values())
@@ -927,10 +938,46 @@ class NoiseMixer:
             block = gen(self, ch, n)
             for i in range(n):
                 acc[i] += block[i] * g
+        # Tracking Notch Filters: remove each notched AUDIO frequency in the time
+        # domain (biquad notch), so a TNF placed on the birdie kills the tone you
+        # hear -- matching the display notch. self.notch_hz is a list of audio Hz.
+        for f_hz in self._notch_hz:
+            acc = self._apply_notch(acc, f_hz)
         # soft clip (tanh) to keep within float range without hard edges
         for i in range(n):
             acc[i] = math.tanh(acc[i])
         return acc
+
+    def set_notches(self, notches):
+        """Set TNF notches. `notches` = list of (audio_hz, width_hz) offsets from
+        the VFO; only those inside the audio band are kept."""
+        self._notch_hz = []
+        self._notch_width_hz = {}
+        for f, w in notches:
+            if abs(f) < self.rate / 2:
+                self._notch_hz.append(f)
+                self._notch_width_hz[round(f)] = w
+
+    def _apply_notch(self, buf, f_hz, q=8.0):
+        """One-pole-pair biquad notch at f_hz, with per-notch state carried across
+        blocks (keyed by rounded freq) so there are no block-edge clicks."""
+        w0 = 2.0 * math.pi * f_hz / self.rate
+        alpha = math.sin(w0) / (2.0 * q)
+        cw = math.cos(w0)
+        b0, b1, b2 = 1.0, -2.0 * cw, 1.0
+        a0, a1, a2 = 1.0 + alpha, -2.0 * cw, 1.0 - alpha
+        b0, b1, b2 = b0 / a0, b1 / a0, b2 / a0
+        a1, a2 = a1 / a0, a2 / a0
+        st = self._notch_state.setdefault(round(f_hz), [0.0, 0.0, 0.0, 0.0])
+        x1, x2, y1, y2 = st
+        out = [0.0] * len(buf)
+        for i, x0 in enumerate(buf):
+            y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+            out[i] = y0
+            x2, x1 = x1, x0
+            y2, y1 = y1, y0
+        st[0], st[1], st[2], st[3] = x1, x2, y1, y2
+        return out
 
     def snapshot(self):
         """JSON-safe view for /state readback + Claude/QA hooks."""
@@ -1017,6 +1064,15 @@ class NoiseMixer:
                 # SSB-ish band 300..2700 Hz above the VFO
                 for b in range(bin_of(300), bin_of(2700)):
                     add_db(b, scr(lvl) - 6.0 + self.rng.uniform(-6.0, 3.0))
+        # TNF display notch: carve a dip to the floor at each notched offset, so a
+        # notch placed on the birdie removes its line from the waterfall too. Width
+        # in bins from the notch's audio width (min a couple of bins to be visible).
+        for f_hz in self._notch_hz:
+            nb = bin_of(f_hz)
+            half = max(1, int((self._notch_width_hz.get(round(f_hz), 100)) / (2 * hz_per_bin)))
+            for b in range(nb - half, nb + half + 1):
+                if 0 <= b < n:
+                    out[b] = floor_dbm
         return out
 
 
@@ -1131,6 +1187,12 @@ class Radio:
         self.slice_freq = CENTER_MHZ                            # active slice freq (= VFO); mirrors slices[active]
         self.slice_mode = "USB"
         self.slices = {}            # index -> {"freq":MHz,"mode":str,"active":bool}; AE adds via +RX (slice create)
+        # Tracking Notch Filters (waterfall notch). AE sends 'tnf create/set/remove'
+        # (radio-side, like ANF) and DRAWS the marker only when we echo status back.
+        # Unlike ANF, we emulate it: notch the mix audio + spectrum render so the
+        # tone vanishes from ear AND eye. id -> {"freq":MHz,"width":Hz,"depth":n,"permanent":0|1}
+        self.tnfs = {}
+        self._next_tnf_id = 1
         self.active_slice = 0       # the slice the pan/waterfall/primary carrier follow
         self.conn = None            # active TCP conn (so the control panel can push TX status)
         self.tx_mox = False         # live: TX keyed (panel toggle or AE's 'transmit set mox=1')
@@ -1481,8 +1543,57 @@ class Radio:
             self.reply(conn, seq)
             self._sync_active_slice()
             self.emit_slice_status(conn, idx)
+        elif c.startswith("tnf "):
+            self._handle_tnf(conn, seq, c)
         else:
             self.reply(conn, seq)
+
+    def _handle_tnf(self, conn, seq, c):
+        """Tracking Notch Filter: 'tnf create freq=<MHz>' (reply = new id),
+        'tnf set <id> freq=|width=|depth=|permanent=', 'tnf remove <id>'.
+        AE draws/holds the marker only when we echo 'tnf <id> ...' status back."""
+        parts = c.split()
+        sub = parts[1] if len(parts) > 1 else ""
+        if sub == "create":
+            kv = parse_kvs(c)
+            tid = self._next_tnf_id
+            self._next_tnf_id += 1
+            self.tnfs[tid] = {
+                "freq": float(kv.get("freq", self.slice_freq)),   # MHz
+                "width": 100,    # Hz (AE's default; it will 'set width=' after)
+                "depth": 1,
+                "permanent": 0,
+            }
+            self.reply(conn, seq, str(tid))       # AE learns the id from the reply body
+            self.emit_tnf_status(conn, tid)       # ...then draws the marker from status
+            log(f"[tnf] create id={tid} freq={self.tnfs[tid]['freq']:.6f}")
+        elif sub == "set" and len(parts) >= 3 and parts[2].isdigit():
+            tid = int(parts[2])
+            t = self.tnfs.get(tid)
+            if t is not None:
+                kv = parse_kvs(c)
+                if "freq" in kv:      t["freq"] = float(kv["freq"])            # MHz
+                if "width" in kv:     t["width"] = _tnf_width_hz(kv["width"])  # AE sends MHz
+                if "depth" in kv:     t["depth"] = int(float(kv["depth"]))
+                if "permanent" in kv: t["permanent"] = int(kv["permanent"] == "1")
+                self.emit_tnf_status(conn, tid)
+            self.reply(conn, seq)
+        elif sub == "remove" and len(parts) >= 3 and parts[2].isdigit():
+            tid = int(parts[2])
+            self.tnfs.pop(tid, None)
+            self.reply(conn, seq)
+            self.status(conn, f"tnf {tid} removed=1")   # AE clears the marker
+            log(f"[tnf] remove id={tid}")
+        else:
+            self.reply(conn, seq)
+
+    def emit_tnf_status(self, conn, tid):
+        t = self.tnfs.get(tid)
+        if not t or not conn:
+            return
+        # Status shape AE parses (RadioModel.cpp:6320): width in Hz, freq in MHz.
+        self.status(conn, f"tnf {tid} freq={t['freq']:.6f} width={t['width']} "
+                          f"depth={t['depth']} permanent={t['permanent']}")
 
     def emit_pan_status(self, conn, pid=None):
         if pid is None: pid = self._primary_pan()
@@ -1839,6 +1950,14 @@ class Radio:
                 # scene (audio path already streams the mix). So the waterfall/pan
                 # match what you hear. span_hz here is the audio Hz -> bin mapping;
                 # the noise sits within a few kHz of the VFO like real RX audio.
+                # Push live TNF notches into the shared mixer: each TNF's RF freq
+                # becomes an audio Hz offset from the slice VFO. The mixer applies
+                # them to BOTH the audio (mix(), in the audio thread) and the
+                # display (spectrum(), below) -- one source of truth.
+                vfo_mhz = self.slice_freq
+                self.noise_mixer.set_notches(
+                    [((t["freq"] - vfo_mhz) * 1.0e6, t["width"])
+                     for t in self.tnfs.values()])
                 if self.noise_mixer.any_enabled() and want_tx is None:
                     # Map audio Hz -> bins through AE's LIVE span (binbw_hz), not a
                     # fixed span, so a tone lands at its TRUE on-screen frequency.
