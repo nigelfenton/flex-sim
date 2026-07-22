@@ -1190,6 +1190,10 @@ class Radio:
         self.port = port                # control/data port we bind + advertise (discovery dest stays 4992)
         self.model = model if model in MODELS else MODEL
         self.max_slices = MODELS.get(self.model, {}).get("slices", 4)   # advertised cap (multi-slice TODO)
+        # SCU count gates 2-SCU-only features. AE decides diversity from the
+        # MODEL it is told, so this is really a self-consistency guard: it stops
+        # the sim inventing a diversity pair on a radio that could not do one.
+        self.scu = MODELS.get(self.model, {}).get("scu", 1)
         # Per-radio identity, so many radios can live in one process (the "rack").
         # Each value must be unique per radio or AE cross-wires them; derived from
         # radio_id off the base constants below.
@@ -1409,7 +1413,11 @@ class Radio:
             freq = float(kvs["freq"]) if "freq" in kvs else self.slice_freq
             mode = kvs.get("mode", self.slice_mode)
             for s in self.slices.values(): s["active"] = False
-            self.slices[idx] = {"freq": freq, "mode": mode, "active": True, "pan": pid}
+            # A real radio always has exactly one TX slice; the first one created
+            # takes it. Diversity children are RX-only and never claim it.
+            is_tx = not any(s.get("tx") for s in self.slices.values())
+            self.slices[idx] = {"freq": freq, "mode": mode, "active": True, "pan": pid,
+                                "tx": is_tx}
             self.pans[pid]["slice"] = idx
             self.pans[pid]["center"] = freq                # pan frames on its slice at creation
             self.active_slice = idx
@@ -1550,12 +1558,27 @@ class Radio:
                 if "anf" in kvs:
                     self.slices[idx]["anf"] = (kvs["anf"] == "1")
                     log(f"[slice] {idx} anf={kvs['anf']}")
+                # Diversity RX (2-SCU radios only). AE sends 'slice set N
+                # diversity=1'. The radio answers by creating a CHILD slice that
+                # is RX-only and shares the PARENT's panadapter — the two SCUs
+                # feed one combined receiver. Turning it off removes the child.
+                if "diversity" in kvs:
+                    if kvs["diversity"] == "1":
+                        self._diversity_on(conn, idx)
+                    else:
+                        self._diversity_off(conn, idx)
             self.reply(conn, seq)
         elif c.startswith("slice remove"):
             idx = self._slice_index_from(c)
             gone = self.slices.pop(idx, None)
-            if gone:                                       # free its panadapter slot too
-                self.pans.pop(gone.get("pan"), None)
+            if gone:
+                # Free its panadapter slot — but ONLY if no other slice is still
+                # on that pan. A diversity child deliberately SHARES its parent's
+                # pan, so popping unconditionally would delete the pan out from
+                # under the parent.
+                pid = gone.get("pan")
+                if pid is not None and not any(s.get("pan") == pid for s in self.slices.values()):
+                    self.pans.pop(pid, None)
             self.reply(conn, seq)
             self.status(conn, f"slice {idx} in_use=0")
             log(f"[slice] remove -> slice {idx}  ({len(self.slices)}/{self.max_slices})")
@@ -1698,14 +1721,82 @@ class Radio:
             self.slice_freq, self.slice_mode = sl["freq"], sl["mode"]
             self.center_mhz = self.slice_freq              # active slice drives the pan/waterfall centre
 
+    def _diversity_on(self, conn, parent_idx):
+        """2-SCU diversity: add an RX-only child slice on the PARENT's pan.
+
+        Modelled on FlexLib: the child is a distinct slice tied to its parent by
+        DiversitySlicePartner, it is never a transmit slice, and it shares the
+        parent's panadapter rather than getting one of its own. That shape is
+        what AE keys on (diversity_child / diversity_parent / diversity_index).
+        """
+        parent = self.slices.get(parent_idx)
+        if not parent or parent.get("diversity"):
+            return                                          # unknown slice, or already on
+        if self.scu < 2:
+            log(f"[slice] diversity refused: {self.model} is single-SCU")
+            return
+        child_idx = self._next_slice_index()
+        if child_idx is None:
+            log(f"[slice] diversity refused: no free slice ({self.max_slices} in use)")
+            return
+        pid = parent.get("pan") or self._primary_pan()
+        parent.update(diversity=True, div_parent=True, div_child=False, div_index=0)
+        self.slices[child_idx] = {
+            "freq": parent["freq"], "mode": parent["mode"], "active": False,
+            "pan": pid,                                     # SAME pan as the parent
+            "tx": False,                                    # RX-only, always
+            "diversity": True, "div_parent": False, "div_child": True, "div_index": 1,
+        }
+        self.emit_slice_status(conn, parent_idx)
+        self.emit_slice_status(conn, child_idx)
+        log(f"[slice] diversity ON -> parent {parent_idx} + child {child_idx} "
+            f"share pan 0x{pid:08X}  ({len(self.slices)}/{self.max_slices})")
+
+    def _diversity_off(self, conn, idx):
+        """Turn diversity off from either half of the pair; removes the child."""
+        sl = self.slices.get(idx)
+        if not sl or not sl.get("diversity"):
+            return
+        # Normalise to the parent, whichever half AE addressed.
+        parent_idx = idx if sl.get("div_parent") else next(
+            (i for i, s in self.slices.items() if s.get("div_parent")), None)
+        if parent_idx is None:
+            return
+        child_idx = next((i for i, s in self.slices.items() if s.get("div_child")), None)
+        for i in (parent_idx, child_idx):
+            if i is not None and i in self.slices:
+                self.slices[i].update(diversity=False, div_parent=False,
+                                      div_child=False, div_index=-1)
+        if child_idx is not None:
+            self.slices.pop(child_idx, None)
+            self.status(conn, f"slice {child_idx} in_use=0")
+            if self.active_slice == child_idx and self.slices:
+                self.active_slice = next(iter(self.slices))
+                self._sync_active_slice()
+        self.emit_slice_status(conn, parent_idx)
+        log(f"[slice] diversity OFF -> parent {parent_idx}, child {child_idx} removed")
+
     def emit_slice_status(self, conn, idx=None):
         if idx is None: idx = self.active_slice
         sl = self.slices.get(idx)
         if not sl: return
         pid = sl.get("pan") or self._primary_pan()
+        # tx=1 marks the transmit slice. Without it AE never populates its
+        # txByPan map, so anything keyed on "the TX slice" stays inert — the
+        # SPLIT/SWAP badges never render at all, for instance.
+        # diversity_* describes 2-SCU diversity RX: the child is an RX-only
+        # slave that shares its PARENT's panadapter (see handle of
+        # "slice set N diversity=").
+        div = ""
+        if sl.get("diversity"):
+            div = (f" diversity=1"
+                   f" diversity_parent={1 if sl.get('div_parent') else 0}"
+                   f" diversity_child={1 if sl.get('div_child') else 0}"
+                   f" diversity_index={sl.get('div_index', -1)}")
         self.status(conn, f"slice {idx} client_handle=0x{self.handle_hex} pan=0x{pid:08X} "
                           f"RF_frequency={sl['freq']:.6f} mode={sl['mode']} in_use=1 "
-                          f"active={1 if sl['active'] else 0}")
+                          f"tx={1 if sl.get('tx') else 0} "
+                          f"active={1 if sl['active'] else 0}{div}")
 
     def emit_radio_status(self, conn):
         # Capability advert. AE computes MaxSlices/SlicesRemaining from the radio status;
