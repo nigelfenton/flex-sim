@@ -2865,7 +2865,9 @@ def main():
     ap.add_argument("--base-port", type=int, default=None,
                     help="rack: port for the radios (each gets its own IP, so they share a port; default = --port)")
     ap.add_argument("--models", default=None,
-                    help="rack: comma-list of models per radio, e.g. FLEX-6300,FLEX-6600,FLEX-6700")
+                    help="model(s): comma-list, one per radio in rack mode, e.g. "
+                         "FLEX-6300,FLEX-6600,FLEX-6700. With a single radio the first entry "
+                         "sets its model (FLEX-6600/6700 advertise 2-SCU, so AE offers DIV)")
     ap.add_argument("--ctl-port", type=int, default=8731, help="web control-panel port")
     args = ap.parse_args()
     ip = args.ip or local_ip()
@@ -2885,11 +2887,17 @@ def main():
         except KeyboardInterrupt:
             log("bye")
         return
-    radio = Radio(ip, args.ae, args.pattern, args.bins, args.fps, args.width_khz, port=args.port)
+    # --models also selects the model for a SINGLE radio (first entry wins); an
+    # unknown name falls back to MODEL inside Radio.__init__.
+    single_model = ([m.strip() for m in args.models.split(",")] or [MODEL])[0] if args.models else MODEL
+    radio = Radio(ip, args.ae, args.pattern, args.bins, args.fps, args.width_khz,
+                  port=args.port, model=single_model)
     threading.Thread(target=radio.discovery_loop, daemon=True).start()
     threading.Thread(target=radio.prime_loop, daemon=True).start()
     start_control_server(radio, args.ctl_port)
-    log(f"flex-sim {FLEX_SIM_VERSION} - model={MODEL} serial={radio.serial} ip={ip} pattern={args.pattern}")
+    # Report the RADIO's model, not the module default — they differ whenever
+    # --models is used, and logging the global made a wrong model look correct.
+    log(f"flex-sim {FLEX_SIM_VERSION} - model={radio.model} serial={radio.serial} ip={ip} pattern={args.pattern}")
     log(f"discovery -> AE's UDP :{DISCOVERY_PORT}; control/data on :{args.port}"
         + ("  (same-host mode)" if args.port != DISCOVERY_PORT else ""))
     log(f"** control panel: http://{ip}:{args.ctl_port}/  (open in your host browser) **")
