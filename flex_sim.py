@@ -1234,8 +1234,15 @@ class Radio:
         self.active_slice = 0       # the slice the pan/waterfall/primary carrier follow
         self.conn = None            # active TCP conn (so the control panel can push TX status)
         self.tx_mox = False         # live: TX keyed (panel toggle or AE's 'transmit set mox=1')
+        # --txlog: characterise UDP arriving FROM AE (TX audio discovery).
+        self.txlog = False
+        self.txlog_interval = 5.0
+        self._txlog_state = {"streams": {}, "total": 0, "last_report": time.time()}
         self.tx_tune = False
         self.tx_power_w = 100.0      # live: forward power (W) reported while TX
+        # What the RADIO generates while tuning: "" (plain carrier) or "two_tone".
+        # AE sets this via 'transmit set tune_mode='; see tx_envelope().
+        self.tune_mode = ""
         self.tx_swr = 1.2           # live: SWR reported while TX
         self.cwx_wpm = 20           # CWX keyer speed (AE drives via 'cwx wpm')
         self.cwx_active = False      # an AE-initiated CWX transmission is in progress
@@ -1315,6 +1322,67 @@ class Radio:
                     except OSError: pass
             time.sleep(1.0)
 
+    def _log_inbound_datagram(self, data, addr):
+        """Characterise UDP arriving FROM AetherSDR (--txlog).
+
+        Answers, from observation rather than from reading AE's source, the
+        questions the TX-audio/parrot design has to settle first (see
+        TX_AUDIO_DESIGN.md): which stream AE actually uses for a given mode,
+        what the packet geometry is, and at what rate they arrive.
+
+        Prints a one-line summary per distinct stream id, then a periodic
+        rate/size report — NOT a line per packet, which at ~375 packets/s for
+        24 kHz audio would bury everything else.
+
+        VITA-49 header (see vita_header()): word 0 packs type/count/size,
+        word 1 is the stream id, then OUI/ICC/PCC, then timestamps. The PCC
+        (packet class code) is what AE uses to pick a decoder, so it is the
+        single most useful field for identifying the payload format.
+        """
+        # Ignore our OWN discovery broadcast looping back on the same host --
+        # it is plain ASCII key=value ("name=flex-sim model=..."), not VITA, and
+        # in same-host mode it lands right back here.
+        if data[:5] == b"name=":
+            return
+        now = time.time()
+        st = self._txlog_state
+        st["total"] += 1
+
+        sid = pcc = None
+        if len(data) >= 28:
+            try:
+                sid = struct.unpack(">I", data[4:8])[0]
+                pcc = struct.unpack(">H", data[14:16])[0]
+            except struct.error:
+                pass
+
+        key = (sid, pcc, len(data))
+        seen = st["streams"]
+        if key not in seen:
+            seen[key] = {"count": 0, "first": now}
+            log(f"[txlog] NEW inbound stream: id=0x{sid:08X} pcc=0x{pcc:04X} "
+                f"payload={len(data)}B from {addr[0]}  (mox={1 if self.tx_mox else 0})"
+                if sid is not None else
+                f"[txlog] NEW inbound datagram: {len(data)}B from {addr[0]} (non-VITA?)")
+            # First few bytes help identify a format the header alone doesn't.
+            log(f"[txlog]   head={data[:16].hex(' ')}")
+        seen[key]["count"] += 1
+
+        # Periodic summary: rate per stream + whether TX is keyed. One line per
+        # stream per interval, so a long capture stays readable.
+        if now - st["last_report"] >= self.txlog_interval:
+            span = now - st["last_report"]
+            log(f"[txlog] --- {st['total']} datagrams in {span:.1f}s  "
+                f"(mox={1 if self.tx_mox else 0} tune={1 if self.tx_tune else 0}) ---")
+            for (s_id, s_pcc, size), info in sorted(seen.items(), key=lambda kv: -kv[1]["count"]):
+                delta = info["count"] - info.get("reported", 0)
+                info["reported"] = info["count"]
+                if delta:
+                    ident = f"id=0x{s_id:08X} pcc=0x{s_pcc:04X}" if s_id is not None else "non-VITA"
+                    log(f"[txlog]   {ident} {size}B  {delta} pkt  {delta / span:.1f}/s")
+            st["last_report"] = now
+            st["total"] = 0
+
     def prime_loop(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1327,6 +1395,8 @@ class Radio:
             if self.ae_peer_ip and addr[0] == self.ae_peer_ip and not self.vita_dest:
                 self.vita_dest = addr
                 log(f"[udp] captured VITA dest from prime: {addr} ({len(data)}B)")
+            if self.txlog:
+                self._log_inbound_datagram(data, addr)
 
     def serve(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1529,10 +1599,34 @@ class Radio:
                         self.audio_stream_id = None
                         self.dax_channel = None
             self.reply(conn, seq)
+        elif c.startswith("transmit tune"):
+            # POSITIONAL form: "transmit tune 1|0". AE's two-tone/ATU tune uses
+            # this, NOT "transmit set tune=" -- measured on the wire 2026-07-22.
+            # Handling only the 'set' form meant every tune was silently ignored:
+            # the sim never keyed, so power stayed at the un-keyed floor.
+            parts = c.split()
+            self.tx_tune = (len(parts) > 2 and parts[2] == "1")
+            self.reply(conn, seq)
+            self.emit_transmit_status()
+            log(f"[tx] tune {'ON' if self.tx_tune else 'OFF'}"
+                f"{' (' + self.tune_mode + ')' if self.tune_mode else ''}")
         elif c.startswith("transmit set"):                 # AE keys TX (MOX / TUNE)
             kvs = parse_kvs(c)
             if "mox" in kvs:  self.tx_mox = kvs["mox"] == "1"
             if "tune" in kvs: self.tx_tune = kvs["tune"] == "1"
+            # tune_mode selects what the RADIO generates while tuning. AE's
+            # two-tone test sends 'tune_mode=two_tone' then 'transmit tune 1'
+            # and sends NO audio of its own -- measured on the wire 2026-07-22.
+            # A real Flex synthesises the tones in hardware, so we must too.
+            if "tune_mode" in kvs:
+                self.tune_mode = kvs["tune_mode"]
+                log(f"[tx] tune_mode={self.tune_mode}")
+            # Track the operator's power setting so the simulated envelope scales
+            # with it -- turning RF Power down must visibly reduce reported watts.
+            for k in ("rfpower", "tunepower"):
+                if k in kvs:
+                    try: self.tx_power_w = max(0.0, float(kvs[k]))
+                    except ValueError: pass
             self.reply(conn, seq)
             self.emit_transmit_status()
         elif c.startswith("cwx "):                          # AE's CW text keyer
@@ -1787,12 +1881,14 @@ class Radio:
         # diversity_* describes 2-SCU diversity RX: the child is an RX-only
         # slave that shares its PARENT's panadapter (see handle of
         # "slice set N diversity=").
-        div = ""
-        if sl.get("diversity"):
-            div = (f" diversity=1"
-                   f" diversity_parent={1 if sl.get('div_parent') else 0}"
-                   f" diversity_child={1 if sl.get('div_child') else 0}"
-                   f" diversity_index={sl.get('div_index', -1)}")
+        # Always send the diversity keys, including the all-zero case. Sending
+        # them ONLY while diversity is on leaves the client holding the last
+        # non-zero value after teardown — AE keeps diversity_parent=1 on a slice
+        # whose diversity=0, which then misleads anything that tests the flags.
+        div = (f" diversity={1 if sl.get('diversity') else 0}"
+               f" diversity_parent={1 if sl.get('div_parent') else 0}"
+               f" diversity_child={1 if sl.get('div_child') else 0}"
+               f" diversity_index={sl.get('div_index', -1)}")
         self.status(conn, f"slice {idx} client_handle=0x{self.handle_hex} pan=0x{pid:08X} "
                           f"RF_frequency={sl['freq']:.6f} mode={sl['mode']} in_use=1 "
                           f"tx={1 if sl.get('tx') else 0} "
@@ -1823,6 +1919,45 @@ class Radio:
                              f"{i}.unit={unit}", f"{i}.low={lo}", f"{i}.hi={hi}"])
             self.status(conn, f"meter {toks}")
         log(f"[->] emitted meter defs: {len(self.slices) or 1} S-meter(s) + TX FWDPWR/SWR")
+
+    def tx_envelope(self, t):
+        """Envelope (0..1) of what the RADIO is generating on transmit, at time t.
+
+        Stage 1a of TX_AUDIO_DESIGN.md. AE's two-tone test is radio-side: it sends
+        'transmit set tune_mode=two_tone' + 'transmit tune 1' and NO audio (measured
+        2026-07-22). A real Flex synthesises the tones itself, so the sim does too --
+        otherwise the sim sits silent through a two-tone and reports flat power,
+        which is simply wrong emulation.
+
+        two_tone : two equal sines, TWO_TONE_SPACING_HZ apart, summed. Their sum
+                   BEATS -- envelope |cos(pi*delta*t)| -- which is exactly what makes
+                   a two-tone the classic linearity/PEP test: peak power is 2x the
+                   single-tone average. Returning the real beat (rather than a flat
+                   line) is what lets the power meter swing the way an operator
+                   expects to see.
+        carrier  : steady dead-key, envelope 1.0 (what 'tune' does without two_tone).
+
+        ⚠ This is a SIMULATION of what the radio would emit. It is not, and must not
+        be presented as, a measurement -- see the honesty note in TX_AUDIO_DESIGN.md.
+        """
+        if self.tune_mode == "two_tone":
+            # Beat frequency = the tone spacing; |cos| because power follows the
+            # magnitude of the summed envelope, not its sign.
+            return abs(math.cos(math.pi * TWO_TONE_SPACING_HZ * t))
+        return 1.0
+
+    def tx_drive(self, t):
+        """(power_watts, alc_0_to_1) the radio is producing right now.
+
+        Power tracks the envelope SQUARED (envelope is amplitude, power is amplitude^2),
+        scaled by the operator's RF-power setting against the model's rated output.
+        """
+        env = self.tx_envelope(t)
+        # tx_power_w already tracks AE's 'transmit set rfpower=' / 'tunepower='.
+        watts = float(self.tx_power_w) * (env ** 2)
+        # ALC follows the instantaneous envelope; >0.95 is the "you are driving it
+        # hard" region an operator watches for.
+        return watts, env
 
     def emit_transmit_status(self):
         # interlock state drives AE's m_radioTransmitting; transmit status drives
@@ -2069,7 +2204,13 @@ class Radio:
                 levels, keyed = self._cwx_frame(ctx, now)
             else:
                 gen = PATTERNS.get(self.pattern, gen)              # live pattern switch
-                levels = gen(ctx, now - start)
+                # While the radio is generating a two-tone (stage 1a), SHOW the
+                # two tones rather than whatever RX pattern was configured --
+                # what you see should match what the radio is emitting.
+                if self.tx_on and self.tune_mode == "two_tone":
+                    levels = pat_two_tone(ctx, now - start)
+                else:
+                    levels = gen(ctx, now - start)
                 if self.pattern == "tx_blank":                    # faithful TX cycle: the gap == keyed.
                     want_tx = (levels is None)
                 elif self.pattern == "cw":                        # Morse keyer: TX for the whole over
@@ -2128,7 +2269,10 @@ class Radio:
                 last_tc = tc
             # TX meters every frame: real power/SWR while keyed, ~0 W / 1.0 SWR when not,
             # so AE's meter decays back to zero on de-key. CW/CWX key power per element.
-            pw = self.tx_power_w if keyed else 0.0
+            # Power follows the radio-generated envelope (stage 1a): a two-tone
+            # BEATS, so the meter swings between ~0 and full instead of sitting
+            # flat -- which is the whole point of watching a two-tone.
+            pw = self.tx_drive(now)[0] if keyed else 0.0
             sw = self.tx_swr if keyed else 1.0
             fwd_dbm = 10.0 * math.log10(max(pw, 1e-6)) + 30.0
             try:
@@ -2960,6 +3104,13 @@ def main():
                          "FLEX-6300,FLEX-6600,FLEX-6700. With a single radio the first entry "
                          "sets its model (FLEX-6600/6700 advertise 2-SCU, so AE offers DIV)")
     ap.add_argument("--ctl-port", type=int, default=8731, help="web control-panel port")
+    ap.add_argument("--txlog", action="store_true",
+                    help="log UDP arriving FROM AetherSDR: one line per new stream "
+                         "(id/PCC/size) plus a periodic rate report. Use it to find out "
+                         "which stream a TX mode really uses before building against it "
+                         "(see TX_AUDIO_DESIGN.md). Off by default — it is a discovery tool.")
+    ap.add_argument("--txlog-interval", type=float, default=5.0,
+                    help="seconds between --txlog rate reports (default 5)")
     args = ap.parse_args()
     ip = args.ip or local_ip()
     if args.radios > 1:                                    # ---- rack mode: N radios + strip panel ----
@@ -2983,6 +3134,10 @@ def main():
     single_model = ([m.strip() for m in args.models.split(",")] or [MODEL])[0] if args.models else MODEL
     radio = Radio(ip, args.ae, args.pattern, args.bins, args.fps, args.width_khz,
                   port=args.port, model=single_model)
+    radio.txlog = args.txlog
+    radio.txlog_interval = args.txlog_interval
+    if args.txlog:
+        log(f"[txlog] enabled — logging UDP from AE (report every {args.txlog_interval:g}s)")
     threading.Thread(target=radio.discovery_loop, daemon=True).start()
     threading.Thread(target=radio.prime_loop, daemon=True).start()
     start_control_server(radio, args.ctl_port)
