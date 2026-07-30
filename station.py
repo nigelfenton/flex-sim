@@ -62,7 +62,7 @@ class Station:
         self.acom = acom_sim.AcomServer(self.acom_amp)
         self.radio_proc = None
 
-    def start(self, with_radio, radio_port=None):
+    def start(self, with_radio, radio_port=None, pattern=None):
         threading.Thread(target=self.ag.tcp_server, daemon=True).start()
         threading.Thread(target=self.ag.broadcaster, daemon=True).start()
         threading.Thread(target=self.pgxl.serve, daemon=True).start()
@@ -75,6 +75,12 @@ class Station:
                 cmd = [sys.executable, flex]
                 if radio_port:
                     cmd += ["--port", str(radio_port)]
+                # Pass the pattern through: without it the radio runs the
+                # default 'ramp', which produces no usable TX drive -- so the
+                # amp gauges sit at zero and it looks like the AMP meters are
+                # broken when they are fine (bench 2026-07-30).
+                if pattern:
+                    cmd += ["--pattern", pattern]
                 self.radio_proc = subprocess.Popen(cmd)
                 print(f"[radio] spawned flex_sim.py on :{radio_port or 4992} "
                       f"(pid {self.radio_proc.pid})", flush=True)
@@ -213,6 +219,9 @@ def main():
     # here -- pick this sim by SERIAL (FLEXSIM00) in AE's radio list. Moving to
     # another port avoids the collision but AE then fails to complete the
     # connection at all (bench-tested 2026-07-30), which is worse.
+    ap.add_argument("--pattern", default="carrier",
+                    help="signal pattern for the spawned radio (default carrier: "
+                         "gives a real S-meter reading and TX drive, unlike 'ramp')")
     ap.add_argument("--radio-port", type=int, default=4992,
                     help="control/data port for the spawned radio "
                          "(default 5992; avoids a :4992 collision)")
@@ -220,7 +229,7 @@ def main():
     args = ap.parse_args()
 
     st = Station(args)
-    st.start(args.with_radio, args.radio_port)
+    st.start(args.with_radio, args.radio_port, args.pattern)
     print("[station] AG :9007 + PGXL :9008 + TGXL :9010 + SPE :4531 + ACOM :9600 up in one process")
     print(st.connect_table())
 
