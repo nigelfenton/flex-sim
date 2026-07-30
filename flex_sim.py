@@ -91,6 +91,15 @@ PCC_FFT, PCC_WF, PCC_METER = 0x8003, 0x8004, 0x8002
 METER_SID = 0x46000000       # meter VITA stream id (AE routes meters by PCC, not by sid)
 SLC_LEVEL_ID = 1             # (legacy) single-slice S-meter id; superseded by SLICE_METER_BASE+index
 FWDPWR_ID, SWR_ID = 2, 3     # TX meters: forward power (src=TX nam=FWDPWR, dBm->W) + SWR
+# Radio-published AMPLIFIER meters (src=AMP). AE creates the Amp applet's
+# gauges from THESE, not from the PGXL's own :9008 telemetry -- without them a
+# connected PGXL has nowhere to land and the applet stays empty (found on the
+# bench 2026-07-30). Routing rule in MeterModel::defineMeter(): src=AMP with
+# nam=FWD (unit dBm) / RL / TEMP, and `num` is matched against the TGXL handle
+# -- num != tgxlHandle => PGXL (Amp applet); num == tgxlHandle => TGXL (Tuner
+# applet). We publish under the AMPLIFIER handle so they route to the Amp side.
+# ⚠ nam=RL is RETURN LOSS in dB (AE converts to SWR), NOT an SWR ratio.
+AMP_FWD_ID, AMP_RL_ID, AMP_TEMP_ID = 4, 5, 6
 SLICE_METER_BASE = 10        # per-slice S-meter: slice k -> meter id SLICE_METER_BASE+k (def num=k)
 
 # pattern timing/shape defaults (seconds / counts)
@@ -113,6 +122,7 @@ WF_FLOOR_VAL, WF_PEAK_VAL = 70.0, 235.0   # AE int16/128 intensity for our [min_
                                           # low dBm -> ~black, high dBm -> bright. (Waterfall colour
                                           # still depends on AE's black_level/color_gain; panadapter
                                           # + S-meter read the exact dBm regardless.)
+AMP_GAIN_DB = 11.0   # exciter -> amp gain in OPERATE (100 W in => ~1.25 kW out)
 S9_DBM = -73.0                            # HF S-meter convention: S9 = -73 dBm, 6 dB per S-unit
 
 # remote_audio_rx VITA-49 constants (sourced from AetherSDR PanadapterStream.cpp)
@@ -190,9 +200,16 @@ def wf_packet(stream_id, seq, intens, low_hz, binbw_hz, timecode, auto_black=20)
     return vita_header(stream_id, PCC_WF, seq, len(payload)) + payload
 
 
-def meter_packet(stream_id, seq, meter_id, dbm):
-    # PCC 0x8002 payload: N x (uint16 meter_id, int16 raw). AE: dBm = raw / 128.0
-    raw = max(-32768, min(32767, int(round(dbm * 128.0))))
+def meter_packet(stream_id, seq, meter_id, value, scale=128.0):
+    # PCC 0x8002 payload: N x (uint16 meter_id, int16 raw).
+    # ⚠ THE SCALE IS PER-UNIT, not universal (MeterModel::convertRaw):
+    #     dBm / dB / dBFS / SWR -> raw / 128
+    #     degC / degF           -> raw / 64      <-- half!
+    #     Volts / Amps          -> raw / 256
+    # Encoding a temperature at 128 makes AE read exactly DOUBLE: a 38 C
+    # heatsink displayed as 76 C, which is what caught this on the bench
+    # (2026-07-30). Pass the matching scale for the meter's declared unit.
+    raw = max(-32768, min(32767, int(round(value * scale))))
     payload = struct.pack(">Hh", meter_id, raw)
     return vita_header(stream_id, PCC_METER, seq, len(payload)) + payload
 
@@ -1244,6 +1261,9 @@ class Radio:
         # AE sets this via 'transmit set tune_mode='; see tx_envelope().
         self.tune_mode = ""
         self.tx_swr = 1.2           # live: SWR reported while TX
+        self.amp_handle = 0xA5000000 + self.radio_id  # radio-side amplifier (PGXL) object handle
+        self.amp_operate = True      # PGXL OPERATE(1)/STANDBY(0); AE toggles via 'amplifier set operate='
+        self.amp_temp_c = 38.0       # amp heatsink; warms while keyed, cools when idle
         self.cwx_wpm = 20           # CWX keyer speed (AE drives via 'cwx wpm')
         self.cwx_active = False      # an AE-initiated CWX transmission is in progress
         self.cwx_schedule = []
@@ -1629,6 +1649,14 @@ class Radio:
                     except ValueError: pass
             self.reply(conn, seq)
             self.emit_transmit_status()
+        elif c == "sub amplifier all":                      # AE subscribes to amplifier presence
+            self.reply(conn, seq)
+            self.emit_amplifier_status(conn)                # -> AE hasAmplifier=true; AMP applet un-gates
+        elif c.startswith("amplifier set"):                 # AE toggles OPERATE / STANDBY
+            kvs = parse_kvs(c)
+            if "operate" in kvs: self.amp_operate = (kvs["operate"] == "1")
+            self.reply(conn, seq)
+            self.emit_amplifier_status(conn)
         elif c.startswith("cwx "):                          # AE's CW text keyer
             self.handle_cwx(c)
             self.reply(conn, seq)
@@ -1912,13 +1940,24 @@ class Radio:
         # leading "meter N") -- RadioModel::handleMeterStatus.
         defs = [(FWDPWR_ID, 0, "TX", "FWDPWR", "dBm", 0.0, 60.0),    # TX fwd power (dBm -> W)
                 (SWR_ID,    0, "TX", "SWR",    "SWR", 1.0, 10.0)]    # TX SWR
+        # Amplifier meters, keyed to the amp object's handle so MeterModel
+        # routes them to the PGXL/Amp applet rather than the TGXL/Tuner one.
+        # ⚠ num must be NON-ZERO and distinct from any TGXL handle: MeterModel
+        # routes AMP meters by `num == tgxlHandle ? TGXL : PGXL`, and the low 16
+        # bits of amp_handle (0xA5000000+id) are 0 for radio 0 -- which would
+        # collide with an unset/zero TGXL handle. Use the low byte of the handle
+        # plus a fixed offset so it is always non-zero and stable per radio.
+        amp_num = 0xA5 + self.radio_id
+        defs += [(AMP_FWD_ID,  amp_num, "AMP", "FWD",  "dBm",  0.0, 70.0),
+                 (AMP_RL_ID,   amp_num, "AMP", "RL",   "dB",   0.0, 60.0),
+                 (AMP_TEMP_ID, amp_num, "AMP", "TEMP", "degC", 0.0, 100.0)]
         for k in (sorted(self.slices) or [0]):                       # one S-meter per slice (num = slice index)
             defs.append((SLICE_METER_BASE + k, k, "SLC", "LEVEL", "dBm", -150.0, 20.0))
         for i, num, src, nam, unit, lo, hi in defs:
             toks = "#".join([f"{i}.src={src}", f"{i}.num={num}", f"{i}.nam={nam}",
                              f"{i}.unit={unit}", f"{i}.low={lo}", f"{i}.hi={hi}"])
             self.status(conn, f"meter {toks}")
-        log(f"[->] emitted meter defs: {len(self.slices) or 1} S-meter(s) + TX FWDPWR/SWR")
+        log(f"[->] emitted meter defs: {len(self.slices) or 1} S-meter(s) + TX FWDPWR/SWR + AMP FWD/RL/TEMP")
 
     def tx_envelope(self, t):
         """Envelope (0..1) of what the RADIO is generating on transmit, at time t.
@@ -1974,6 +2013,21 @@ class Radio:
                 f"freq={self.slice_freq:.6f} rfpower={int(self.tx_power_w)} "
                 f"tunepower={int(self.tx_power_w)}")
             log(f"[->] TX {'ON' if on else 'off'}  ({self.tx_power_w:.0f} W, SWR {self.tx_swr:.1f})")
+        except OSError:
+            pass
+
+    def emit_amplifier_status(self, conn):
+        # Radio-side amplifier advert (answers 'sub amplifier all'). This is what
+        # flips AE's hasAmplifier true, so the AMP applet/button, the status-bar amp
+        # indicator, and the peakfwd->S-meter feed all un-gate. Rich telemetry
+        # (temp/current/fwd/swr) still arrives over the direct :9008 PGXL link
+        # (pgxl_sim); this line establishes presence + OPERATE state.  model must be
+        # exactly "PowerGeniusXL" for AE to classify it as a power amplifier.
+        try:
+            self.status(conn,
+                f"amplifier 0x{self.amp_handle:08X} model=PowerGeniusXL serial=PGXL-SIM "
+                f"operate={1 if self.amp_operate else 0} ant=ANT1 ip={self.ip} port=9008")
+            log(f"[->] amplifier: PowerGeniusXL operate={1 if self.amp_operate else 0}")
         except OSError:
             pass
 
@@ -2275,9 +2329,31 @@ class Radio:
             pw = self.tx_drive(now)[0] if keyed else 0.0
             sw = self.tx_swr if keyed else 1.0
             fwd_dbm = 10.0 * math.log10(max(pw, 1e-6)) + 30.0
+            # Amp heatsink thermal lag: warms toward a drive-dependent target
+            # while keyed in OPERATE, coasts back to ambient otherwise. Updated
+            # OUTSIDE the send try/except so a transient socket error cannot
+            # freeze the model mid-climb.
+            tgt = 38.0 + (26.0 * min(1.0, pw / 1200.0)
+                          if (keyed and self.amp_operate) else 0.0)
+            self.amp_temp_c += (tgt - self.amp_temp_c) * 0.02
             try:
                 s.sendto(meter_packet(self.meter_sid, mseq & 0xF, FWDPWR_ID, fwd_dbm), dest); mseq += 1
                 s.sendto(meter_packet(self.meter_sid, mseq & 0xF, SWR_ID, sw), dest); mseq += 1
+                # Amplifier meters. In OPERATE the amp is amplifying, so it
+                # reports GAIN_DB more forward power than the exciter; in
+                # STANDBY it is a through-path and reports the exciter level.
+                # RL is return loss in dB (>0), derived from the same SWR --
+                # AE converts it back, so the two agree by construction.
+                # Heatsink thermal lag: warms toward a drive-dependent target
+                # while keyed, coasts back to ambient when not. Gives the
+                # applet's temp gauge something real to track.
+                amp_dbm = fwd_dbm + (AMP_GAIN_DB if self.amp_operate else 0.0)
+                rho = max(1e-6, (sw - 1.0) / (sw + 1.0))
+                amp_rl = -20.0 * math.log10(rho)      # 1.0 SWR -> ~120 dB, 3:1 -> 6 dB
+                s.sendto(meter_packet(self.meter_sid, mseq & 0xF, AMP_FWD_ID, amp_dbm), dest); mseq += 1
+                s.sendto(meter_packet(self.meter_sid, mseq & 0xF, AMP_RL_ID, min(60.0, amp_rl)), dest); mseq += 1
+                s.sendto(meter_packet(self.meter_sid, mseq & 0xF, AMP_TEMP_ID,
+                                      self.amp_temp_c, scale=64.0), dest); mseq += 1
             except OSError:
                 pass
             dt = period - (time.time() - now)
@@ -2486,7 +2562,8 @@ CONTROL_HTML = """<!DOCTYPE html><html><head><meta charset=utf-8><title>flex-sim
 <style>body{{font-family:sans-serif;background:#111;color:#ddd;padding:18px;max-width:440px}}
 h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=range]{{width:380px}}
 .v{{color:#5cf;font-weight:bold}}</style></head><body>
-<h2>flex-sim &mdash; live control</h2>
+<h2 style="display:flex;align-items:baseline;gap:12px">flex-sim &mdash; live control
+<a href="/qa/view" style="font-size:13px;font-weight:normal;color:#5cf;text-decoration:none;border:1px solid #243;border-radius:6px;padding:3px 9px">QA results &rsaquo;</a></h2>
 <div id=statusbar style="display:flex;align-items:center;gap:12px;background:#15202b;border:1px solid #243;border-radius:6px;padding:10px 12px;margin:0 0 14px">
   <button id=gobtn onclick="togglePause()" style="font-size:15px;font-weight:bold;padding:7px 16px;border:none;border-radius:5px;cursor:pointer;background:#c33;color:#fff">&#9632; Stop</button>
   <div style="line-height:1.4">
@@ -2837,6 +2914,14 @@ def start_control_server(radio, port):
 
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
+            # ---- read-only QA regression-suite results viewer (optional module) ----
+            if u.path == "/qa" or u.path == "/qa/view":
+                try:
+                    import qa_viewer
+                    return qa_viewer.handle(self, u.path)
+                except Exception:
+                    self.send_response(404); self.end_headers()
+                    self.wfile.write(b"qa viewer not available"); return
             # ---- live status (panel polls this for connection + stream state) ----
             if u.path == "/status":
                 return self._json({
@@ -3043,6 +3128,16 @@ def start_rack_control_server(rack, port):
 
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
+            if u.path == "/qa" or u.path == "/qa/view":
+                # Read-only QA regression-suite results viewer. Optional: only
+                # active if qa_viewer.py sits alongside flex_sim.py. Never fails
+                # the panel if it's absent.
+                try:
+                    import qa_viewer
+                    return qa_viewer.handle(self, u.path)
+                except Exception:
+                    self.send_response(404); self.end_headers()
+                    self.wfile.write(b"qa viewer not available"); return
             if u.path == "/state":
                 body = json.dumps([r.state() for r in rack.radios]).encode()
                 self.send_response(200); self.send_header("Content-Type", "application/json")
