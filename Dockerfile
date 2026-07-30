@@ -20,8 +20,10 @@ WORKDIR /app
 COPY *.py ./
 
 # Radio:       :4992 discovery + FlexLib control + VITA-49, :8731 control panel
-# Accessories: :4531 SPE Expert amplifier, :9600 ACOM 600S
-EXPOSE 4992/tcp 4992/udp 8731/tcp 4531/tcp 9600/tcp
+# Accessories: :4531 SPE Expert amplifier, :9600 ACOM 600S,
+#              :9007 Antenna Genius (TCP + UDP beacon), :9008 Power Genius XL,
+#              :9010 Tuner Genius XL
+EXPOSE 4992/tcp 4992/udp 8731/tcp 4531/tcp 9600/tcp 9007/tcp 9007/udp 9008/tcp 9010/tcp
 
 # The radio stays the default, so existing invocations such as
 #   docker run --rm --network host flex-sim --ae 192.168.1.50

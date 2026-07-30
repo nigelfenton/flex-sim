@@ -113,6 +113,30 @@ WAV). Whatever text you choose stays on your machine — generated WAVs are giti
 python3 loopback_test.py carrier      # mock-AetherSDR: handshake + VITA + meter checks, no real AE
 ```
 
+## Accessory simulators — a whole station, no hardware
+
+Alongside the radio, flex-sim ships standalone simulators for the station accessories
+AetherSDR can control, each a single pure-stdlib file with its own interactive prompt
+(`--no-cli` for headless, `-h` for flags):
+
+| Sim | Device | Port | Discovery in AetherSDR |
+|---|---|---|---|
+| `ag_sim.py` | 4O3A Antenna Genius (switch) | 9007 | auto (UDP beacon) |
+| `pgxl_sim.py` | 4O3A Power Genius XL (amp) | 9008 | manual IP (Peripherals tab) |
+| `tgxl_sim.py` | 4O3A Tuner Genius XL (tuner) | 9010 | manual IP (Peripherals tab) |
+| `spe_sim.py` | SPE Expert 1.3K/1.5K/2K (amp) | 4531 | manual IP (Network mode) |
+| `acom_sim.py` | ACOM 600S/700S/1200S (amp) | 9600 | manual IP |
+
+**`station.py` runs them all in one process** with one prompt to drive them — key an
+amp, step the tuner relays, switch antennas — so meters and relays actually move in
+AetherSDR instead of sitting at headless defaults:
+```
+python3 station.py                    # all five accessories + unified prompt
+python3 station.py --with-radio       # also spawn flex_sim.py (the radio)
+python3 station.py --no-cli           # headless (staged/background)
+```
+It prints a connect table with the exact host:port to enter in AetherSDR for each device.
+
 ---
 
 ## Same-machine setup (WSL)

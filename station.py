@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# station.py — Phase-0 integrated station-rack launcher (see RACK_SCOPE.md).
+# station.py — Phase-0 integrated station-rack launcher.
 #
 # Starts the three 4O3A accessory sims (Antenna Genius / Power Genius XL /
 # Tuner Genius XL) in ONE process, and gives you ONE prompt to drive them all —
