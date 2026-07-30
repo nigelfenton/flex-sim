@@ -757,29 +757,36 @@ def sig_voice(st, ch, n):
 
 
 def sig_cw(st, ch, n):
-    """A separate keyed CW tone at cw_hz, sending a repeating callsign-ish id so
-    NR has a tonal signal to preserve. Envelope-shaped keying (no clicks)."""
+    """A separate keyed CW tone at cw_hz, sending a repeating id in REAL Morse
+    so NR has a tonal signal to preserve and a decoder reads actual content.
+    Envelope-shaped keying (no clicks).
+
+    Was an element table [1,3,1,1,3,0,0] that conflated duration with key
+    state — every non-zero entry keyed, so the id rendered as one fused
+    ~600 ms tone ('L' feel, not L). Found via the C++ port of this table in
+    AetherSDR demo mode (aethersdr#4593/#4594); now built from the same
+    _morse_schedule the panel keyer and CWX already use."""
     hz   = ch.get("hz", 700.0)
     wpm  = ch.get("wpm", 18.0)
-    dit  = 1.2 / wpm                                   # seconds per dit
-    # element pattern for a short id (· — · ·  = 'L' feel); loop it
-    elems = ch.setdefault("_elems", [1, 3, 1, 1, 3, 0, 0])  # 1=dit 3=dah 0=gap(=1 dit)
+    text = ch.get("id", "L")
+    cache = ch.get("_sched")
+    if not cache or cache[0] != (text, wpm):
+        # schedule + 7-dit word gap before the loop restarts
+        sched = _morse_schedule(text, wpm) + [(False, 7 * 1.2 / wpm)]
+        cache = ((text, wpm), sched, sum(d for _, d in sched))
+        ch["_sched"] = cache
+    _, sched, total = cache
+    edge = 0.005                                       # raised-cosine, 5 ms
     out = []
     for i in range(n):
         tt = (st.cw_phase + i) / st.rate
-        # position within the keying pattern
-        unit = dit
-        total = sum((e if e else 1) for e in elems) * unit
         pos = tt % total
         acc = 0.0; key = 0.0
-        for e in elems:
-            dur = (e if e else 1) * unit
-            if acc <= pos < acc + dur:
-                key = 1.0 if e else 0.0
-                # raised-cosine edges (5 ms) to kill key clicks
-                edge = 0.005
-                into = pos - acc; left = acc + dur - pos
-                if e:
+        for on, dur in sched:
+            if pos < acc + dur:
+                if on:
+                    key = 1.0
+                    into = pos - acc; left = acc + dur - pos
                     if into < edge: key = 0.5 - 0.5 * math.cos(math.pi * into / edge)
                     elif left < edge: key = 0.5 - 0.5 * math.cos(math.pi * left / edge)
                 break
