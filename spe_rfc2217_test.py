@@ -138,5 +138,17 @@ tx = "C,15K,O,T,A,2,05,2b,0r,H,1350, 1.10, 1.25, 47.5, 32.0, 45, 40, 38,S,N"
 check(b.status_payload().decode() == tx, "TX vector (69 chars)",
       str(len(b.status_payload())))
 
+print("\n=== 5. a poll frame split mid-sync across two TCP reads still lands ===")
+p = run("raw", power="on")
+s = socket.create_connection(("127.0.0.1", PORT), timeout=3); s.settimeout(1.5)
+s.sendall(b"\x55\x55")          # sync run straddles the recv boundary
+time.sleep(0.25)
+s.sendall(b"\x55\x01\x90\x90\r\n")
+r = drain(s)
+check(r[:3] == b"\xaa\xaa\xaa",
+      "split sync carried across reads -> poll still answered", r[:3].hex())
+s.close()
+stop(p)
+
 print("\n" + ("ALL PASS" if not fails else f"FAILURES: {fails}"))
 sys.exit(1 if fails else 0)

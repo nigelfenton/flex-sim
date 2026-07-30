@@ -327,9 +327,18 @@ class SpeServer:
                 while True:
                     i = buf.find(b"\x55\x55\x55")
                     if i < 0 or len(buf) < i + 5:
-                        if i > 0 or (i < 0 and buf):
-                            self.report_junk(buf if i < 0 else buf[:i])
-                            buf = b"" if i < 0 else buf[i:]
+                        if i < 0 and buf:
+                            # A sync run can straddle a recv boundary just
+                            # like an IAC sequence can (see split_telnet's
+                            # tail-carry): keep a trailing 55 / 55 55 for the
+                            # next read, junk only what precedes it.
+                            keep = 2 if buf[-2:] == b"\x55\x55" else \
+                                   1 if buf[-1:] == b"\x55" else 0
+                            self.report_junk(buf[:len(buf) - keep])
+                            buf = buf[len(buf) - keep:]
+                        elif i > 0:
+                            self.report_junk(buf[:i])
+                            buf = buf[i:]
                         break
                     if i > 0:
                         self.report_junk(buf[:i])
