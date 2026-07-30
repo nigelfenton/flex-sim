@@ -62,7 +62,7 @@ class Station:
         self.acom = acom_sim.AcomServer(self.acom_amp)
         self.radio_proc = None
 
-    def start(self, with_radio):
+    def start(self, with_radio, radio_port=None):
         threading.Thread(target=self.ag.tcp_server, daemon=True).start()
         threading.Thread(target=self.ag.broadcaster, daemon=True).start()
         threading.Thread(target=self.pgxl.serve, daemon=True).start()
@@ -72,8 +72,12 @@ class Station:
         if with_radio:
             flex = os.path.join(HERE, "flex_sim.py")
             if os.path.exists(flex):
-                self.radio_proc = subprocess.Popen([sys.executable, flex])
-                print(f"[radio] spawned flex_sim.py (pid {self.radio_proc.pid})", flush=True)
+                cmd = [sys.executable, flex]
+                if radio_port:
+                    cmd += ["--port", str(radio_port)]
+                self.radio_proc = subprocess.Popen(cmd)
+                print(f"[radio] spawned flex_sim.py on :{radio_port or 4992} "
+                      f"(pid {self.radio_proc.pid})", flush=True)
             else:
                 print("[radio] flex_sim.py not found — skipping", flush=True)
 
@@ -203,11 +207,20 @@ def main():
                     help="AG beacon name (ShackSwitch hits AE's isShackSwitch path)")
     ap.add_argument("--antennas", type=int, default=8)
     ap.add_argument("--with-radio", action="store_true", help="also spawn flex_sim.py")
+    # ⚠ Stays at 4992 on purpose. Other radios on this network also answer
+    # discovery (the hub's noise bench, aether-gate instances, the real 6700),
+    # so AE may pair with the WRONG one while still taking peripherals from
+    # here -- pick this sim by SERIAL (FLEXSIM00) in AE's radio list. Moving to
+    # another port avoids the collision but AE then fails to complete the
+    # connection at all (bench-tested 2026-07-30), which is worse.
+    ap.add_argument("--radio-port", type=int, default=4992,
+                    help="control/data port for the spawned radio "
+                         "(default 5992; avoids a :4992 collision)")
     ap.add_argument("--no-cli", action="store_true", help="headless: serve only")
     args = ap.parse_args()
 
     st = Station(args)
-    st.start(args.with_radio)
+    st.start(args.with_radio, args.radio_port)
     print("[station] AG :9007 + PGXL :9008 + TGXL :9010 + SPE :4531 + ACOM :9600 up in one process")
     print(st.connect_table())
 
