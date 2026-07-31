@@ -3,8 +3,8 @@
 
 Drives a live flex_sim through AE's exact command order (from the #4510 report
 log) and asserts the /txchain verdict names each FIRST-missing stage in turn,
-then flips the auto-adopt knob and proves the works-for-many population needs
-no explicit tx=1. No AetherSDR required: the point of the observer is that the
+then drives multiFLEX contention and proves the chain names the foreign TX
+owner rather than just failing. No AetherSDR required: the point of the observer is that the
 radio side alone can testify to the chain, and this test IS that testimony.
 
 Run: python3 tests/test_txchain.py   (spawns its own sim on :5993/:8733)
@@ -124,9 +124,20 @@ def main():
         for _ in range(10):             # keep stage 3 fresh across the checks
             udp.sendto(b"\x38\x84\x00\x00" + b"\x00" * 60, ("127.0.0.1", DAXTX_PORT))
             time.sleep(0.01)
+
+        # THE #4510 REPRODUCTION. Note WHY a rival is needed here: the client
+        # never sends `tx=1` outside the WSPR path, which is harmless on a
+        # single-client radio (the create granted it) and fatal the moment
+        # another client owns the bit. Contention IS the bug, not a separate
+        # scenario — asserting "fresh stream lacks TX" would encode the old,
+        # wrong firmware-population theory (#4640).
+        ctl("/txchain/contend?on=1&handle=0xBEEF0001")
+        for _ in range(10):
+            udp.sendto(b"\x38\x84\x00\x00" + b"\x00" * 60, ("127.0.0.1", DAXTX_PORT))
+            time.sleep(0.01)
         v = ctl("/txchain")
-        check("THE #4510 REPRODUCTION: keyed+dax+audio but stage 5 named",
-              "5:" in v["verdict"], v["verdict"])
+        check("THE #4510 REPRODUCTION: keyed+dax+audio, rival holds TX -> stage 5",
+              "5:" in v["verdict"] and v["tx_owner"] == "0xBEEF0001", v["verdict"])
 
         cmd("stream set 0x84000000 tx=1")
         for _ in range(10):
@@ -137,14 +148,17 @@ def main():
               v["verdict"] == "RF WOULD BE PRODUCED", v["verdict"])
 
         # ---- release + remove tears the chain back down ----
+        ctl("/txchain/contend?on=0")     # rival yields; back to single-client
         cmd("transmit set mox=0")
         cmd("stream remove 0x84000000")
         v = ctl("/txchain")
         check("stream removed -> stage 2 named again",
               "2:" in v["verdict"], v["verdict"])
 
-        # ---- the works-for-many population: firmware auto-adopts tx=1 ----
-        ctl("/txchain/adopt?on=1")
+        # ---- single-client radio: the create GRANTS the TX bit ----
+        # #4640, from FlexLib: `stream set <id> tx=1` is RequestTX — multiFLEX
+        # ownership arbitration, NOT a per-transmission step. So on a radio
+        # with one GUI client, nothing needs sending and RF flows.
         cmd("stream create type=dax_tx compression=NONE")
         cmd("transmit set dax=1")
         cmd("transmit set mox=1")
@@ -152,9 +166,32 @@ def main():
             udp.sendto(b"\x38\x84\x00\x00" + b"\x00" * 60, ("127.0.0.1", DAXTX_PORT))
             time.sleep(0.01)
         v = ctl("/txchain")
-        check("auto-adopt population: RF WOULD BE PRODUCED with NO tx=1 sent",
-              v["verdict"] == "RF WOULD BE PRODUCED" and v["auto_adopt"],
-              v["verdict"])
+        check("single-client: RF WOULD BE PRODUCED with NO tx=1 ever sent",
+              v["verdict"] == "RF WOULD BE PRODUCED" and v["tx_owner"] == "us",
+              f'{v["verdict"]} owner={v["tx_owner"]}')
+
+        # ---- multiFLEX contention: a rival takes the TX bit MID-SESSION ----
+        # The radio that produced RF a moment ago now silently does not. This
+        # is the real "works for many, fails for some": state-dependent, so it
+        # can strike the same radio that worked yesterday.
+        ctl("/txchain/contend?on=1&handle=0xCAFEBABE")
+        for _ in range(10):
+            udp.sendto(b"\x38\x84\x00\x00" + b"\x00" * 60, ("127.0.0.1", DAXTX_PORT))
+            time.sleep(0.01)
+        v = ctl("/txchain")
+        check("contention: stage 5 named when a foreign client holds TX",
+              "5:" in v["verdict"] and v["contention"], v["verdict"])
+        check("the foreign owner is NAMED, not merely 'failed'",
+              v["tx_owner"] == "0xCAFEBABE", str(v["tx_owner"]))
+
+        # ---- and it recovers when the rival yields ----
+        ctl("/txchain/contend?on=0")
+        for _ in range(10):
+            udp.sendto(b"\x38\x84\x00\x00" + b"\x00" * 60, ("127.0.0.1", DAXTX_PORT))
+            time.sleep(0.01)
+        v = ctl("/txchain")
+        check("recovers to RF when the rival yields TX",
+              v["verdict"] == "RF WOULD BE PRODUCED", v["verdict"])
 
         print(f"\n{passed} passed, {failed} failed")
         return 0 if failed == 0 else 1

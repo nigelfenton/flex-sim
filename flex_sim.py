@@ -1309,11 +1309,15 @@ class Radio:
         # diagnosis. GET /txchain on the control panel returns the table.
         self.daxtx_id = None            # 'stream create type=dax_tx' id
         self.daxtx_tx = False           # radio-side TX-source flag ('stream set <id> tx=1')
-        self.daxtx_auto_adopt = False   # model the firmware population that marks a
-                                        # fresh dax_tx stream tx=1 UNPROMPTED — the
-                                        # split behind "works for many, fails for
-                                        # some": AE only sends tx=1 on the WSPR path
-                                        # (RadioModel.cpp:9410/:9476, both WSPR-gated)
+        # multiFLEX CONTENTION, not a firmware switch (corrected on #4640 from
+        # FlexLib: `stream set <id> tx=1` is RequestTX — ownership arbitration
+        # between GUI clients, not a per-transmission step). On a single-client
+        # radio the create GRANTS the TX bit implicitly and the status echoes
+        # tx=1; nothing needs sending. When ANOTHER client holds it, the same
+        # client code silently produces no RF — the real "works for many, fails
+        # for some" split, and state-dependent rather than device-dependent, so
+        # it can recur on the very radio that worked yesterday.
+        self.daxtx_foreign_owner = 0    # 0 = we own it; else the handle holding TX
         self.tx_dax = False             # 'transmit set dax=1'
         self.daxtx_pkts = 0             # VITA audio packets seen on :4991
         self.daxtx_bytes = 0
@@ -1382,7 +1386,7 @@ class Radio:
             ("2: dax_tx stream exists",           self.daxtx_id is not None),
             ("3: TX audio arriving on :4991",     audio_fresh),
             ("4: radio keyed with dax=1",         bool(self.tx_on) and self.tx_dax),
-            ("5: stream claimed as TX source",    self.daxtx_tx),
+            ("5: stream claimed as TX source",    self.daxtx_tx),   # foreign owner => False
         ]
         first_missing = next((name for name, ok in stages if not ok), None)
         return {
@@ -1390,7 +1394,10 @@ class Radio:
             "stream_id": f"0x{self.daxtx_id:08X}" if self.daxtx_id else None,
             "audio_pkts": self.daxtx_pkts,
             "audio_bytes": self.daxtx_bytes,
-            "auto_adopt": self.daxtx_auto_adopt,
+            "tx_owner": ("us" if self.daxtx_tx
+                         else f"0x{self.daxtx_foreign_owner:08X}"
+                         if self.daxtx_foreign_owner else "unclaimed"),
+            "contention": self.daxtx_foreign_owner != 0,
             "keyed": bool(self.tx_on),
             "dax": self.tx_dax,
             "verdict": ("RF WOULD BE PRODUCED" if first_missing is None
@@ -1745,20 +1752,25 @@ class Radio:
                 # The TX half of the #4510 chain. Real firmware replies with an
                 # id and a registration status; whether it ALSO marks the fresh
                 # stream tx=1 unprompted is exactly the behaviour split behind
-                # the "no RF" family — daxtx_auto_adopt models both populations.
+                # the "no RF" family — see daxtx_foreign_owner for the contention model.
                 sid = DAXTX_SID_BASE + self.radio_id
                 self.daxtx_id = sid
-                self.daxtx_tx = bool(self.daxtx_auto_adopt)
+                # Create grants TX ownership implicitly — UNLESS a foreign
+                # client holds it, which is the whole failure mode.
+                self.daxtx_tx = (self.daxtx_foreign_owner == 0)
                 self.daxtx_pkts = 0
                 self.daxtx_bytes = 0
                 self.daxtx_last_pkt = 0.0
                 self.reply(conn, seq, f"0x{sid:08X}")
+                owner = (self.handle_hex if self.daxtx_tx
+                         else f"{self.daxtx_foreign_owner:08X}")
                 self.status(conn, f"stream 0x{sid:08X} type=dax_tx "
-                                  f"client_handle=0x{self.handle_hex} "
+                                  f"client_handle=0x{owner} "
                                   f"tx={1 if self.daxtx_tx else 0}")
                 log(f"[txchain] dax_tx stream created id=0x{sid:08X} "
                     f"tx={int(self.daxtx_tx)}"
-                    f"{' (auto-adopted by firmware model)' if self.daxtx_tx else ''}")
+                    + ("" if self.daxtx_tx else
+                       f" — TX bit held by FOREIGN client 0x{owner} (multiFLEX contention)"))
             else:
                 self.reply(conn, seq, "0x48000000")
         elif c.startswith("stream set"):
@@ -3118,13 +3130,24 @@ def start_control_server(radio, port):
             if u.path == "/txchain":
                 # The #4510 chain verdict — radio-side stages + first missing.
                 return self._json(radio.txchain())
-            if u.path == "/txchain/adopt":
-                # Model the firmware split: on = the radio marks a fresh dax_tx
-                # stream tx=1 unprompted (the works-for-many population); off =
-                # the explicit 'stream set tx=1' is required (the #4510 case).
+            if u.path == "/txchain/contend":
+                # multiFLEX contention (#4640): ?on=1 makes ANOTHER client hold
+                # the dax_tx TX bit, so our create no longer grants it and the
+                # chain stops at stage 5 with the foreign owner named. ?on=0
+                # returns the radio to single-client, where create grants TX
+                # implicitly. Optional ?handle=<hex> sets the rival's handle.
                 q = urllib.parse.parse_qs(u.query)
-                radio.daxtx_auto_adopt = q.get("on", ["1"])[0] == "1"
-                return self._json({"auto_adopt": radio.daxtx_auto_adopt})
+                on = q.get("on", ["1"])[0] == "1"
+                try:
+                    h = int(q.get("handle", ["0xDEADBEEF"])[0], 16)
+                except ValueError:
+                    h = 0xDEADBEEF
+                radio.daxtx_foreign_owner = h if on else 0
+                if radio.daxtx_id is not None:
+                    # Ownership can move mid-session — that is the point: the
+                    # same radio that worked a minute ago now produces no RF.
+                    radio.daxtx_tx = not on
+                return self._json(radio.txchain())
             if u.path == "/state":
                 # List form (one radio) so the noise-bench JS is identical to the
                 # rack panel's /state — pollNoise() reads arr[0].
