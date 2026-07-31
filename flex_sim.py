@@ -64,6 +64,8 @@ FLEX_SIM_VERSION = "0.2.0"
 
 DISCOVERY_PORT = 4992        # AE always listens for discovery here (fixed); we broadcast TO it
 DEFAULT_PORT = 4992          # flex-sim's own control (TCP) + VITA-prime (UDP) port; override with --port
+SERIAL_PREFIX = "FLEXSIM"    # serial = <prefix><radio_id:02d>; override with --serial when a second
+                             # sim shares the network (AE matches `connect local serial <s>`)
                              # -> set e.g. 5992 to run on the SAME host as AE without a :4992 clash
 HANDLE = 0x1A2B3C4D
 HANDLE_HEX = f"{HANDLE:08X}"
@@ -1214,7 +1216,7 @@ def load_noise_preset(radio, name):
 
 class Radio:
     def __init__(self, ip, ae_ip, pattern="ramp", bins=BINS, fps=FPS, width_khz=SIGNAL_WIDTH_KHZ,
-                 port=DEFAULT_PORT, radio_id=0, model=MODEL):
+                 port=DEFAULT_PORT, radio_id=0, model=MODEL, serial_prefix=SERIAL_PREFIX):
         self.ip, self.ae_ip = ip, ae_ip
         self.port = port                # control/data port we bind + advertise (discovery dest stays 4992)
         self.model = model if model in MODELS else MODEL
@@ -1227,7 +1229,12 @@ class Radio:
         # Each value must be unique per radio or AE cross-wires them; derived from
         # radio_id off the base constants below.
         self.radio_id = radio_id
-        self.serial = f"FLEXSIM{radio_id:02d}"
+        # Serial prefix is overridable (--serial) because AE's `connect local
+        # serial <s>` matches on SERIAL: two sims advertising the default on one
+        # network (e.g. a local one plus the hub's bench) are indistinguishable
+        # to that verb, and AE silently takes whichever it found first. The
+        # per-radio :02d suffix is preserved so rack mode stays unique.
+        self.serial = f"{serial_prefix}{radio_id:02d}"
         self.client_handle = HANDLE + radio_id   # NB: NOT self.handle — that's the method!
         self.handle_hex = f"{self.client_handle:08X}"
         self.pan_id = PAN_ID + radio_id * 16     # FFT stream-id BASE; AE stacks a panadapter per +RX,
@@ -3188,7 +3195,8 @@ def start_control_server(radio, port):
 
 # ---- the rack: one process hosting N radios + a combined "1U strip" panel ----
 class Rack:
-    def __init__(self, ip, ae_ip, n, base_port, pattern, bins, fps, width_khz, models=None):
+    def __init__(self, ip, ae_ip, n, base_port, pattern, bins, fps, width_khz, models=None,
+                 serial_prefix=SERIAL_PREFIX):
         prefix, last = ip.rsplit(".", 1)                  # each radio gets its own IP (like real rigs):
         base_last = int(last)                             # base, base+1, ... on the same port (default 4992)
         models = models or []
@@ -3197,7 +3205,8 @@ class Rack:
             rip = f"{prefix}.{base_last + i}"
             mdl = models[i % len(models)] if models else MODEL
             self.radios.append(Radio(rip, ae_ip, pattern, bins, fps, width_khz,
-                                     port=base_port, radio_id=i, model=mdl))
+                                     port=base_port, radio_id=i, model=mdl,
+                                     serial_prefix=serial_prefix))
 
     def start(self):
         for r in self.radios:
@@ -3353,6 +3362,12 @@ def main():
                     help="number of virtual radios in one process (>1 = rack mode)")
     ap.add_argument("--base-port", type=int, default=None,
                     help="rack: port for the radios (each gets its own IP, so they share a port; default = --port)")
+    ap.add_argument("--serial", default=SERIAL_PREFIX, metavar="PREFIX",
+                    help="serial-number prefix (default FLEXSIM; serial = PREFIX + 2-digit radio "
+                         "index). Change it when another flex-sim is already on the network: AE's "
+                         "'connect local serial <s>' matches on SERIAL, so two sims sharing the "
+                         "default are indistinguishable and AE silently takes whichever it saw "
+                         "first")
     ap.add_argument("--models", default=None,
                     help="model(s): comma-list, one per radio in rack mode, e.g. "
                          "FLEX-6300,FLEX-6600,FLEX-6700. With a single radio the first entry "
@@ -3370,7 +3385,8 @@ def main():
     if args.radios > 1:                                    # ---- rack mode: N radios + strip panel ----
         base = args.base_port or args.port
         models = [m.strip() for m in args.models.split(",")] if args.models else None
-        rack = Rack(ip, args.ae, args.radios, base, args.pattern, args.bins, args.fps, args.width_khz, models=models)
+        rack = Rack(ip, args.ae, args.radios, base, args.pattern, args.bins, args.fps, args.width_khz,
+                    models=models, serial_prefix=args.serial)
         rack.start()
         start_rack_control_server(rack, args.ctl_port)
         log(f"flex-sim {FLEX_SIM_VERSION} - RACK of {args.radios} radios on :{base}")
@@ -3387,7 +3403,7 @@ def main():
     # unknown name falls back to MODEL inside Radio.__init__.
     single_model = ([m.strip() for m in args.models.split(",")] or [MODEL])[0] if args.models else MODEL
     radio = Radio(ip, args.ae, args.pattern, args.bins, args.fps, args.width_khz,
-                  port=args.port, model=single_model)
+                  port=args.port, model=single_model, serial_prefix=args.serial)
     radio.txlog = args.txlog
     radio.txlog_interval = args.txlog_interval
     if args.txlog:
