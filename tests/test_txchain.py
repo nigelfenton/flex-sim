@@ -11,6 +11,7 @@ Run: python3 tests/test_txchain.py   (spawns its own sim on :5993/:8733)
 """
 
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -19,6 +20,7 @@ import urllib.request
 from pathlib import Path
 
 PORT, CTL = 5993, 8733
+DAXTX_PORT = 4993          # not 4991: a running sim owns that, and one process per box can bind it
 ROOT = Path(__file__).resolve().parent.parent
 
 passed = failed = 0
@@ -53,7 +55,8 @@ def main():
     sim = subprocess.Popen(
         [sys.executable, str(ROOT / "flex_sim.py"), "--port", str(PORT),
          "--ctl-port", str(CTL)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(ROOT))
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(ROOT),
+        env={**os.environ, "FLEXSIM_DAXTX_PORT": str(DAXTX_PORT)})
     try:
         if not wait_ctl():
             print("FAIL: sim control panel never came up")
@@ -108,7 +111,7 @@ def main():
 
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         for _ in range(20):             # ~AE cadence, content irrelevant
-            udp.sendto(b"\x38\x84\x00\x00" + b"\x00" * 60, ("127.0.0.1", 4991))
+            udp.sendto(b"\x38\x84\x00\x00" + b"\x00" * 60, ("127.0.0.1", DAXTX_PORT))
             time.sleep(0.01)
         v = ctl("/txchain")
         check("audio flowing -> stage 4 named",
@@ -119,7 +122,7 @@ def main():
         cmd("transmit set dax=1")
         cmd("transmit set mox=1")
         for _ in range(10):             # keep stage 3 fresh across the checks
-            udp.sendto(b"\x38\x84\x00\x00" + b"\x00" * 60, ("127.0.0.1", 4991))
+            udp.sendto(b"\x38\x84\x00\x00" + b"\x00" * 60, ("127.0.0.1", DAXTX_PORT))
             time.sleep(0.01)
         v = ctl("/txchain")
         check("THE #4510 REPRODUCTION: keyed+dax+audio but stage 5 named",
@@ -127,7 +130,7 @@ def main():
 
         cmd("stream set 0x84000000 tx=1")
         for _ in range(10):
-            udp.sendto(b"\x38\x84\x00\x00" + b"\x00" * 60, ("127.0.0.1", 4991))
+            udp.sendto(b"\x38\x84\x00\x00" + b"\x00" * 60, ("127.0.0.1", DAXTX_PORT))
             time.sleep(0.01)
         v = ctl("/txchain")
         check("tx=1 claimed -> RF WOULD BE PRODUCED",
@@ -146,7 +149,7 @@ def main():
         cmd("transmit set dax=1")
         cmd("transmit set mox=1")
         for _ in range(25):
-            udp.sendto(b"\x38\x84\x00\x00" + b"\x00" * 60, ("127.0.0.1", 4991))
+            udp.sendto(b"\x38\x84\x00\x00" + b"\x00" * 60, ("127.0.0.1", DAXTX_PORT))
             time.sleep(0.01)
         v = ctl("/txchain")
         check("auto-adopt population: RF WOULD BE PRODUCED with NO tx=1 sent",

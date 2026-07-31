@@ -64,8 +64,31 @@ FLEX_SIM_VERSION = "0.2.0"
 
 DISCOVERY_PORT = 4992        # AE always listens for discovery here (fixed); we broadcast TO it
 DEFAULT_PORT = 4992          # flex-sim's own control (TCP) + VITA-prime (UDP) port; override with --port
-SERIAL_PREFIX = "FLEXSIM"    # serial = <prefix><radio_id:02d>; override with --serial when a second
-                             # sim shares the network (AE matches `connect local serial <s>`)
+def _default_serial_prefix():
+    """Serial prefix defaults to THIS MACHINE'S hostname.
+
+    AE matches `connect local serial <s>`, so two sims sharing a prefix are
+    indistinguishable to that verb and AE silently takes whichever it
+    discovered first — a real wrong-radio bug on a network with more than one
+    sim. Deriving from the hostname makes the collision structurally impossible
+    rather than merely avoidable-if-you-remember-the-flag: every box is
+    distinct for free, including ones nobody has thought of yet.
+
+    Sanitised to A-Z0-9 (a serial travels in a discovery string and a
+    `chassis_serial=` reply; punctuation has no business in either) and capped
+    so the `:02d` suffix keeps rack serials readable. Falls back to the old
+    FLEXSIM constant if the hostname is unusable, so this can never leave a
+    radio without an identity.
+    """
+    try:
+        raw = "".join(c for c in socket.gethostname().upper() if c.isalnum())
+    except Exception:
+        raw = ""
+    return raw[:12] or "FLEXSIM"
+
+
+SERIAL_PREFIX = _default_serial_prefix()   # serial = <prefix><radio_id:02d>; --serial overrides
+                                           # (pass --serial FLEXSIM for the pre-2026-07-31 default)
                              # -> set e.g. 5992 to run on the SAME host as AE without a :4992 clash
 HANDLE = 0x1A2B3C4D
 HANDLE_HEX = f"{HANDLE:08X}"
@@ -93,8 +116,11 @@ PCC_FFT, PCC_WF, PCC_METER = 0x8003, 0x8004, 0x8002
 METER_SID = 0x46000000       # meter VITA stream id (AE routes meters by PCC, not by sid)
 DAXTX_SID_BASE = 0x84000000  # dax_tx stream id base — matches the id a real 6x00
                              # hands out (0x84000000 observed in the #4510 report log)
-DAXTX_AUDIO_PORT = 4991      # AE hardcodes DAX TX audio to <radio>:4991
-                             # (PanadapterStream.cpp: m_radioPort = 4991)
+DAXTX_AUDIO_PORT = int(os.environ.get("FLEXSIM_DAXTX_PORT", "4991"))
+                             # AE hardcodes DAX TX audio to <radio>:4991
+                             # (PanadapterStream.cpp: m_radioPort = 4991), so this is only
+                             # overridable for TESTS: one process per box can bind it, and a
+                             # running sim would otherwise make the txchain suite unrunnable.
 _DAXTX_LISTENER_STARTED = False  # one :4991 observer per process (see Radio.__init__)
 SLC_LEVEL_ID = 1             # (legacy) single-slice S-meter id; superseded by SLICE_METER_BASE+index
 FWDPWR_ID, SWR_ID = 2, 3     # TX meters: forward power (src=TX nam=FWDPWR, dBm->W) + SWR
@@ -3363,11 +3389,11 @@ def main():
     ap.add_argument("--base-port", type=int, default=None,
                     help="rack: port for the radios (each gets its own IP, so they share a port; default = --port)")
     ap.add_argument("--serial", default=SERIAL_PREFIX, metavar="PREFIX",
-                    help="serial-number prefix (default FLEXSIM; serial = PREFIX + 2-digit radio "
-                         "index). Change it when another flex-sim is already on the network: AE's "
-                         "'connect local serial <s>' matches on SERIAL, so two sims sharing the "
-                         "default are indistinguishable and AE silently takes whichever it saw "
-                         "first")
+                    help=f"serial-number prefix (serial = PREFIX + 2-digit radio index). Defaults "
+                         f"to this machine's hostname ({SERIAL_PREFIX}), so two sims on one "
+                         f"network can never collide: AE's 'connect local serial <s>' matches on "
+                         f"SERIAL, and identical prefixes make it silently take whichever radio it "
+                         f"discovered first. Pass --serial FLEXSIM for the pre-2026-07-31 default")
     ap.add_argument("--models", default=None,
                     help="model(s): comma-list, one per radio in rack mode, e.g. "
                          "FLEX-6300,FLEX-6600,FLEX-6700. With a single radio the first entry "
