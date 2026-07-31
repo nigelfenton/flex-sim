@@ -89,6 +89,11 @@ BAND_CENTERS_MHZ = {
 }
 PCC_FFT, PCC_WF, PCC_METER = 0x8003, 0x8004, 0x8002
 METER_SID = 0x46000000       # meter VITA stream id (AE routes meters by PCC, not by sid)
+DAXTX_SID_BASE = 0x84000000  # dax_tx stream id base — matches the id a real 6x00
+                             # hands out (0x84000000 observed in the #4510 report log)
+DAXTX_AUDIO_PORT = 4991      # AE hardcodes DAX TX audio to <radio>:4991
+                             # (PanadapterStream.cpp: m_radioPort = 4991)
+_DAXTX_LISTENER_STARTED = False  # one :4991 observer per process (see Radio.__init__)
 SLC_LEVEL_ID = 1             # (legacy) single-slice S-meter id; superseded by SLICE_METER_BASE+index
 FWDPWR_ID, SWR_ID = 2, 3     # TX meters: forward power (src=TX nam=FWDPWR, dBm->W) + SWR
 # Radio-published AMPLIFIER meters (src=AMP). AE creates the Amp applet's
@@ -1262,6 +1267,32 @@ class Radio:
         self.txlog = False
         self.txlog_interval = 5.0
         self._txlog_state = {"streams": {}, "total": 0, "last_report": time.time()}
+        # ---- DAX TX chain observer (the #4510 "audio arrives but no RF" family) ----
+        # "No RF" is a symptom-SINK: DAX TX is a six-stage chain and every
+        # mid-chain failure presents identically at the far end, which is why
+        # the family never converged on one fix. The sim tracks each stage it
+        # can see (2..5; stage 1 is app-side capture, stage 6 is the verdict)
+        # and names the FIRST missing one — turning the symptom into a
+        # diagnosis. GET /txchain on the control panel returns the table.
+        self.daxtx_id = None            # 'stream create type=dax_tx' id
+        self.daxtx_tx = False           # radio-side TX-source flag ('stream set <id> tx=1')
+        self.daxtx_auto_adopt = False   # model the firmware population that marks a
+                                        # fresh dax_tx stream tx=1 UNPROMPTED — the
+                                        # split behind "works for many, fails for
+                                        # some": AE only sends tx=1 on the WSPR path
+                                        # (RadioModel.cpp:9410/:9476, both WSPR-gated)
+        self.tx_dax = False             # 'transmit set dax=1'
+        self.daxtx_pkts = 0             # VITA audio packets seen on :4991
+        self.daxtx_bytes = 0
+        self.daxtx_last_pkt = 0.0       # monotonic-ish wall time of the last packet
+        self._txchain_was_keyed = False # rising-edge latch for the verdict log line
+        # One :4991 observer per process (rack mode: radio 0 owns the counters —
+        # AE only runs one DAX TX stream at a time, so that is not a loss).
+        global _DAXTX_LISTENER_STARTED
+        if not _DAXTX_LISTENER_STARTED:
+            _DAXTX_LISTENER_STARTED = True
+            threading.Thread(target=self._daxtx_audio_listener,
+                             daemon=True, name="daxtx-audio-observer").start()
         self.tx_tune = False
         self.tx_power_w = 100.0      # live: forward power (W) reported while TX
         # What the RADIO generates while tuning: "" (plain carrier) or "two_tone".
@@ -1302,6 +1333,67 @@ class Radio:
     @property
     def tx_on(self):
         return self.tx_mox or self.tx_tune
+
+    # ---- DAX TX chain observer (#4510) -----------------------------------
+    def txchain(self):
+        """The 'audio arrives but no RF' chain, radio-side view.
+
+        Stage 1 (app-side audio capture) is invisible from here by design —
+        this is the radio's testimony, which is exactly what the divergent
+        no-RF family lacks: the operator sees only the two chain ends, so
+        every mid-chain failure looks identical. The verdict names the FIRST
+        missing stage instead."""
+        audio_fresh = (self.daxtx_last_pkt > 0
+                       and (time.time() - self.daxtx_last_pkt) < 2.0)
+        stages = [
+            ("2: dax_tx stream exists",           self.daxtx_id is not None),
+            ("3: TX audio arriving on :4991",     audio_fresh),
+            ("4: radio keyed with dax=1",         bool(self.tx_on) and self.tx_dax),
+            ("5: stream claimed as TX source",    self.daxtx_tx),
+        ]
+        first_missing = next((name for name, ok in stages if not ok), None)
+        return {
+            "stages": {name: ok for name, ok in stages},
+            "stream_id": f"0x{self.daxtx_id:08X}" if self.daxtx_id else None,
+            "audio_pkts": self.daxtx_pkts,
+            "audio_bytes": self.daxtx_bytes,
+            "auto_adopt": self.daxtx_auto_adopt,
+            "keyed": bool(self.tx_on),
+            "dax": self.tx_dax,
+            "verdict": ("RF WOULD BE PRODUCED" if first_missing is None
+                        else f"NO RF — first missing stage: {first_missing}"),
+        }
+
+    def txchain_edge(self):
+        """Log the chain verdict once per key-down while DAX is the TX source
+        setting — the moment an operator would be transmitting silence."""
+        keyed = bool(self.tx_on)
+        if keyed and not self._txchain_was_keyed and self.tx_dax:
+            log(f"[txchain] {self.txchain()['verdict']}")
+        self._txchain_was_keyed = keyed
+
+    def _daxtx_audio_listener(self):
+        # AE hardcodes DAX TX audio to <radio>:4991 (PanadapterStream.cpp:
+        # m_radioPort = 4991), which nothing else here binds — a dedicated
+        # observer socket counts stage 3. Best-effort: if the port is taken
+        # (SmartSDR DAX on this host?), log once and run without stage 3.
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", DAXTX_AUDIO_PORT))
+        except OSError as e:
+            log(f"[txchain] :{DAXTX_AUDIO_PORT} observer unavailable ({e}) — "
+                f"stage-3 audio counting disabled")
+            return
+        log(f"[txchain] observing DAX TX audio on UDP :{DAXTX_AUDIO_PORT}")
+        while True:
+            try:
+                data, _addr = s.recvfrom(4096)
+            except OSError:
+                return
+            self.daxtx_pkts += 1
+            self.daxtx_bytes += len(data)
+            self.daxtx_last_pkt = time.time()
 
     def set_power(self, on):
         # Rack "power button": off -> stop streaming + drop AE's connection + stop
@@ -1616,8 +1708,48 @@ class Radio:
                                   f"client_handle=0x{self.handle_hex}")
                 log(f"[dax] registered dax_rx stream 0x{sid:08X} channel={ch}")
                 self._start_audio_thread()
+            elif kvs.get("type") == "dax_tx":
+                # The TX half of the #4510 chain. Real firmware replies with an
+                # id and a registration status; whether it ALSO marks the fresh
+                # stream tx=1 unprompted is exactly the behaviour split behind
+                # the "no RF" family — daxtx_auto_adopt models both populations.
+                sid = DAXTX_SID_BASE + self.radio_id
+                self.daxtx_id = sid
+                self.daxtx_tx = bool(self.daxtx_auto_adopt)
+                self.daxtx_pkts = 0
+                self.daxtx_bytes = 0
+                self.daxtx_last_pkt = 0.0
+                self.reply(conn, seq, f"0x{sid:08X}")
+                self.status(conn, f"stream 0x{sid:08X} type=dax_tx "
+                                  f"client_handle=0x{self.handle_hex} "
+                                  f"tx={1 if self.daxtx_tx else 0}")
+                log(f"[txchain] dax_tx stream created id=0x{sid:08X} "
+                    f"tx={int(self.daxtx_tx)}"
+                    f"{' (auto-adopted by firmware model)' if self.daxtx_tx else ''}")
             else:
                 self.reply(conn, seq, "0x48000000")
+        elif c.startswith("stream set"):
+            # AE sends 'stream set 0x… tx=1|0' to claim/release a dax_tx stream
+            # as the transmit modulation source — the stage-5 command of the
+            # chain, and the one the ordinary DAX/TCI path never sends (#4510:
+            # only the WSPR path is wired to it). Echo a status so AE's
+            # ownership-adoption path (m_daxTxActive) sees the radio's answer.
+            kvs = parse_kvs(c)
+            sid = None
+            for tok in c.split():
+                if tok.lower().startswith("0x"):
+                    try:
+                        sid = int(tok, 16)
+                    except ValueError:
+                        pass
+                    break
+            if sid is not None and sid == self.daxtx_id and "tx" in kvs:
+                self.daxtx_tx = kvs["tx"] == "1"
+                log(f"[txchain] stream 0x{sid:08X} tx={kvs['tx']} — TX source "
+                    f"{'CLAIMED' if self.daxtx_tx else 'released'} by client")
+                self.status(conn, f"stream 0x{sid:08X} type=dax_tx "
+                                  f"client_handle=0x{self.handle_hex} tx={kvs['tx']}")
+            self.reply(conn, seq)
         elif c.startswith("stream remove"):
             for tok in c.split():
                 if tok.lower().startswith("0x"):
@@ -1625,6 +1757,10 @@ class Radio:
                         self.audio_stop.set()
                         self.audio_stream_id = None
                         self.dax_channel = None
+                    if self.daxtx_id is not None and int(tok, 16) == self.daxtx_id:
+                        self.daxtx_id = None
+                        self.daxtx_tx = False
+                        log("[txchain] dax_tx stream removed")
             self.reply(conn, seq)
         elif c.startswith("transmit tune"):
             # POSITIONAL form: "transmit tune 1|0". AE's two-tone/ATU tune uses
@@ -1635,12 +1771,17 @@ class Radio:
             self.tx_tune = (len(parts) > 2 and parts[2] == "1")
             self.reply(conn, seq)
             self.emit_transmit_status()
+            self.txchain_edge()
             log(f"[tx] tune {'ON' if self.tx_tune else 'OFF'}"
                 f"{' (' + self.tune_mode + ')' if self.tune_mode else ''}")
         elif c.startswith("transmit set"):                 # AE keys TX (MOX / TUNE)
             kvs = parse_kvs(c)
             if "mox" in kvs:  self.tx_mox = kvs["mox"] == "1"
             if "tune" in kvs: self.tx_tune = kvs["tune"] == "1"
+            # Stage 4 of the #4510 chain: dax=1 tells the radio the TX audio
+            # SOURCE is DAX — necessary but not sufficient; stage 5 (stream
+            # tx=1) still has to name WHICH stream modulates.
+            if "dax" in kvs:  self.tx_dax = kvs["dax"] == "1"
             # tune_mode selects what the RADIO generates while tuning. AE's
             # two-tone test sends 'tune_mode=two_tone' then 'transmit tune 1'
             # and sends NO audio of its own -- measured on the wire 2026-07-22.
@@ -1656,6 +1797,7 @@ class Radio:
                     except ValueError: pass
             self.reply(conn, seq)
             self.emit_transmit_status()
+            self.txchain_edge()
         elif c == "sub amplifier all":                      # AE subscribes to amplifier presence
             self.reply(conn, seq)
             self.emit_amplifier_status(conn)                # -> AE hasAmplifier=true; AMP applet un-gates
@@ -2940,6 +3082,16 @@ def start_control_server(radio, port):
                     "tx": radio.tx_on,
                     "meter_dbm": round(radio.last_vfo_dbm, 1),
                 })
+            if u.path == "/txchain":
+                # The #4510 chain verdict — radio-side stages + first missing.
+                return self._json(radio.txchain())
+            if u.path == "/txchain/adopt":
+                # Model the firmware split: on = the radio marks a fresh dax_tx
+                # stream tx=1 unprompted (the works-for-many population); off =
+                # the explicit 'stream set tx=1' is required (the #4510 case).
+                q = urllib.parse.parse_qs(u.query)
+                radio.daxtx_auto_adopt = q.get("on", ["1"])[0] == "1"
+                return self._json({"auto_adopt": radio.daxtx_auto_adopt})
             if u.path == "/state":
                 # List form (one radio) so the noise-bench JS is identical to the
                 # rack panel's /state — pollNoise() reads arr[0].
