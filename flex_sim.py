@@ -226,8 +226,12 @@ def wf_packet(stream_id, seq, intens, low_hz, binbw_hz, timecode, auto_black=20)
     # here; AE's #3586 auto-black path uses it as the waterfall black/low point.
     # Pass the frame's measured floor (min raw) for faithful emulation.
     w = len(intens)
-    low_raw = int(round(low_hz))                           # plain Hz (|val|<1e11 -> AE decodes as Hz;
-    binbw_raw = int(round(binbw_hz))                       # unambiguous for HF/VHF, unlike Hz*2^20 at low f)
+    # FrameLowFreq/BinBandwidth are FlexLib "VitaFrequency" = Hz * 2^20. AE >= #4412
+    # decodes that format UNCONDITIONALLY (VitaTileFrequency.h) — the old magnitude
+    # heuristic that let plain Hz through is gone, so plain Hz now lands ~2^20 low
+    # and every row maps off-screen (waterfall black while the pan stays correct).
+    low_raw = int(round(low_hz * 1048576))
+    binbw_raw = int(round(binbw_hz * 1048576))
     sub = struct.pack(">qqIHHIIHH", low_raw, binbw_raw, 100, w, 1, timecode, auto_black, w, 0)
     payload = sub + struct.pack(">%dh" % w, *intens)       # signed int16, AE reads /128.0
     return vita_header(stream_id, PCC_WF, seq, len(payload)) + payload
