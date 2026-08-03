@@ -238,8 +238,10 @@ class SpeServer:
             conn.sendall(bytes([IAC, DONT, COM_PORT_OPTION]))
             print("[2217] client WILL COM-PORT-OPTION -> replied DONT. This "
                   "port is `telnet` WITHOUT rfc2217=true, so SET-CONTROL is "
-                  "refused and DTR/RTS will NOT move. AE does not read this "
-                  "reply, so from its side the pulse will appear to succeed.",
+                  "refused and DTR/RTS will NOT move here. AE reads this reply "
+                  "(scanComPortOptionReply, PR #4531) and warns. Note a real "
+                  "ser2net 4.3.11 was observed answering DONT and then acting "
+                  "on SET-CONTROL anyway -- this sim models the strict case.",
                   flush=True)
 
     def on_subneg(self, payload, conn):
