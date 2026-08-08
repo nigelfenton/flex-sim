@@ -1,0 +1,45 @@
+# Runs the test suite on every push and PR.
+#
+# Until 2026-08-08 nothing ran these: build.yml only fires on version tags and
+# only builds binaries, and the tests were main() scripts pytest could not
+# collect (`pytest tests/` said "no tests ran" and exited 0 — a green that
+# proved nothing). They are collectable now, so this makes the coverage real.
+#
+# flex-sim is stdlib-only; pytest is the sole install. test_txchain spawns a
+# real sim and talks to it over TCP/UDP, so it needs a routable interface — it
+# SKIPS rather than fails if the sim cannot start, keeping an environment
+# problem visibly distinct from a regression.
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      # -rs surfaces SKIPPED reasons in the summary: a silently skipped
+      # integration test is the failure mode this job exists to prevent.
+      - name: Run tests
+        run: python -m pytest tests/ -v -rs
+      # The suite is worthless if it collects nothing, and that is exactly how
+      # it shipped. Fail loudly rather than pass vacuously.
+      - name: Assert the suite is non-empty
+        shell: bash
+        run: |
+          n=$(python -m pytest tests/ --collect-only -q 2>/dev/null | grep -cE '^tests/.*::' || true)
+          echo "collected $n test(s)"
+          test "$n" -ge 4
