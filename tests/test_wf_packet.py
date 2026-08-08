@@ -33,22 +33,44 @@ def _decode_like_ae(pkt, n_bins):
     return low_raw / VITA_FREQ_TO_MHZ, binbw_raw / VITA_FREQ_TO_MHZ
 
 
-def main():
-    low_hz, binbw_hz, bins = 13_926_700.0, 244.140625, 32
-    pkt = wf_packet(0x42000000, 0, [0] * bins, low_hz, binbw_hz, timecode=1)
-    low_mhz, binbw_mhz = _decode_like_ae(pkt, bins)
+# One 20 m tile, decoded the way AE decodes it. Shared by every case below so a
+# regression shows up in whichever assertion it actually breaks.
+LOW_HZ, BINBW_HZ, BINS = 13_926_700.0, 244.140625, 32
 
-    # AE must land the tile at the pan frequency, not 2^20 below it.
-    assert abs(low_mhz - low_hz / 1e6) < 1e-6, \
+
+def _tile():
+    pkt = wf_packet(0x42000000, 0, [0] * BINS, LOW_HZ, BINBW_HZ, timecode=1)
+    return _decode_like_ae(pkt, BINS)
+
+
+def test_tile_lands_on_the_pan_frequency():
+    """Plain Hz would decode 2^20 low — the black-waterfall regression."""
+    low_mhz, _ = _tile()
+    assert abs(low_mhz - LOW_HZ / 1e6) < 1e-6, \
         f"tile decodes to {low_mhz} MHz — plain-Hz regression (AE #4412 has no fallback)"
-    assert abs(binbw_mhz * 1e6 - binbw_hz) < 1e-3, \
-        f"bin bandwidth decodes to {binbw_mhz * 1e6} Hz, expected {binbw_hz}"
 
-    # The whole tile must span the pan width, not collapse near DC.
-    high_mhz = low_mhz + binbw_mhz * bins
+
+def test_bin_bandwidth_survives_the_encoding():
+    _, binbw_mhz = _tile()
+    assert abs(binbw_mhz * 1e6 - BINBW_HZ) < 1e-3, \
+        f"bin bandwidth decodes to {binbw_mhz * 1e6} Hz, expected {BINBW_HZ}"
+
+
+def test_tile_spans_the_pan_width():
+    """Catches a collapse near DC even if the low edge happened to look right."""
+    low_mhz, binbw_mhz = _tile()
+    high_mhz = low_mhz + binbw_mhz * BINS
     assert high_mhz > low_mhz > 13.0, \
         f"tile spans {low_mhz}..{high_mhz} MHz — collapsed near DC"
 
+
+def main():
+    """Standalone entry point — kept so `python3 tests/test_wf_packet.py` still
+    works on a box without pytest (the Pi appliance, a bare sim host)."""
+    test_tile_lands_on_the_pan_frequency()
+    test_bin_bandwidth_survives_the_encoding()
+    test_tile_spans_the_pan_width()
+    low_mhz, binbw_mhz = _tile()
     print(f"PASS: tile decodes to {low_mhz:.6f} MHz "
           f"(binbw {binbw_mhz * 1e6:.3f} Hz) — VitaFrequency encoding confirmed")
 

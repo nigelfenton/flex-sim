@@ -199,5 +199,29 @@ def main():
         sim.kill()
 
 
+def test_txchain_observer():
+    """pytest entry point.
+
+    Deliberately ONE test wrapping the whole sequence rather than a function per
+    check: this is a single ordered walk of the #4510 failure — each stage sets
+    up the next, and the point is that the chain names the FIRST missing stage in
+    turn. Split into independent cases it would spawn a sim per case (fixed
+    ports, ~15x the runtime) and lose the ordering that is the actual subject.
+    Individual checks are still reported by name in the captured output.
+
+    Skips rather than fails when the ports are busy or a sim cannot be spawned —
+    a box already running flex-sim on :5993 is an environment fact, not a
+    regression (see check() output for which stage failed if it does fail).
+    """
+    rc = main()
+    if rc == 0:
+        return
+    import pytest
+    if failed == 0:      # never got as far as asserting anything: infra, not code
+        pytest.skip("flex_sim could not be started or its control panel never came up "
+                    f"(ports {PORT}/{CTL}/{DAXTX_PORT} busy?)")
+    assert rc == 0, f"{failed} txchain check(s) failed — see output above"
+
+
 if __name__ == "__main__":
     sys.exit(main())
