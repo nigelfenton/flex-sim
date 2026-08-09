@@ -8,9 +8,21 @@ fits.
 
 ---
 
-## 0. The finding that changes the plan
+## 0. ANSWERED 2026-08-09: it is an ANAN-G2 → Protocol 2, no cheap path
 
-**Ask which ANAN he has before writing any P2 code.**
+**He has an ANAN-G2.** That is the Saturn FPGA board, and TAPR publishes **no
+Protocol 1 firmware for it** — P2 is the only wire it speaks. So §1's cheap path
+(reuse the Metis wire AE already has) **does not apply**, and this is the
+months-long sibling-backend project in §2.
+
+§1 is kept below because it is still true of the 7000/8000DLE family and would
+apply to any *other* ANAN owner who asks — but it is not the path for this radio.
+
+The G2 detail that matters for the sim: it is a Saturn FPGA **plus an onboard
+Raspberry Pi**, so the radio is a small computer. Worth knowing when reading a
+pcap — some traffic may be the Pi rather than the FPGA.
+
+### Original scoping question (now resolved)
 
 | Model | Board | Protocol 1? | Protocol 2? |
 |---|---|---|---|
@@ -103,7 +115,7 @@ size to the entire HL2 backend effort.
 
 ## 5. Open questions
 
-1. **Which ANAN?** Blocks everything above.
+1. ~~**Which ANAN?**~~ **ANSWERED: G2 (Saturn) → Protocol 2 only.**
 2. **Board IDs for the Orion MkII family** — needed for v0's discovery reply, and
    not in the firmware repo README.
 3. **A pcap from a real ANAN** would turn v1 from "built to a spec" into "built
@@ -113,9 +125,25 @@ size to the entire HL2 backend effort.
 4. Does AE want a P2 backend at all? Worth an RFC before writing backend code —
    the sim can proceed regardless, since it lives in our repo.
 
-## 6. The honest framing
+## 6. The honest framing (revised, model known)
 
-The user-facing prize is real: he is tired of Thetis and would rather run AE. But
-"AE could drive it" is a months-long backend if it is a G2, and possibly a
-firmware conversation if it is a 7000/8000. **The sim is worth building either
-way** — it is the only way this work becomes reviewable, and v0 is nearly free.
+The user-facing prize is real — he is tired of Thetis and would rather run AE —
+but with a G2 confirmed, **there is no shortcut**. Driving that radio means a
+Protocol 2 backend: ~90 function-per-port sockets, eleven datagram formats, a new
+client class, and a sibling to `Hl2Backend`. That is comparable in size to the
+entire HL2 effort, which ran to months and many PRs.
+
+What I would NOT do is promise him a timeline. What I would do:
+
+1. **Get the pcap anyway** — it is now the foundation rather than a nice-to-have,
+   because without an ANAN on the bench a capture is the *only* ground truth for
+   what the sim must emit.
+2. **Build the v1 P2 sim** (discovery + one DDC IQ stream). Days of work, and it
+   is the thing that makes any future P2 backend reviewable by people without a
+   $3k radio — the #4815 lesson applied before the fact rather than after.
+3. **Then judge the backend on its merits**, with a sim to develop against and a
+   real radio (his) available for the final proof. That is a much better position
+   to start from than a cold months-long build against hardware nobody has.
+
+The sim is worth building. The backend is a decision for the maintainer and
+whoever has the appetite, not something to commit to on a friend's behalf.
