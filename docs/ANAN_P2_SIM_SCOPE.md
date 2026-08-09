@@ -113,6 +113,73 @@ size to the entire HL2 backend effort.
 - Multi-DDC, DUC/transmit, wideband, mic/line
 - Only worth building once something consumes v1
 
+## 4b. AUTHORITATIVE PORT MAP + PACKET SIZES (extracted 2026-08-09)
+
+From **laurencebarker/Saturn** (GPL-3.0), `project_documentation/` — written by the
+G2's own firmware author, so it describes what *this* radio actually does.
+Cached on the NAS at `_claude/anan-p2/` (both originals + extracted text).
+
+### Ports (PC → SDR unless noted)
+
+| Purpose | Port | Thread idx |
+|---|---|---|
+| Discovery **and** General Packet to SDR | **1024** | 0 |
+| DDC Specific | 1025 | 1 |
+| DUC Specific | 1026 | 2 |
+| High Priority **from** PC | 1027 | 3 |
+| DDC Audio (speaker) | 1028 | 4 |
+| DUC0 I/Q | 1029 | 5 |
+| **High Priority → PC** | 1025 | 6 |
+| **Mic samples → PC** | 1026 | 7 |
+| **DDC0–9 I/Q → PC** | **1035–1044** | 8–17 |
+| Wideband ADC0 / ADC1 → PC | 1027 / 1028 | 18 / 19 |
+| Memory-mapped either way | not supported | — |
+
+⭐ **Discovery reply goes to the *source port* of the discovery request**, not a
+fixed port — and "all outgoing messages go to the same PC port, as used in the
+discovery request." A sim must echo the requester's port, not assume 1024.
+
+⭐ **The General Packet can RE-ASSIGN every port above.** Zero means "use the
+default". Thetis sends the defaults, but a conforming sim has to honour a
+non-default set — and the author notes Thetis fires its next 3 messages
+immediately after, so a real radio can miss them while re-binding.
+
+⚠ **Byte order is network (big-endian) throughout.** Saturn does not implement
+the protocol's byte-order-change mechanism, and the author doubts Thetis does.
+
+### Startup sequence (what the sim must answer, in order)
+
+1. P1 discovery **and** P2 discovery both arrive at **1024** — a P2 radio has to
+   tolerate a P1 probe on the same port.
+2. P2 discovery → **P2 reply** (to the requester's source port).
+3. **General Packet** → assigns ports; re-bind if non-default.
+4. DDC Specific → DUC Specific → **High Priority with run bit = 1**.
+5. Only then do outgoing data threads start. **There is no separate run/stop
+   packet** — the run bit is embedded in the High Priority packet.
+6. High Priority → PC is sent **every 50 ms in RX, every 1 ms in TX**.
+
+### Packet sizes (`protocol 2 data transfer sizes.xlsx`)
+
+**DDC I/Q packets are 1440 bytes / 240 samples at every sample rate** — the rate
+changes the *cadence*, not the size:
+
+| Rate | packet duration |
+|---|---|
+| 48 k | 5 ms |
+| 96 k | 2.5 ms |
+| 192 k | 1.25 ms |
+| 384 k | 0.625 ms |
+| 768 k | 0.3125 ms |
+| 1536 k | 0.156 ms |
+
+Interleaved DDC halves the samples per packet (120) and so halves the duration.
+Speaker audio 256 B / 64 samples @ 48 k; mic 128 B / 64 samples @ 48 k;
+DUC I/Q 1440 B / 240 samples @ 192 k.
+
+**For a v1 sim this is the whole job:** answer discovery on 1024, accept the
+General/DDC/DUC/High-Priority sequence, then emit 1440-byte DDC0 packets to 1035
+every 5 ms (48 k) with correct big-endian framing.
+
 ## 5. Open questions
 
 1. ~~**Which ANAN?**~~ **ANSWERED: G2 (Saturn) → Protocol 2 only.**
