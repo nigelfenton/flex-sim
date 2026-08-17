@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
     while (pkts < 200) {
         n = recvfrom(s, rx, sizeof(rx), 0, NULL, NULL);
         if (n < 0) break;
-        if (n != 1456) { badlen++; continue; }   /* 16 header + 1440 payload */
+        if (n != 1444) { badlen++; continue; }   /* 16 header + 1428 payload = 238 samples */
         long seq = ((long)(rx[0]&0xFF)<<24)|((rx[1]&0xFF)<<16)|((rx[2]&0xFF)<<8)|(rx[3]&0xFF);
         if (firstseq < 0) firstseq = seq;
         if (prev >= 0 && seq != prev+1) badseq++;
@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
         int spf  = ((rx[14]&0xFF)<<8) + (rx[15]&0xFF);
         if (pkts == 0) {
             check("bits/sample = 24 (piHPSDR offset [12:14])", bits == 24, "wrong");
-            check("samplesperframe = 240 (piHPSDR offset [14:16])", spf == 240, "wrong");
+            check("samplesperframe = 238 (piHPSDR offset [14:16])", spf == 238, "wrong");
         }
         /* decode sample 0 exactly as process_ddc_iq does */
         int b = 16;
@@ -93,7 +93,7 @@ int main(int argc, char **argv) {
     double el = (t1.tv_sec-t0.tv_sec) + (t1.tv_usec-t0.tv_usec)/1e6;
 
     check("DDC0 IQ received after RUN=1", pkts >= 20, "too few packets");
-    check("every packet is 1456 B (16+1440)", badlen == 0, "wrong-length packets seen");
+    check("every packet is 1444 B (16+1428)", badlen == 0, "wrong-length packets seen");
     check("sequence numbers monotonic", badseq == 0, "gaps/repeats");
     check("payload decodes to non-zero samples", nonzero > pkts/2, "all zero");
     if (pkts > 1) {

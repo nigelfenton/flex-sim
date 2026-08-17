@@ -34,9 +34,15 @@
 #     packet (byte 4, bit 0) — that is what starts and stops the data threads.
 #   - Everything is NETWORK BYTE ORDER (big-endian). Saturn does not implement
 #     the protocol's byte-order-change mechanism.
-#   - DDC I/Q packets are 1440 bytes / 240 samples at EVERY sample rate. The
-#     rate changes the CADENCE, not the size: 5 ms at 48k, 2.5 at 96k, 1.25 at
-#     192k, 0.625 at 384k. Samples are 24-bit I + 24-bit Q, big-endian.
+#   - DDC (RX) I/Q packets are 16 B header + 1428 B = 238 samples at EVERY sample
+#     rate. The rate changes the CADENCE, not the size: 4.96 ms at 48k, 2.48 at
+#     96k, 1.24 at 192k. Samples are 24-bit I + 24-bit Q, big-endian.
+#     VERIFIED 2026-08-17 against N2JXL's real ANAN-G2 pcaps: the radio's own
+#     samples/frame field reads 238, and 238*6 = 1428 fills the 1444 B payload
+#     exactly. The "transfer sizes" spreadsheet's 1440 B / 240 samples is the
+#     DUC (TX) geometry -- TX has a 4-byte header (seq only, no timestamp and no
+#     bits/samples fields), so 4 + 240*6 = 1444 as well. Do not mix them up:
+#     240 samples on RX overruns the payload by 12 bytes.
 #
 # NOT implemented (v1): TX/DUC, DDC1-9, wideband ADC, mic samples, memory-mapped
 # access, non-default port re-assignment (accepted and logged, not acted on).
@@ -77,10 +83,10 @@ DEVICE_SATURN = 0x0A           # pihpsdr NEW_DEVICE_SATURN 1010 = 1000 + 0x0A
 P2_VERSION = 39                # protocol 3.9
 SW_VERSION = 21
 
-# --- DDC I/Q framing (Saturn "transfer sizes" sheet) -------------------------
-IQ_SAMPLES_PER_PACKET = 240
+# --- DDC I/Q framing (real-hardware pcap, 2026-08-17) -------------------------
+IQ_SAMPLES_PER_PACKET = 238
 IQ_BYTES_PER_SAMPLE = 6        # 24-bit I + 24-bit Q
-IQ_PAYLOAD_BYTES = IQ_SAMPLES_PER_PACKET * IQ_BYTES_PER_SAMPLE   # 1440
+IQ_PAYLOAD_BYTES = IQ_SAMPLES_PER_PACKET * IQ_BYTES_PER_SAMPLE   # 1428
 IQ_HEADER_BYTES = 16           # seq(4) + timestamp(8) + bits/sample(2) + samples/frame(2)
 
 FULL_SCALE_24 = (1 << 23) - 1
@@ -218,7 +224,7 @@ class AnanSim:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((self.ip, PORT_DDC0_IQ_OUT))
         self.socks.append(s)
-        period = IQ_SAMPLES_PER_PACKET / self.rate      # 5 ms @ 48k
+        period = IQ_SAMPLES_PER_PACKET / self.rate      # 4.96 ms @ 48k
         log(f"[iq ] DDC0 ready: {IQ_PAYLOAD_BYTES} B / {IQ_SAMPLES_PER_PACKET} samples "
             f"every {period*1000:.3f} ms at {self.rate} S/s")
         next_at = time.perf_counter()
