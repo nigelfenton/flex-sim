@@ -11,7 +11,10 @@ Every assertion here traces to a source:
   - reply goes to the requester's SOURCE port, ports, and "no run/stop packet —
     the run bit is in High Priority": Saturn project_documentation/
     "protocol 2 data transder.docx"
-  - 1440 bytes / 240 samples at every rate: "protocol 2 data transfer sizes.xlsx"
+  - DDC/RX is 16 + 1428 B = 238 samples at every rate. VERIFIED against N2JXL's
+    real ANAN-G2 pcaps 2026-08-17 (samples/frame reads 238, 238*6=1428 exactly).
+    NOTE the spreadsheet's "1440 B / 240 samples" is the DUC/TX geometry (4 B
+    header + 1440), which does NOT fit RX -- it overruns the 1444 B payload by 12.
 
 Run: python3 tests/test_anan_p2.py   (spawns its own sim; no radio, no network
                                       beyond loopback)
@@ -30,8 +33,8 @@ IP = "127.0.0.1"
 
 PORT_DISCOVERY = 1024
 PORT_HIGH_PRIO_IN = 1027
-IQ_PAYLOAD_BYTES = 1440
-IQ_SAMPLES = 240
+IQ_PAYLOAD_BYTES = 1428
+IQ_SAMPLES = 238
 IQ_HEADER_BYTES = 16
 
 passed = failed = 0
@@ -141,7 +144,11 @@ def main():
                 d, _ = s.recvfrom(4096)
             except socket.timeout:
                 break
-            if len(d) == IQ_HEADER_BYTES + IQ_PAYLOAD_BYTES:
+            # Collect every datagram big enough to be an IQ frame. Filtering on
+            # the EXPECTED size here would make a wrong-sized packet disappear
+            # instead of failing the size check below -- which is exactly how the
+            # 240-sample error stayed green until the real-hardware pcap.
+            if len(d) > IQ_HEADER_BYTES:
                 if t_first is None:
                     t_first = time.time()
                 t_last = time.time()
@@ -161,11 +168,11 @@ def main():
             check("sequence numbers increment by 1",
                   all(b - a == 1 for a, b in zip(seqs, seqs[1:])),
                   f"{seqs[:5]}...")
-            # 240 samples @ 48 kHz = 5 ms/packet. Allow generous slack for a
+            # 238 samples @ 48 kHz = 4.96 ms/packet. Allow generous slack for a
             # Python sender on a loaded box; we are pinning the RATE, not jitter.
             if len(pkts) >= 10 and t_first and t_last > t_first:
                 per = (t_last - t_first) / (len(pkts) - 1)
-                check("cadence ~5 ms/packet at 48 kHz (240 samples)",
+                check("cadence ~4.96 ms/packet at 48 kHz (238 samples)",
                       0.002 < per < 0.020, f"measured {per*1000:.2f} ms")
 
         # --- run bit = 0 -> stops ------------------------------------------
