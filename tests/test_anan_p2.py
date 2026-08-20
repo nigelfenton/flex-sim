@@ -15,6 +15,10 @@ Every assertion here traces to a source:
     real ANAN-G2 pcaps 2026-08-17 (samples/frame reads 238, 238*6=1428 exactly).
     NOTE the spreadsheet's "1440 B / 240 samples" is the DUC/TX geometry (4 B
     header + 1440), which does NOT fit RX -- it overruns the 1444 B payload by 12.
+  - the client COMMANDS the sample rate: the DDC Specific packet (port 1025)
+    carries 6-byte per-DDC records from byte 17, rate at 18+6n as big-endian
+    uint16 in kHz (pihpsdr new_protocol.c). Rate changes the CADENCE only —
+    the 16+1428 B / 238-sample geometry holds at every rate (real-G2 pcaps).
 
 Run: python3 tests/test_anan_p2.py   (spawns its own sim; no radio, no network
                                       beyond loopback)
@@ -32,6 +36,7 @@ ROOT = Path(__file__).resolve().parent.parent
 IP = "127.0.0.1"
 
 PORT_DISCOVERY = 1024
+PORT_DDC_SPEC = 1025
 PORT_HIGH_PRIO_IN = 1027
 IQ_PAYLOAD_BYTES = 1428
 IQ_SAMPLES = 238
@@ -60,6 +65,18 @@ def high_priority(run, centre_hz=14_100_000):
     b = bytearray(60)
     b[4] = 0x01 if run else 0x00
     struct.pack_into(">I", b, 9, centre_hz)
+    return bytes(b)
+
+
+def ddc_specific(rate_khz):
+    """DDC Specific to port 1025. Per-DDC records are 6 bytes from byte 17:
+    ADC at 17+6n, sample rate at 18+6n as big-endian uint16 in kHz — the
+    offsets pihpsdr's new_protocol.c writes. DDC0's rate lands at [18:20]."""
+    b = bytearray(1444)
+    b[4] = 1                             # one ADC
+    b[7] = 0x01                          # DDC0 enable
+    b[17] = 0                            # DDC0 <- ADC0
+    struct.pack_into(">H", b, 18, rate_khz)
     return bytes(b)
 
 
@@ -137,7 +154,7 @@ def main():
         hp.sendto(high_priority(True), (IP, PORT_HIGH_PRIO_IN))
 
         s.settimeout(5)
-        pkts, t_first, t_last = [], None, None
+        pkts, t_first, t_last, per_48 = [], None, None, None
         t0 = time.time()
         while time.time() - t0 < 3.0 and len(pkts) < 60:
             try:
@@ -171,9 +188,59 @@ def main():
             # 238 samples @ 48 kHz = 4.96 ms/packet. Allow generous slack for a
             # Python sender on a loaded box; we are pinning the RATE, not jitter.
             if len(pkts) >= 10 and t_first and t_last > t_first:
-                per = (t_last - t_first) / (len(pkts) - 1)
+                per_48 = (t_last - t_first) / (len(pkts) - 1)
                 check("cadence ~4.96 ms/packet at 48 kHz (238 samples)",
-                      0.002 < per < 0.020, f"measured {per*1000:.2f} ms")
+                      0.002 < per_48 < 0.020, f"measured {per_48*1000:.2f} ms")
+
+        # --- DDC Specific re-rate: cadence must follow, geometry must not ---
+        # NereusSDR (2026-08-20) connected commanding 192 k while the sim sat
+        # at its 48 k default — a sim that only honours --rate streams 4x slow.
+        # A real radio obeys the rate in the DDC Specific packet.
+        ddc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ddc.sendto(ddc_specific(192), (IP, PORT_DDC_SPEC))
+        # Let the change land; keep draining so the socket buffer stays empty
+        # and the arrival times below are genuine cadence, not queue drain.
+        t0 = time.time()
+        while time.time() - t0 < 0.4 and not expired():
+            try:
+                s.settimeout(0.3)
+                s.recvfrom(4096)
+            except socket.timeout:
+                break
+        s.settimeout(5)
+        pkts2, t2_first, t2_last = [], None, None
+        t0 = time.time()
+        while time.time() - t0 < 3.0 and len(pkts2) < 120:
+            try:
+                d, _ = s.recvfrom(4096)
+            except socket.timeout:
+                break
+            if len(d) > IQ_HEADER_BYTES:
+                if t2_first is None:
+                    t2_first = time.time()
+                t2_last = time.time()
+                pkts2.append(d)
+
+        check("IQ still flows after the DDC Specific packet", len(pkts2) >= 20,
+              f"got {len(pkts2)} packets")
+        if pkts2:
+            check(f"re-rate leaves the geometry alone: still "
+                  f"{IQ_HEADER_BYTES}+{IQ_PAYLOAD_BYTES} bytes",
+                  all(len(d) == IQ_HEADER_BYTES + IQ_PAYLOAD_BYTES for d in pkts2),
+                  f"sizes {sorted({len(d) for d in pkts2})}")
+            nsamps = {struct.unpack_from(">HH", d, 12)[1] for d in pkts2}
+            check(f"header still declares {IQ_SAMPLES} samples/frame",
+                  nsamps == {IQ_SAMPLES}, f"got {nsamps}")
+            if per_48 and len(pkts2) >= 20 and t2_first and t2_last > t2_first:
+                per_192 = (t2_last - t2_first) / (len(pkts2) - 1)
+                # 238 @ 192 k = 1.24 ms. The discriminating assertion is the
+                # RATIO: a sim that ignores the re-rate still measures ~4.96 ms
+                # here, and any absolute window loose enough for CI jitter
+                # would let that through.
+                check("cadence follows the commanded rate (192 k >= 2x faster "
+                      "than 48 k)", per_192 < per_48 / 2,
+                      f"48k {per_48*1000:.2f} ms -> 192k {per_192*1000:.2f} ms")
+        ddc.close()
 
         # --- run bit = 0 -> stops ------------------------------------------
         hp.sendto(high_priority(False), (IP, PORT_HIGH_PRIO_IN))

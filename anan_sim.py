@@ -37,6 +37,13 @@
 #   - DDC (RX) I/Q packets are 16 B header + 1428 B = 238 samples at EVERY sample
 #     rate. The rate changes the CADENCE, not the size: 4.96 ms at 48k, 2.48 at
 #     96k, 1.24 at 192k. Samples are 24-bit I + 24-bit Q, big-endian.
+#   - The sample rate is COMMANDED by the client, not configured on the radio:
+#     the DDC Specific packet (port 1025) carries 6-byte per-DDC records from
+#     byte 17 — ADC at 17+6n, rate at 18+6n as big-endian uint16 in kHz
+#     (pihpsdr new_protocol.c writes (rate/1000)>>8 there). --rate is only the
+#     pre-handshake default; NereusSDR proved this the hard way on 2026-08-20
+#     by asking for 192k while the sim sat at 48k and would have streamed 4x
+#     slow.
 #     VERIFIED 2026-08-17 against N2JXL's real ANAN-G2 pcaps: the radio's own
 #     samples/frame field reads 238, and 238*6 = 1428 fills the 1444 B payload
 #     exactly. The "transfer sizes" spreadsheet's 1440 B / 240 samples is the
@@ -82,6 +89,13 @@ STATUS_IDLE = 0x02             # 2 = idle/available, 3 = already sending
 DEVICE_SATURN = 0x0A           # pihpsdr NEW_DEVICE_SATURN 1010 = 1000 + 0x0A
 P2_VERSION = 39                # protocol 3.9
 SW_VERSION = 21
+
+# --- DDC Specific packet (port 1025) ------------------------------------------
+# Per-DDC records are 6 bytes starting at byte 17: ADC assignment at 17+6n,
+# sample rate at 18+6n as a big-endian uint16 in kHz (pihpsdr new_protocol.c).
+# DDC0's rate therefore lives at bytes [18:20].
+DDC0_RATE_OFFSET = 18
+DDC_RATES = (48000, 96000, 192000, 384000, 768000, 1536000)
 
 # --- DDC I/Q framing (real-hardware pcap, 2026-08-17) -------------------------
 IQ_SAMPLES_PER_PACKET = 238
@@ -202,7 +216,36 @@ class AnanSim:
                     self.centre_hz = f
                     log(f"[hp ] DDC0 centre -> {f/1e6:.6f} MHz")
 
-    # -- DDC / DUC specific (1025 / 1026): accepted, minimally parsed ---------
+    # -- DDC specific (1025): the client commands the DDC0 sample rate here ---
+    def serve_ddc_spec(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((self.ip, PORT_DDC_SPEC))
+        self.socks.append(s)
+        seen = False
+        while not self.stop:
+            try:
+                data, _ = s.recvfrom(2048)
+            except OSError:
+                break
+            if not seen:
+                seen = True
+                log(f"[ddc] first packet ({len(data)} B) — accepted")
+            if len(data) < DDC0_RATE_OFFSET + 2:
+                continue
+            khz = struct.unpack_from(">H", data, DDC0_RATE_OFFSET)[0]
+            rate = khz * 1000
+            if not khz or rate == self.rate:
+                continue
+            if rate not in DDC_RATES:
+                log(f"[ddc] ⚠ commanded DDC0 rate {khz} kHz is not a P2 rate — ignored")
+                continue
+            self.rate = rate
+            log(f"[ddc] DDC0 rate -> {rate} S/s "
+                f"(cadence {IQ_SAMPLES_PER_PACKET/rate*1000:.3f} ms/packet, "
+                f"size stays {IQ_HEADER_BYTES + IQ_PAYLOAD_BYTES} B)")
+
+    # -- DUC specific (1026): accepted, minimally parsed ----------------------
     def serve_spec(self, port, name):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -239,6 +282,7 @@ class AnanSim:
             except OSError:
                 pass
             self.seq_iq += 1
+            period = IQ_SAMPLES_PER_PACKET / self.rate  # live: DDC Specific may re-rate us
             next_at += period
             slack = next_at - time.perf_counter()
             if slack > 0:
@@ -295,7 +339,7 @@ class AnanSim:
         log(f"  MAC {':'.join(f'{x:02x}' for x in self.mac)}  device 0x{DEVICE_SATURN:02x} (Saturn)")
         for target, args in ((self.serve_discovery, ()),
                              (self.serve_high_priority, ()),
-                             (self.serve_spec, (PORT_DDC_SPEC, "ddc")),
+                             (self.serve_ddc_spec, ()),
                              (self.serve_spec, (PORT_DUC_SPEC, "duc")),
                              (self.stream_ddc0, ()),
                              (self.stream_high_priority, ())):
@@ -317,9 +361,9 @@ class AnanSim:
 def main():
     ap = argparse.ArgumentParser(description="openHPSDR Protocol 2 (ANAN/Saturn) RX simulator")
     ap.add_argument("--ip", default=None, help="interface to bind (default: autodetect)")
-    ap.add_argument("--rate", type=int, default=48000,
-                    choices=[48000, 96000, 192000, 384000, 768000, 1536000],
-                    help="DDC0 sample rate (changes packet CADENCE, not size)")
+    ap.add_argument("--rate", type=int, default=48000, choices=list(DDC_RATES),
+                    help="initial DDC0 sample rate — the client's DDC Specific "
+                         "packet overrides it (changes packet CADENCE, not size)")
     ap.add_argument("--pattern", default="tone", choices=["tone", "noise", "zero"])
     ap.add_argument("--tone", type=float, default=1000.0, help="tone offset from centre, Hz")
     ap.add_argument("--ddc", type=int, default=2, help="DDC count to advertise")
