@@ -150,22 +150,30 @@ def main():
             check("no IQ before the run bit", True)
 
         # --- run bit = 1 -> DDC0 IQ starts ---------------------------------
-        hp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        hp.sendto(high_priority(True), (IP, PORT_HIGH_PRIO_IN))
+        # Sent from the SAME socket that listens for IQ — the real client
+        # shape (Thetis/NereusSDR run the whole session on one socket). The
+        # sim streams to the source of the General/HP-in packets (issue #5),
+        # so a separate throwaway socket here would steal the stream.
+        s.sendto(high_priority(True), (IP, PORT_HIGH_PRIO_IN))
 
         s.settimeout(5)
         pkts, t_first, t_last, per_48 = [], None, None, None
         t0 = time.time()
         while time.time() - t0 < 3.0 and len(pkts) < 60:
             try:
-                d, _ = s.recvfrom(4096)
+                d, frm = s.recvfrom(4096)
             except socket.timeout:
                 break
-            # Collect every datagram big enough to be an IQ frame. Filtering on
-            # the EXPECTED size here would make a wrong-sized packet disappear
-            # instead of failing the size check below -- which is exactly how the
+            # Demux by radio-side SOURCE port, the way real clients do: DDC IQ
+            # arrives from 1035-1044; HP status arrives from 1025 on the SAME
+            # session socket (that is correct radio behaviour, not noise).
+            # Within the IQ ports, collect EVERY size — filtering on the
+            # EXPECTED size would make a wrong-sized packet disappear instead
+            # of failing the size check below, which is exactly how the
             # 240-sample error stayed green until the real-hardware pcap.
-            if len(d) > IQ_HEADER_BYTES:
+            if not (1035 <= frm[1] <= 1044):
+                continue
+            if len(d) > 0:
                 if t_first is None:
                     t_first = time.time()
                 t_last = time.time()
@@ -212,10 +220,12 @@ def main():
         t0 = time.time()
         while time.time() - t0 < 3.0 and len(pkts2) < 120:
             try:
-                d, _ = s.recvfrom(4096)
+                d, frm = s.recvfrom(4096)
             except socket.timeout:
                 break
-            if len(d) > IQ_HEADER_BYTES:
+            if not (1035 <= frm[1] <= 1044):     # IQ ports only (HP is :1025)
+                continue
+            if len(d) > 0:
                 if t2_first is None:
                     t2_first = time.time()
                 t2_last = time.time()
@@ -243,7 +253,7 @@ def main():
         ddc.close()
 
         # --- run bit = 0 -> stops ------------------------------------------
-        hp.sendto(high_priority(False), (IP, PORT_HIGH_PRIO_IN))
+        s.sendto(high_priority(False), (IP, PORT_HIGH_PRIO_IN))
         time.sleep(0.4)
         while not expired():                         # drain what was in flight
             try:
@@ -259,8 +269,47 @@ def main():
         except socket.timeout:
             check("clearing the run bit stops the stream", True)
 
+        # --- session-port regression: two-socket client (issue #5) ----------
+        # NereusSDR/Thetis probe discovery on one socket and run the session
+        # on ANOTHER. Streams must follow the SESSION socket (the General /
+        # HP-in source), never the discovery socket — verified against the
+        # real-G2 capture: the PC probed from :62517, ran the session from
+        # :62520, and every radio->PC stream went to :62520.
+        disc_s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        disc_s.bind((IP, 0))
+        disc_s.settimeout(1.0)
+        sess_s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sess_s.bind((IP, 0))
+        sess_s.settimeout(5)
+        disc_s.sendto(discovery_request(), (IP, PORT_DISCOVERY))
+        try:
+            disc_s.recvfrom(2048)              # the reply itself goes to A
+        except socket.timeout:
+            pass
+        sess_s.sendto(bytes(60), (IP, PORT_DISCOVERY))       # General from B
+        sess_s.sendto(high_priority(True), (IP, PORT_HIGH_PRIO_IN))
+        got_sess = 0
+        t0 = time.time()
+        while time.time() - t0 < 3.0 and got_sess < 10 and not expired():
+            try:
+                d, frm = sess_s.recvfrom(4096)
+            except socket.timeout:
+                break
+            if 1035 <= frm[1] <= 1044 and len(d) > 0:
+                got_sess += 1
+        check("IQ follows the SESSION socket, not the discovery socket",
+              got_sess >= 10, f"session socket got {got_sess} packets")
+        try:
+            stray, _ = disc_s.recvfrom(4096)
+            check("discovery-only socket receives NO stream", False,
+                  f"got {len(stray)} bytes")
+        except socket.timeout:
+            check("discovery-only socket receives NO stream", True)
+        sess_s.sendto(high_priority(False), (IP, PORT_HIGH_PRIO_IN))
+        disc_s.close()
+        sess_s.close()
+
         s.close()
-        hp.close()
         print(f"\n{passed} passed, {failed} failed")
         return 0 if failed == 0 else 1
     finally:

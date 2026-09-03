@@ -133,11 +133,14 @@ class AnanSim:
 
         self.run = False                 # set by the High Priority run bit
         self.stop = False
-        self.pc_addr = None              # (host, port) learned from discovery
+        self.pc_addr = None              # (host, port) of the client SESSION
+        self.active_ddc = 0              # which DDC we stream as (enable mask)
         self.centre_hz = 14_100_000      # DDC0 NCO, set by DDC Specific
         self.seq_iq = 0
         self.seq_hp = 0
         self.phase = 0.0
+        self.stat_pkts = 0
+        self.stat_t0 = time.perf_counter()
         self.lock = threading.Lock()
         self.socks = []
 
@@ -158,7 +161,10 @@ class AnanSim:
             # P2 discovery: [0:4] == 0, [4] == 0x02. A P1 probe (EF FE ...) also
             # lands here; ignore it rather than answering with a P2 reply.
             if data[0:4] == b"\x00\x00\x00\x00" and data[4] == 0x02:
-                self.pc_addr = addr           # reply to the SOURCE port
+                # Reply to the probe's source port — but do NOT stream there.
+                # The real G2 (N2JXL pcap, 2026-08-20) streams to the SESSION
+                # port (General/HP source), never the discovery port: Thetis
+                # probes from one socket and runs the session on another.
                 s.sendto(self.discovery_reply(), addr)
                 log(f"[disc] P2 discovery from {addr[0]}:{addr[1]} -> replied "
                     f"(device=0x{DEVICE_SATURN:02x} Saturn, {self.ddc_count} DDC)")
@@ -178,10 +184,21 @@ class AnanSim:
         b[20] = self.ddc_count
         return bytes(b)
 
+    def _learn_session(self, addr):
+        """All radio->PC streams target the client's SESSION source port
+        (verified against N2JXL's real-G2 pcap: DDC IQ, mic and HP status all
+        went to :62520, the General/HP source — not :62517, the discovery
+        source). Learned from General and HP-in so it survives a sim restart
+        mid-session."""
+        if addr != self.pc_addr:
+            self.pc_addr = addr
+            log(f"[gen] session -> {addr[0]}:{addr[1]} (streams target this port)")
+
     def handle_general(self, data, addr):
         """General Packet to SDR — may re-assign every port. v1 logs only."""
         if len(data) < 60:
             return
+        self._learn_session(addr)
         # Ports live at [5:] as big-endian uint16 pairs; zero means "default".
         wanted = struct.unpack_from(">H", data, 5)[0] if len(data) >= 7 else 0
         if wanted not in (0, PORT_DDC_SPEC):
@@ -203,6 +220,7 @@ class AnanSim:
                 break
             if len(data) < 5:
                 continue
+            self._learn_session(addr)
             run = bool(data[4] & 0x01)
             if run != self.run:
                 self.run = run
@@ -222,6 +240,7 @@ class AnanSim:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((self.ip, PORT_DDC_SPEC))
         self.socks.append(s)
+        self.sock_1025 = s     # HP-out shares it: radio sends HP FROM :1025
         seen = False
         while not self.stop:
             try:
@@ -231,17 +250,41 @@ class AnanSim:
             if not seen:
                 seen = True
                 log(f"[ddc] first packet ({len(data)} B) — accepted")
-            if len(data) < DDC0_RATE_OFFSET + 2:
+            # Evidence log: mask + first four per-DDC rate records, whenever
+            # the CmdRx content changes (diagnoses a client writing the rate
+            # into the wrong DDC's record).
+            if len(data) >= 44:
+                prefix = bytes(data[:44])
+                if prefix != getattr(self, "_last_cmdrx", None):
+                    self._last_cmdrx = prefix
+                    rates = [struct.unpack_from(">H", data, 18 + 6 * i)[0]
+                             for i in range(4)]
+                    log(f"[ddc] CmdRx mask=0x{data[7]:02x} "
+                        f"rates(kHz) DDC0-3={rates}")
+            # buf[7] = DDC enable bitmask (bit n = DDCn), per Thetis CmdRx
+            # (NereusSDR P2CodecOrionMkII::composeCmdRx). Thetis-family clients
+            # run RX1 on DDC2 — DDC0/1 are reserved for PureSignal feedback —
+            # which is why N2JXL's real-G2 capture streams from port 1037, not
+            # 1035. Stream as the LOWEST enabled DDC, from its own port.
+            if len(data) >= 8 and data[7]:
+                ddc = (data[7] & -data[7]).bit_length() - 1
+                if ddc != self.active_ddc:
+                    self.active_ddc = ddc
+                    log(f"[ddc] enable mask 0x{data[7]:02x} -> streaming as "
+                        f"DDC{ddc} (port {PORT_DDC0_IQ_OUT + ddc})")
+            rate_off = DDC0_RATE_OFFSET + 6 * self.active_ddc
+            if len(data) < rate_off + 2:
                 continue
-            khz = struct.unpack_from(">H", data, DDC0_RATE_OFFSET)[0]
+            khz = struct.unpack_from(">H", data, rate_off)[0]
             rate = khz * 1000
             if not khz or rate == self.rate:
                 continue
             if rate not in DDC_RATES:
-                log(f"[ddc] ⚠ commanded DDC0 rate {khz} kHz is not a P2 rate — ignored")
+                log(f"[ddc] ⚠ commanded DDC{self.active_ddc} rate {khz} kHz "
+                    f"is not a P2 rate — ignored")
                 continue
             self.rate = rate
-            log(f"[ddc] DDC0 rate -> {rate} S/s "
+            log(f"[ddc] DDC{self.active_ddc} rate -> {rate} S/s "
                 f"(cadence {IQ_SAMPLES_PER_PACKET/rate*1000:.3f} ms/packet, "
                 f"size stays {IQ_HEADER_BYTES + IQ_PAYLOAD_BYTES} B)")
 
@@ -261,34 +304,59 @@ class AnanSim:
                 seen = True
                 log(f"[{name}] first packet ({len(data)} B) — accepted")
 
-    # -- DDC0 I/Q out (to PC port learned at discovery, from 1035) -----------
+    # -- DDC I/Q out (to the client's SESSION port, from 1035+n) --------------
+    # Clients demux streams by the radio-side SOURCE port, so the socket must
+    # be bound to 1035 + active_ddc and rebound if the enable mask moves it.
     def stream_ddc0(self):
+        bound = self.active_ddc
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((self.ip, PORT_DDC0_IQ_OUT))
+        s.bind((self.ip, PORT_DDC0_IQ_OUT + bound))
         self.socks.append(s)
         period = IQ_SAMPLES_PER_PACKET / self.rate      # 4.96 ms @ 48k
-        log(f"[iq ] DDC0 ready: {IQ_PAYLOAD_BYTES} B / {IQ_SAMPLES_PER_PACKET} samples "
+        log(f"[iq ] DDC ready: {IQ_PAYLOAD_BYTES} B / {IQ_SAMPLES_PER_PACKET} samples "
             f"every {period*1000:.3f} ms at {self.rate} S/s")
         next_at = time.perf_counter()
         while not self.stop:
+            if bound != self.active_ddc:
+                s.close()
+                bound = self.active_ddc
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((self.ip, PORT_DDC0_IQ_OUT + bound))
+                self.socks.append(s)
+                self.seq_iq = 0            # fresh stream identity, fresh seq
+                log(f"[iq ] source port -> {PORT_DDC0_IQ_OUT + bound} (DDC{bound})")
             if not (self.run and self.pc_addr):
                 time.sleep(0.02)
                 next_at = time.perf_counter()
                 continue
-            pkt = self.iq_packet()
-            try:
-                s.sendto(pkt, self.pc_addr)
-            except OSError:
-                pass
-            self.seq_iq += 1
-            period = IQ_SAMPLES_PER_PACKET / self.rate  # live: DDC Specific may re-rate us
-            next_at += period
+            # Windows sleep() is ~15 ms grained; per-packet pacing at 1.24 ms
+            # (192k) is impossible. Sleep to the next deadline, then send EVERY
+            # packet due in one burst — clients buffer; what they cannot survive
+            # is the old "fell behind -> resync" branch silently DROPPING the
+            # backlog (heard as ~3 Hz clicking: bursts of tone, then starvation).
             slack = next_at - time.perf_counter()
             if slack > 0:
                 time.sleep(slack)
-            else:
-                next_at = time.perf_counter()      # we fell behind; resync
+            sent = 0
+            while next_at <= time.perf_counter() and sent < 64:
+                try:
+                    s.sendto(self.iq_packet(), self.pc_addr)
+                except OSError:
+                    pass
+                self.seq_iq += 1
+                self.stat_pkts += 1
+                next_at += IQ_SAMPLES_PER_PACKET / self.rate
+                sent += 1
+            if sent >= 64:                 # hopelessly behind (paused/debugged)
+                next_at = time.perf_counter()
+            now = time.perf_counter()
+            if now - self.stat_t0 >= 5.0:
+                want = self.rate / IQ_SAMPLES_PER_PACKET
+                got = self.stat_pkts / (now - self.stat_t0)
+                log(f"[iq ] {got:.0f} pkt/s (nominal {want:.0f}) at {self.rate} S/s")
+                self.stat_t0, self.stat_pkts = now, 0
 
     def iq_packet(self):
         hdr = struct.pack(">IQHH", self.seq_iq & 0xFFFFFFFF,
@@ -317,22 +385,34 @@ class AnanSim:
             out[o+3:o+6] = (q & 0xFFFFFF).to_bytes(3, "big")
         return bytes(out)
 
-    # -- high priority out (to PC:1025): 50 ms in RX --------------------------
+    # -- high priority out: FROM radio :1025 TO the session port, 50 ms in RX.
+    # Real-G2 pcap: .127:1025 -> .108:<session>, 60 B. Clients demux by the
+    # radio-side SOURCE port, so this must leave from :1025 — reuse the DDC
+    # Specific socket, which is already bound there.
     def stream_high_priority(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socks.append(s)
+        while not self.stop and getattr(self, "sock_1025", None) is None:
+            time.sleep(0.05)
         while not self.stop:
             if self.run and self.pc_addr:
                 b = bytearray(60)
                 struct.pack_into(">I", b, 0, self.seq_hp & 0xFFFFFFFF)
                 self.seq_hp += 1
                 try:
-                    s.sendto(bytes(b), (self.pc_addr[0], PORT_HIGH_PRIO_OUT))
+                    self.sock_1025.sendto(bytes(b), self.pc_addr)
                 except OSError:
                     pass
             time.sleep(0.050)                      # 50 ms in RX; 1 ms in TX
 
     def start(self):
+        if sys.platform == "win32":
+            # 1 ms system timer so the IQ pacing sleep wakes ~on time instead
+            # of on the default ~15.6 ms tick. Without this the sender leans
+            # entirely on the burst catch-up and audio arrives lumpy.
+            try:
+                import ctypes
+                ctypes.windll.winmm.timeBeginPeriod(1)
+            except Exception:
+                pass
         log(f"anan-sim {VERSION} — openHPSDR Protocol 2 (Saturn/ANAN-G2) RX only")
         log(f"  ip={self.ip} rate={self.rate} pattern={self.pattern} "
             f"tone={self.tone_hz} Hz ddc={self.ddc_count}")
