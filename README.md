@@ -178,12 +178,18 @@ while all being wrong:
 | Real ANAN-G2 captures, read by `p2verify.py` | RX frames are **16 B header + 1428 B = 238 samples** at every rate. The widely-quoted 1440 B / 240-sample figure is the **TX** layout ([#3](https://github.com/nigelfenton/flex-sim/pull/3)) |
 | NereusSDR 0.5.2, end to end | discovery, session-port handling, enabled-DDC streaming, re-rating and RX rendering interoperate — and it exposed four sim defects the shared-ancestry checks could not ([#5](https://github.com/nigelfenton/flex-sim/issues/5)) |
 | `tools/p2stream.c` | an independent probe whose send and parse offsets come from piHPSDR, not from this sim |
-| `tests/test_anan_p2.py` | the wire bytes, asserted in CI on Linux and Windows |
+| AetherSDR's ANAN-G2 backend, end to end (2026-09-16) | discovery, session and streaming interoperate — and it exposed that the sim's **I/Q handedness was mirrored**: the "+1 kHz" tone drew 1 kHz *below* the dial and was audible only in LSB. AE's polarity had been measured on a real G2 and cross-checked with an RSP1B, so the sim was the one in error. Fixed in v0.3.1 |
+| `tests/test_anan_p2.py` | the wire bytes **and the tone's handedness**, asserted in CI on Linux and Windows |
 
-⚠ **Not yet run against AetherSDR's ANAN backend** — which is precisely what it is for,
-so reports are welcome. One observation is still open: an RX-audio click comb seen in
-NereusSDR while the wire itself was clean, with its attribution deliberately left
-unresolved ([#5](https://github.com/nigelfenton/flex-sim/issues/5)).
+**I/Q handedness.** Like a real HPSDR radio, the sim's wire I/Q is the conjugate of the
+textbook convention: a signal *above* the dial arrives at a *negative* frequency. A
+correct client shows the default tone just **above** the tuned frequency and hears it in
+**USB**. If you see it below the dial and hear it only in LSB, the client — or a sim
+older than v0.3.1 — has I/Q the wrong way round.
+
+One observation is still open: an RX-audio click comb seen in NereusSDR while the wire
+itself was clean, with its attribution deliberately left unresolved
+([#5](https://github.com/nigelfenton/flex-sim/issues/5)).
 
 ```
 python3 -m pytest tests/test_anan_p2.py                      # spawns its own sim on loopback
