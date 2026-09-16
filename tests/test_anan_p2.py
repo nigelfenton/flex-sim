@@ -19,11 +19,20 @@ Every assertion here traces to a source:
     carries 6-byte per-DDC records from byte 17, rate at 18+6n as big-endian
     uint16 in kHz (pihpsdr new_protocol.c). Rate changes the CADENCE only —
     the 16+1428 B / 238-sample geometry holds at every rate (real-G2 pcaps).
+  - IQ HANDEDNESS: the HPSDR wire is the conjugate of the analytic convention,
+    so a tone ABOVE the dial arrives at a NEGATIVE frequency. Measured on a real
+    ANAN-G2 against WWV and cross-checked with an RSP1B + SDR++ (AetherSDR
+    docs/HERMES.md section 16). Until v0.3.1 the sim had it backwards and every
+    check here passed, because none looked at which side the tone landed.
+  - High Priority frequencies are phase words by default (Hz = word *
+    122.88 MHz / 2^32), advertised by discovery reply byte 21.
 
 Run: python3 tests/test_anan_p2.py   (spawns its own sim; no radio, no network
                                       beyond loopback)
 """
 
+import cmath
+import math
 import os
 import socket
 import struct
@@ -41,6 +50,7 @@ PORT_HIGH_PRIO_IN = 1027
 IQ_PAYLOAD_BYTES = 1428
 IQ_SAMPLES = 238
 IQ_HEADER_BYTES = 16
+TONE_HZ = 1000.0                         # anan_sim's default --tone
 
 passed = failed = 0
 
@@ -80,7 +90,29 @@ def ddc_specific(rate_khz):
     return bytes(b)
 
 
+def decode_iq(frame):
+    """24-bit big-endian I then Q, after the 16 B DDC header."""
+    def s24(b):
+        v = int.from_bytes(b, "big")
+        return v - (1 << 24) if v & 0x800000 else v
+    out = []
+    for n in range(struct.unpack_from(">H", frame, 14)[0]):
+        o = IQ_HEADER_BYTES + 6 * n
+        out.append(complex(s24(frame[o:o + 3]), s24(frame[o + 3:o + 6])))
+    return out
+
+
+def check_phase_word():
+    """10.000 MHz as the phase word AetherSDR's ANAN backend sends."""
+    sys.path.insert(0, str(ROOT))
+    import anan_sim
+    hz = anan_sim.phase_word_to_hz(349_525_333)
+    check("phase word 349525333 decodes to 10.000000 MHz",
+          abs(hz - 10_000_000) < 1, f"got {hz:.1f} Hz")
+
+
 def main():
+    check_phase_word()
     # A watchdog, because a sim that streams when it should be silent makes this
     # test consume packets forever — and a hang is indistinguishable from a pass
     # in CI. Proven necessary: removing the run-bit gate hung this test at 124.
@@ -130,6 +162,8 @@ def main():
               f"got 0x{reply[11]:02x}")
         check("P2 version present", reply[12] > 0, f"got {reply[12]}")
         check("DDC count advertised", reply[20] > 0, f"got {reply[20]}")
+        check("reply[21] = 1 (High Priority frequencies are phase words)",
+              reply[21] == 1, f"got {reply[21]}")
 
         # --- a P1 probe must NOT be answered with a P2 reply ---------------
         s.sendto(b"\xef\xfe\x02" + bytes(60), (IP, PORT_DISCOVERY))
@@ -189,6 +223,16 @@ def main():
             check("header declares 24 bits/sample", bits == 24, f"got {bits}")
             check(f"header declares {IQ_SAMPLES} samples/frame", nsamp == IQ_SAMPLES,
                   f"got {nsamp}")
+            # Handedness: the sim's +TONE_HZ tone must arrive at a NEGATIVE
+            # frequency, as a real radio's above-dial signal does. The mean
+            # phase step between consecutive samples is 2*pi*f/rate, signed.
+            iq = decode_iq(pkts[0])
+            steps = [cmath.phase(b * a.conjugate()) for a, b in zip(iq, iq[1:])]
+            f_meas = sum(steps) / len(steps) * 48000 / (2 * math.pi)
+            check(f"+{TONE_HZ:.0f} Hz tone arrives at a NEGATIVE frequency "
+                  "(real HPSDR wire handedness)",
+                  abs(f_meas + TONE_HZ) < 0.02 * TONE_HZ,
+                  f"measured {f_meas:+.1f} Hz, want {-TONE_HZ:+.1f}")
             seqs = [struct.unpack_from(">I", p, 0)[0] for p in pkts]
             check("sequence numbers increment by 1",
                   all(b - a == 1 for a, b in zip(seqs, seqs[1:])),

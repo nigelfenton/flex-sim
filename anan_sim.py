@@ -50,6 +50,18 @@
 #     DUC (TX) geometry -- TX has a 4-byte header (seq only, no timestamp and no
 #     bits/samples fields), so 4 + 240*6 = 1444 as well. Do not mix them up:
 #     240 samples on RX overruns the payload by 12 bytes.
+#   - The wire IQ is the CONJUGATE of the textbook analytic convention: a signal
+#     ABOVE the DDC centre arrives at a NEGATIVE frequency. A sim that emits
+#     I = cos, Q = sin for "+1 kHz" puts its tone 1 kHz BELOW the dial on a
+#     correct client -- audible only in LSB. That was this sim's bug until
+#     v0.3.1, found when AetherSDR's ANAN backend (whose polarity was measured
+#     on a real G2 against WWV, and cross-checked with an RSP1B + SDR++ sharing
+#     no code with it) drew the tone on the wrong side. See AetherSDR
+#     docs/HERMES.md section 16.
+#   - Frequencies in the High Priority packet (4 bytes per DDC at 9+4n) are a
+#     PHASE WORD by default, not Hz: Hz = word * 122.88 MHz / 2^32 (Saturn's
+#     ADC clock). The General Packet's byte 37 bit 3 selects it, and the
+#     discovery reply's byte 21 advertises it. 10.000 MHz is 349525333.
 #
 # NOT implemented (v1): TX/DUC, DDC1-9, wideband ADC, mic samples, memory-mapped
 # access, non-default port re-assignment (accepted and logged, not acted on).
@@ -69,7 +81,7 @@ import sys
 import threading
 import time
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # --- ports (PC -> SDR unless noted). Saturn doc, "Port Numbers to Use". -------
 PORT_DISCOVERY = 1024          # discovery AND General Packet to SDR
@@ -83,7 +95,8 @@ PORT_DDC0_IQ_OUT = 1035        # DDC0 I/Q -> PC (DDC0-9 = 1035..1044)
 
 # --- discovery reply layout (pihpsdr new_discovery.c field offsets) ----------
 # [0:4] zero  [4] status  [5:11] MAC  [11] device id  [12] P2 version
-# [13] software version  [20] number of DDCs  [23] beta version
+# [13] software version  [20] number of DDCs  [21] frequency is a phase word
+# [23] beta version
 REPLY_LEN = 60
 STATUS_IDLE = 0x02             # 2 = idle/available, 3 = already sending
 DEVICE_SATURN = 0x0A           # pihpsdr NEW_DEVICE_SATURN 1010 = 1000 + 0x0A
@@ -104,6 +117,15 @@ IQ_PAYLOAD_BYTES = IQ_SAMPLES_PER_PACKET * IQ_BYTES_PER_SAMPLE   # 1428
 IQ_HEADER_BYTES = 16           # seq(4) + timestamp(8) + bits/sample(2) + samples/frame(2)
 
 FULL_SCALE_24 = (1 << 23) - 1
+
+# --- High Priority frequency words ---------------------------------------------
+PHASE_WORD_CLOCK_HZ = 122_880_000   # Saturn ADC clock: Hz = word * clock / 2^32
+GENERAL_FREQ_FLAGS = 37             # General Packet byte; bit 3 set = phase word
+HP_FREQ_OFFSET = 9                  # High Priority: 4-byte word per DDC at 9+4n
+
+
+def phase_word_to_hz(word):
+    return word * PHASE_WORD_CLOCK_HZ / (1 << 32)
 
 
 def log(*a):
@@ -135,7 +157,8 @@ class AnanSim:
         self.stop = False
         self.pc_addr = None              # (host, port) of the client SESSION
         self.active_ddc = 0              # which DDC we stream as (enable mask)
-        self.centre_hz = 14_100_000      # DDC0 NCO, set by DDC Specific
+        self.centre_hz = 14_100_000      # active DDC's NCO, from High Priority
+        self.freq_is_phase_word = True   # the P2 default; General byte 37 bit 3
         self.seq_iq = 0
         self.seq_hp = 0
         self.phase = 0.0
@@ -182,6 +205,7 @@ class AnanSim:
         b[12] = P2_VERSION
         b[13] = SW_VERSION
         b[20] = self.ddc_count
+        b[21] = 1                        # High Priority frequencies are phase words
         return bytes(b)
 
     def _learn_session(self, addr):
@@ -206,6 +230,10 @@ class AnanSim:
                 f"v1 ignores this and keeps the defaults")
         else:
             log(f"[gen] General Packet from {addr[0]} — default ports")
+        phase = bool(data[GENERAL_FREQ_FLAGS] & 0x08)
+        if phase != self.freq_is_phase_word:
+            self.freq_is_phase_word = phase
+            log(f"[gen] frequencies arrive as {'phase words' if phase else 'Hz'}")
 
     # -- high priority in (port 1027): carries the RUN bit --------------------
     def serve_high_priority(self):
@@ -226,13 +254,16 @@ class AnanSim:
                 self.run = run
                 log(f"[hp ] RUN bit -> {int(run)} "
                     f"({'streaming DDC0' if run else 'stopped'})")
-            # DDC0 centre frequency: big-endian uint32 at [9:13] in the P2
-            # high-priority packet. Track it so the tone lands where asked.
-            if len(data) >= 13:
-                f = struct.unpack_from(">I", data, 9)[0]
-                if f and f != self.centre_hz:
-                    self.centre_hz = f
-                    log(f"[hp ] DDC0 centre -> {f/1e6:.6f} MHz")
+            # Centre frequency of the DDC we stream: big-endian uint32 at 9+4n,
+            # a phase word unless the General Packet switched to Hz. Logged
+            # only -- the tone is an offset from wherever the client tuned.
+            off = HP_FREQ_OFFSET + 4 * self.active_ddc
+            if len(data) >= off + 4:
+                word = struct.unpack_from(">I", data, off)[0]
+                hz = round(phase_word_to_hz(word)) if self.freq_is_phase_word else word
+                if word and hz != self.centre_hz:
+                    self.centre_hz = hz
+                    log(f"[hp ] DDC{self.active_ddc} centre -> {hz/1e6:.6f} MHz")
 
     # -- DDC specific (1025): the client commands the DDC0 sample rate here ---
     def serve_ddc_spec(self):
@@ -378,8 +409,10 @@ class AnanSim:
                 self.phase += step
                 if self.phase > 2 * math.pi:
                     self.phase -= 2 * math.pi
+                # Conjugate of the analytic convention, like the real wire:
+                # -sin puts a +tone_hz offset ABOVE the dial on a correct client.
                 i = int(amp * math.cos(self.phase))
-                q = int(amp * math.sin(self.phase))
+                q = int(-amp * math.sin(self.phase))
             o = n * IQ_BYTES_PER_SAMPLE
             out[o:o+3] = (i & 0xFFFFFF).to_bytes(3, "big")
             out[o+3:o+6] = (q & 0xFFFFFF).to_bytes(3, "big")

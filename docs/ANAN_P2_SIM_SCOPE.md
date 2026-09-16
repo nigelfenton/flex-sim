@@ -188,6 +188,19 @@ protocol's byte-order-change mechanism.
 > 24-bit I then 24-bit Q, big-endian. `p2verify.py` is the tool that established
 > this, and `anan_sim.py` carries the corrected values.
 
+> ⚠ **CORRECTED 2026-09-16 — I/Q handedness.** The wire I/Q is the **conjugate** of
+> the analytic convention: a signal above the DDC centre arrives at a **negative**
+> frequency. Until v0.3.1 the sim emitted `I = cos, Q = sin` for its "+1 kHz" tone,
+> which a correct client draws 1 kHz *below* the dial and demodulates only in LSB.
+> AetherSDR's ANAN backend exposed it: its polarity was measured on a real G2
+> against WWV and cross-checked with an RSP1B + SDR++ sharing no code with it
+> (AetherSDR `docs/HERMES.md` §16). The packet-geometry checks above could never
+> catch this — every frame was the right size.
+
+High Priority centre frequencies (4 bytes per DDC at byte 9 + 4n) are a **phase word**
+by default, not Hz: Hz = word × 122.88 MHz / 2³². The General Packet's byte 37 bit 3
+selects it and discovery reply byte 21 advertises it; 10.000 MHz is 349 525 333.
+
 The sample rate changes the **cadence**, not the frame size. With 238 samples per RX
 frame:
 
@@ -232,5 +245,6 @@ backend, comparable in size to the whole HL2 effort. The plan was therefore:
    exercised by an independent client (NereusSDR) that found four defects the
    documentation-derived checks could not.
 3. **Judge a backend on its merits, with a sim to develop against.** The backend was
-   built upstream under its own RFC. The sim has **not yet been run against it** —
-   that remains the obvious next use for it.
+   built upstream under its own RFC. The sim was first run against it on
+   **2026-09-16**: it interoperated end to end, and the backend — already validated on
+   real hardware — showed the sim's I/Q handedness was mirrored (fixed in v0.3.1).
