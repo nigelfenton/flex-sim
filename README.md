@@ -4,6 +4,8 @@ A **synthetic FlexRadio-6000 emulator** for testing [AetherSDR](https://github.c
 
 flex-sim looks like a real FlexRadio 6000 on your network: AetherSDR discovers it, connects, and renders a live panadapter, waterfall, S-meter, TX meters and CW from a programmable signal engine. **No radio required.**
 
+It also ships **`anan_sim.py`**, an **Apache Labs ANAN-G2 / openHPSDR Protocol 2** receiver simulator, and **`p2verify.py`**, which checks a real Protocol 2 radio's wire from a capture — see [ANAN / openHPSDR Protocol 2](#anan--openhpsdr-protocol-2-simulator).
+
 > Pure **Python 3.8+ standard library** — zero dependencies. **GPL-3.0**.
 
 ---
@@ -14,6 +16,8 @@ flex-sim looks like a real FlexRadio 6000 on your network: AetherSDR discovers i
    - **Windows:** `flex-sim-windows-x64.exe`
    - **Linux:** `flex-sim-linux-x64`
    - **macOS:** `flex-sim-macos-arm64`
+
+   *(The binaries are the Flex radio sim. The ANAN / Protocol 2 tools and the accessory simulators run from source — see [Run from Python](#run-from-python-any-os-no-install).)*
 2. **Run it on a computer that is *not* running AetherSDR** — a spare PC, a Raspberry Pi, a NUC, a VM… anything on the same network. *(Why not the same computer? It's one simple rule — see [Networking](#networking--the-one-rule). You can run it on the same machine, it just needs a couple of extra steps.)*
    - **Windows:** double-click `flex-sim-windows-x64.exe`. It isn't code-signed, so Windows SmartScreen says *"unrecognized app"* (**More info → Run anyway**) and some antivirus (Norton, Defender) may flag or quarantine it — see the false-positive note below.
    - **Linux / macOS:** `chmod +x flex-sim-linux-x64 && ./flex-sim-linux-x64`
@@ -139,6 +143,79 @@ It prints a connect table with the exact host:port to enter in AetherSDR for eac
 
 ---
 
+## ANAN / openHPSDR Protocol 2 simulator
+
+`anan_sim.py` simulates a **different radio family**: an Apache Labs **ANAN-G2
+(Saturn)** speaking **openHPSDR Protocol 2**. It answers discovery, completes the
+General → DDC-Specific → DUC-Specific → High-Priority handshake, and streams DDC I/Q
+at the sample rate the client commands — enough for a Protocol 2 client to find the
+radio and paint a panadapter and waterfall. Pure standard library, like the rest.
+
+It exists so Protocol 2 client work can be developed and reviewed **without a radio on
+the bench** — including AetherSDR's own ANAN-G2 backend
+([aethersdr/AetherSDR#5143](https://github.com/aethersdr/AetherSDR/pull/5143), designed in
+[RFC #4970](https://github.com/aethersdr/AetherSDR/issues/4970)).
+
+```
+python3 anan_sim.py                           # 48 k, test tone, autodetected interface
+python3 anan_sim.py --rate 96000 --pattern noise
+python3 anan_sim.py --ip 10.0.0.5             # bind a specific interface
+```
+
+Then point a Protocol 2 client — Thetis, piHPSDR, NereusSDR, AetherSDR's ANAN backend —
+at that host. As with the Flex sim, a **separate machine or IP** is the simple path.
+
+**Receive only.** Not implemented: transmit (DUC), wideband ADC streams, mic samples,
+memory-mapped access, and acting on a non-default port re-assignment (accepted and
+logged, not honoured).
+
+**How it has been checked** — deliberately not only against itself, because the sim,
+its tests and the probe below all derive from the same documentation and could agree
+while all being wrong:
+
+| Check | What it established |
+|---|---|
+| Real ANAN-G2 captures, read by `p2verify.py` | RX frames are **16 B header + 1428 B = 238 samples** at every rate. The widely-quoted 1440 B / 240-sample figure is the **TX** layout ([#3](https://github.com/nigelfenton/flex-sim/pull/3)) |
+| NereusSDR 0.5.2, end to end | discovery, session-port handling, enabled-DDC streaming, re-rating and RX rendering interoperate — and it exposed four sim defects the shared-ancestry checks could not ([#5](https://github.com/nigelfenton/flex-sim/issues/5)) |
+| `tools/p2stream.c` | an independent probe whose send and parse offsets come from piHPSDR, not from this sim |
+| `tests/test_anan_p2.py` | the wire bytes, asserted in CI on Linux and Windows |
+
+⚠ **Not yet run against AetherSDR's ANAN backend** — which is precisely what it is for,
+so reports are welcome. One observation is still open: an RX-audio click comb seen in
+NereusSDR while the wire itself was clean, with its attribution deliberately left
+unresolved ([#5](https://github.com/nigelfenton/flex-sim/issues/5)).
+
+```
+python3 -m pytest tests/test_anan_p2.py                      # spawns its own sim on loopback
+cc -O2 -o p2stream tools/p2stream.c && ./p2stream 127.0.0.1  # POSIX: Linux / macOS / WSL
+```
+
+### Checking a real radio's wire — `p2verify.py`
+
+A standard-library pcapng reader that reports what a real Protocol 2 radio actually
+puts on the wire: the discovery reply, every P2 flow with its rate, and whether each
+1444 B stream is **DDC (RX)** or **DUC (TX)** — decided by the frame's own declared
+fields, never by port number. It also flags all-zero transmit payloads, which are
+useless as a modulation reference.
+
+```
+python3 p2verify.py session.pcapng [--radio-ip A.B.C.D] [--limit N]
+```
+
+It guards against the two traps that made earlier readings wrong:
+
+- **pcapng timestamps can be nanoseconds, not microseconds.** Resolution is declared
+  per interface; assuming the default makes every cadence 1000× too slow.
+- **Unrelated multicast (RTP, PTP) can share the wire** and bury the P2 session in a
+  top-N summary. Only traffic in the P2 port range is reported, and multicast and
+  broadcast are dropped except for discovery packets.
+
+The reference captures it was verified against are recordings of a private station and
+are not distributed; point it at your own capture. `tests/test_p2verify.py` exercises it
+on a synthetic capture built to trip both traps.
+
+---
+
 ## Same-machine setup (WSL)
 
 Running flex-sim on the **same Windows PC** as AetherSDR, via WSL2 (which gives it its own IP, so no port clash):
@@ -176,4 +253,6 @@ pyinstaller --onefile --name flex-sim flex_sim.py    # -> dist/flex-sim(.exe)
 ## Credits
 Created by **Nigel Fenton (G0JKN)** — design, direction, and testing against live AetherSDR. Code generated by **Claude (Anthropic)** via Claude Code under Nigel's direction — the same AI-assisted, human-reviewed workflow AetherSDR itself uses.
 
-> Status: **v0.1 (beta).** Wire format reverse-engineered from AetherSDR's own decoder — see [`PROTOCOL.md`](PROTOCOL.md). Design notes in [`DESIGN.md`](DESIGN.md).
+Protocol 2 facts come from Laurence Barker's Saturn documentation and piHPSDR (both GPL-3.0; clean-room — facts consulted, no code copied), with the receive geometry confirmed against real ANAN-G2 captures from **N2JXL**.
+
+> Status: **v0.3 (beta).** Wire format reverse-engineered from AetherSDR's own decoder — see [`PROTOCOL.md`](PROTOCOL.md). Design notes in [`DESIGN.md`](DESIGN.md).
