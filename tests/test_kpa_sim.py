@@ -341,6 +341,74 @@ def test_enabling_ni_with_the_line_already_asserted_takes_effect(bench):
     assert bench.amp.tr == "RX"
 
 
+def test_atu_mode_and_relays(bench):
+    assert bench.ask("^AM;") == "^AMI;"                    # letters, per the reference
+    assert bench.ask("^AI;") == "^AI1;"
+    assert bench.ask("^SW;") == "^SW011;"                  # tuned match through the ATU
+    bench.ask("^AMB;", expect_reply=False)
+    assert bench.ask("^AM;") == "^AMB;"
+    assert bench.ask("^AI;") == "^AI0;"
+    assert bench.ask("^SW;") == "^SW018;"                  # bypassed: the antenna's own SWR
+    assert int(bench.ask("^LQ;")[-3:-1], 16) & 0x0C == 0x04  # ATU BYP lit, ATU IN dark
+    bench.ask("^AMI;", expect_reply=False)
+    bench.ask("^AI0;", expect_reply=False)                 # mode I, relays bypassed:
+    assert int(bench.ask("^LQ;")[-3:-1], 16) & 0x0C == 0x0C  # "both ATU LEDs are illuminated"
+    assert bench.ask("^AM2;", expect_reply=False) is None  # not a wire value: ignored
+    assert bench.ask("^AM;") == "^AMI;"
+
+
+def test_antenna_enable(bench):
+    assert bench.ask("^AE;") == "^AE0;"                    # 0 = ANT1 and ANT2, not "off"
+    bench.ask("^AE2;", expect_reply=False)
+    assert bench.ask("^AE;") == "^AE2;"
+    assert bench.ask("^AE07;") == "^AE070;"                # another band, still both
+    bench.ask("^AE071;", expect_reply=False)
+    assert bench.ask("^AE07;") == "^AE071;"
+    assert bench.ask("^AE;") == "^AE2;"                    # current band (20 m) untouched
+
+
+def test_tune_needs_rf_and_replies_when_done(bench):
+    bench.ask("^AMB;", expect_reply=False)                 # start bypassed, antenna at 1.8
+    assert bench.ask("^FT;", expect_reply=False) is None   # no immediate reply
+    assert bench.ask("^TP;") == "^TP1;"
+    time.sleep(0.5)
+    assert bench.amp.tuning                                # no RF: no progress
+    bench.rf_on(20)
+    bench.tcp.settimeout(4)
+    assert bench.tcp.recv(64) == b"^FT;"                   # pushed unprompted on completion
+    assert bench.ask("^TP;") == "^TP0;"
+    assert bench.ask("^AM;") == "^AMI;" and bench.ask("^AI;") == "^AI1;"
+    assert bench.ask("^SW;") == "^SW011;"
+    assert any(e["kind"] == "tune" and e["state"] == "done" for e in bench.amp.events)
+
+
+def test_tune_leaves_a_good_antenna_bypassed(bench):
+    bench.amp.ant_swr = 1.3
+    bench.ask("^FT;", expect_reply=False)
+    bench.rf_on(20)
+    bench.tcp.settimeout(4)
+    assert bench.tcp.recv(64) == b"^FT;"
+    assert bench.ask("^AM;") == "^AMI;" and bench.ask("^AI;") == "^AI0;"
+
+
+def test_cancel_tune_replies_ft(bench):
+    bench.ask("^FT;", expect_reply=False)
+    assert bench.ask("^FE;") == "^FT;"                     # "completes or is cancelled" -> ^FT;
+    assert bench.ask("^TP;") == "^TP0;"
+
+
+def test_pr5905_style_commands_are_not_the_reference(bench):
+    """What aethersdr/AetherSDR#5905 sends. The reference's forms are ^FT; ^FE;
+    ^FLC; and ^AMI;/^AMB;, so a reference-faithful amp ignores these."""
+    bench.amp.set_fault(0x60)
+    assert bench.ask("^FT1;", expect_reply=False) is None
+    assert not bench.amp.tuning
+    assert bench.ask("^FL0;", expect_reply=False) is None
+    assert bench.ask("^FL;") == "^FL60;"                   # still faulted
+    assert bench.ask("^AM1;", expect_reply=False) is None
+    assert bench.ask("^AM;") == "^AMI;"
+
+
 def test_old_firmware_has_no_network_ptt():
     b = Bench(firmware="02.03", operate=True)
     try:
