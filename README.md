@@ -130,16 +130,38 @@ AetherSDR can control, each a single pure-stdlib file with its own interactive p
 | `tgxl_sim.py` | 4O3A Tuner Genius XL (tuner) | 9010 | manual IP (Peripherals tab) |
 | `spe_sim.py` | SPE Expert 1.3K/1.5K/2K (amp) | 4531 | manual IP (Network mode) |
 | `acom_sim.py` | ACOM 600S/700S/1200S (amp) | 9600 | manual IP |
+| `kpa_sim.py` | Elecraft KPA1500 (amp), with network PTT | 1500 TCP+UDP | none yet — AetherSDR has no KPA1500 support ([#4097](https://github.com/aethersdr/AetherSDR/issues/4097)) |
 
 **`station.py` runs them all in one process** with one prompt to drive them — key an
 amp, step the tuner relays, switch antennas — so meters and relays actually move in
 AetherSDR instead of sitting at headless defaults:
 ```
-python3 station.py                    # all five accessories + unified prompt
+python3 station.py                    # all six accessories + unified prompt
 python3 station.py --with-radio       # also spawn flex_sim.py (the radio)
 python3 station.py --no-cli           # headless (staged/background)
 ```
 It prints a connect table with the exact host:port to enter in AetherSDR for each device.
+
+### KPA1500: a bench for network PTT and T/R interlocks
+
+`kpa_sim.py` is the only accessory sim that **transmits**. KPA1500 firmware 3.07 can be keyed
+over the network (`^TX;` / `^TXnn;` / `^RX;` / `^TQ;`), and the reference warns that the amp
+needs **about 5 ms of key lead before exciter RF arrives**, and that RF must be gone before
+`^RX;`. The sim models the T/R relays and logs a **HOT SWITCH** whenever they move with RF on
+them: RF that arrives before the key, RF sooner than 5 ms after it, or a drop to RX
+(`^RX`, a `^TXnn` watchdog expiry, a fault, STBY) while the exciter is still on. Every edge is
+timestamped, with the measured lead and tail, so a controller's sequencing is *measured*.
+
+```
+python3 kpa_sim.py                            # :1500 TCP+UDP, control page :8737, RF sense :1510
+python3 flex_sim.py --rf-sense 127.0.0.1:1510 # the radio tells the amp when its RF is on
+python3 station.py --with-radio               # both, wired together
+```
+
+Open `http://<host>:8737/` for live meters, keying, fault injection and the event log, or
+`GET /state`, `/events?since=N` and `/cmd?c=<command>` from a script. Built against the
+Elecraft KPA1500 Programming Reference V3; the file's header lists exactly where the sim
+follows the reference and where it has to guess.
 
 ---
 

@@ -1340,6 +1340,11 @@ class Radio:
         # AE sets this via 'transmit set tune_mode='; see tx_envelope().
         self.tune_mode = ""
         self.tx_swr = 1.2           # live: SWR reported while TX
+        # --rf-sense HOST:PORT: tell an amplifier sim (kpa_sim.py) when this radio's
+        # RF starts and stops, so it can time its T/R relays against real TX edges.
+        self.rf_sense = []           # [(host, port), ...]
+        self._rf_sense_last = None
+        self._rf_sense_sock = None
         self.amp_handle = 0xA5000000 + self.radio_id  # radio-side amplifier (PGXL) object handle
         self.amp_operate = True      # PGXL OPERATE(1)/STANDBY(0); AE toggles via 'amplifier set operate='
         self.amp_temp_c = 38.0       # amp heatsink; warms while keyed, cools when idle
@@ -2196,9 +2201,32 @@ class Radio:
         # hard" region an operator watches for.
         return watts, env
 
+    def notify_rf_sense(self):
+        """Send 'RF 1 <W>' / 'RF 0' to each --rf-sense target on a TX edge.
+
+        Every TX change in this file funnels through emit_transmit_status(), so
+        hooking there sees the same edges AE is told about. Sent BEFORE the
+        conn check below: the amp needs the edge whether or not a client is
+        attached. The moment tx_on flips is when a real radio's RF would start
+        (this sim has no TX delay), so it is the worst case for the amp."""
+        on = self.tx_on
+        now = (on, int(self.tx_power_w) if on else 0)   # a power change mid-over is news too
+        if not self.rf_sense or now == self._rf_sense_last:
+            return
+        self._rf_sense_last = now
+        msg = (f"RF 1 {now[1]}\n" if on else "RF 0\n").encode()
+        if self._rf_sense_sock is None:
+            self._rf_sense_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for target in self.rf_sense:
+            try:
+                self._rf_sense_sock.sendto(msg, target)
+            except OSError as e:
+                log(f"[rf-sense] send to {target[0]}:{target[1]} failed: {e}")
+
     def emit_transmit_status(self):
         # interlock state drives AE's m_radioTransmitting; transmit status drives
         # the MOX/TUNE UI. tx_client_handle = our handle => AE sees us as TX owner.
+        self.notify_rf_sense()
         if not self.conn:
             return
         on = self.tx_on
@@ -3433,13 +3461,25 @@ def main():
                          "(see TX_AUDIO_DESIGN.md). Off by default — it is a discovery tool.")
     ap.add_argument("--txlog-interval", type=float, default=5.0,
                     help="seconds between --txlog rate reports (default 5)")
+    ap.add_argument("--rf-sense", action="append", default=[], metavar="HOST:PORT",
+                    help="send 'RF 1 <W>' / 'RF 0' over UDP to an amplifier sim on every "
+                         "TX edge, e.g. --rf-sense 127.0.0.1:1510 for kpa_sim.py, so it "
+                         "can time its T/R relays against this radio's RF. Repeatable")
     args = ap.parse_args()
     ip = args.ip or local_ip()
+    rf_sense = []
+    for spec in args.rf_sense:
+        host, _, port = spec.rpartition(":")
+        if not host or not port.isdigit():
+            ap.error(f"--rf-sense wants HOST:PORT, got {spec!r}")
+        rf_sense.append((host, int(port)))
     if args.radios > 1:                                    # ---- rack mode: N radios + strip panel ----
         base = args.base_port or args.port
         models = [m.strip() for m in args.models.split(",")] if args.models else None
         rack = Rack(ip, args.ae, args.radios, base, args.pattern, args.bins, args.fps, args.width_khz,
                     models=models, serial_prefix=args.serial)
+        for r in rack.radios:
+            r.rf_sense = rf_sense
         rack.start()
         start_rack_control_server(rack, args.ctl_port)
         log(f"flex-sim {FLEX_SIM_VERSION} - RACK of {args.radios} radios on :{base}")
@@ -3459,6 +3499,9 @@ def main():
                   port=args.port, model=single_model, serial_prefix=args.serial)
     radio.txlog = args.txlog
     radio.txlog_interval = args.txlog_interval
+    radio.rf_sense = rf_sense
+    if rf_sense:
+        log("[rf-sense] TX edges -> " + ", ".join(f"{h}:{p}" for h, p in rf_sense))
     if args.txlog:
         log(f"[txlog] enabled — logging UDP from AE (report every {args.txlog_interval:g}s)")
     threading.Thread(target=radio.discovery_loop, daemon=True).start()

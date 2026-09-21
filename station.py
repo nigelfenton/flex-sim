@@ -26,6 +26,7 @@ sys.path.insert(0, HERE)
 
 import acom_sim
 import ag_sim
+import kpa_sim
 import pgxl_sim
 import spe_sim
 import tgxl_sim
@@ -60,6 +61,10 @@ class Station:
         # ACOM 600S (merged AE #4298)
         self.acom_amp = acom_sim.Amp()
         self.acom = acom_sim.AcomServer(self.acom_amp)
+        # Elecraft KPA1500, with network PTT and the T/R interlock bench (AE #4097)
+        self.kpa = kpa_sim.Amp()
+        self.kpa_ctl_port = args.kpa_ctl_port
+        self.kpa_rf_sense_port = args.kpa_rf_sense_port
         self.radio_proc = None
 
     def start(self, with_radio, radio_port=None, pattern=None):
@@ -69,12 +74,21 @@ class Station:
         threading.Thread(target=self.tgxl.serve, daemon=True).start()
         threading.Thread(target=self.spe.serve, daemon=True).start()
         threading.Thread(target=self.acom.serve, daemon=True).start()
+        kpa_sim.KpaServer(self.kpa).start()
+        if self.kpa_rf_sense_port:
+            kpa_sim.RfSense(self.kpa, self.kpa_rf_sense_port).start()
+        if self.kpa_ctl_port:
+            kpa_sim.start_control_server(self.kpa, self.kpa_ctl_port)
         if with_radio:
             flex = os.path.join(HERE, "flex_sim.py")
             if os.path.exists(flex):
                 cmd = [sys.executable, flex]
                 if radio_port:
                     cmd += ["--port", str(radio_port)]
+                # The radio's TX edges drive the KPA's RF input, so AE's
+                # "^TX, then MOX" ordering is measured end to end.
+                if self.kpa_rf_sense_port:
+                    cmd += ["--rf-sense", f"127.0.0.1:{self.kpa_rf_sense_port}"]
                 # Pass the pattern through: without it the radio runs the
                 # default 'ramp', which produces no usable TX drive -- so the
                 # amp gauges sit at zero and it looks like the AMP meters are
@@ -99,7 +113,8 @@ class Station:
             f"    Power Genius XL (PGXL){ip}:9008\n"
             f"    Tuner Genius XL (TGXL){ip}:9010\n"
             f"    SPE Expert (SPE)      {ip}:4531   (Network mode; poll-only)\n"
-            f"    ACOM 600S (ACOM)      {ip}:9600\n")
+            f"    ACOM 600S (ACOM)      {ip}:9600\n"
+            f"    Elecraft KPA1500 (KPA){ip}:1500   (TCP+UDP; control page :{self.kpa_ctl_port})\n")
 
 
 def dispatch(st, line):
@@ -123,6 +138,11 @@ def dispatch(st, line):
             print("  ACOM : mode=0x%02X fwd=%dW swr=%.2f temp=%.1fC fault=0x%02X"
                   % (st.acom_amp.mode_byte, st.acom_amp.fwd_power,
                      st.acom_amp.swr, st.acom_amp.temp_c, st.acom_amp.fault))
+            print("  KPA  :" + kpa_sim.status_line(st.kpa)[1:])
+            return True
+
+        if dev == "kpa":
+            print(kpa_sim.command(st.kpa, " ".join(a) or "help"))
             return True
 
         if dev == "ag":
@@ -204,6 +224,7 @@ HELP = ("commands:\n"
         "  ag <port 1|2> <antenna N>       select an antenna\n"
         "  pgxl key|unkey|power <W>|swr <v>|temp <C>|state <s>\n"
         "  tgxl key|unkey|autotune|swr <v>|power <W>|relay <1|2> <+/-1>\n"
+        "  kpa oper|keyin|tx|rx|rf|cycle|fault|events|...   ('kpa help' for all)\n"
         "  help | quit")
 
 
@@ -225,12 +246,18 @@ def main():
     ap.add_argument("--radio-port", type=int, default=4992,
                     help="control/data port for the spawned radio "
                          "(default 5992; avoids a :4992 collision)")
+    ap.add_argument("--kpa-ctl-port", type=int, default=kpa_sim.CTL_PORT,
+                    help="KPA1500 control page / JSON port (0 = off)")
+    ap.add_argument("--kpa-rf-sense-port", type=int, default=kpa_sim.RF_SENSE_PORT,
+                    help="UDP port the KPA1500 hears the exciter's RF on (0 = off); "
+                         "--with-radio points the spawned radio at it")
     ap.add_argument("--no-cli", action="store_true", help="headless: serve only")
     args = ap.parse_args()
 
     st = Station(args)
     st.start(args.with_radio, args.radio_port, args.pattern)
-    print("[station] AG :9007 + PGXL :9008 + TGXL :9010 + SPE :4531 + ACOM :9600 up in one process")
+    print("[station] AG :9007 + PGXL :9008 + TGXL :9010 + SPE :4531 + ACOM :9600 "
+          "+ KPA1500 :1500 up in one process")
     print(st.connect_table())
 
     try:
