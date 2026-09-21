@@ -289,6 +289,58 @@ def test_over_temperature_clears_only_by_cooling(bench):
     assert bench.ask("^FL;") == "^FL00;"
 
 
+def test_ni_get_and_set(bench):
+    assert bench.ask("^NI;") == "^NI0;"                    # sim default: line ignored
+    assert bench.ask("^NI1;", expect_reply=False) is None  # a SET: no reply
+    assert bench.ask("^NI;") == "^NI1;"
+    assert bench.ask("^NI2;", expect_reply=False) is None  # not a valid value: ignored
+    assert bench.ask("^NI;") == "^NI1;"
+
+
+def test_inhibit_line_is_ignored_while_ni_is_off(bench):
+    bench.ask("^OS1;", expect_reply=False)
+    bench.amp.set_inhibit_line(True)
+    bench.ask("^TX;")
+    assert bench.amp.tr == "TX"                            # ^NI0: the line does nothing
+    assert "x00" in bench.ask("^VG;")
+
+
+def test_inhibit_holds_the_amp_bypassed(bench):
+    bench.ask("^OS1;", expect_reply=False)
+    bench.ask("^NI1;", expect_reply=False)
+    bench.amp.set_inhibit_line(True)
+    bench.ask("^TX;")
+    assert bench.ask("^TQ;") == "^TQ1;"                    # the key request stands...
+    assert bench.amp.tr == "RX"                            # ...but the relays stay in RX
+    vg = bench.ask("^VG;")
+    assert "TRINHIBIT x04" in vg and "TR_STATE_RX" in vg
+    assert int(bench.ask("^LQ;")[-3:-1], 16) & 0x01 == 0   # TX LED off
+    bench.amp.set_inhibit_line(False)                      # released: the standing key takes
+    assert bench.amp.tr == "TX"
+    assert bench.hot() == []
+
+
+def test_inhibit_asserted_mid_over_drops_the_relays(bench):
+    bench.ask("^OS1;", expect_reply=False)
+    bench.ask("^NI1;", expect_reply=False)
+    bench.ask("^TX;")
+    time.sleep(0.020)
+    bench.rf_on(50)
+    bench.amp.set_inhibit_line(True)                       # e.g. a sequencer pulling INHIBIT
+    assert bench.amp.tr == "RX"
+    hot = bench.hot()
+    assert len(hot) == 1 and "ACC INHIBIT asserted" in hot[0]["reason"]
+
+
+def test_enabling_ni_with_the_line_already_asserted_takes_effect(bench):
+    bench.ask("^OS1;", expect_reply=False)
+    bench.amp.set_inhibit_line(True)
+    bench.ask("^TX;")
+    assert bench.amp.tr == "TX"
+    bench.ask("^NI1;", expect_reply=False)                 # now honoured: drops at once
+    assert bench.amp.tr == "RX"
+
+
 def test_old_firmware_has_no_network_ptt():
     b = Bench(firmware="02.03", operate=True)
     try:
