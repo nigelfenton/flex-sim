@@ -17,6 +17,10 @@
 #     the reference tells control software to rely on ("send something like
 #     ^TX60; periodically while key down is needed").
 #   - The T/R relays, and whether they ever move with RF on them.
+#   - The ACC connector INHIBIT line and ^NI; / ^NIx;, which says whether the
+#     amp honours it: "1 (enabled) to use the INHIBIT line to keep the KPA1500
+#     amplifier bypassed". Enabled and asserted, it holds the relays in RX like
+#     STBY does, and asserting it mid-over drops them at once.
 #
 # THE INTERLOCK MODEL — what "hot switching" means here
 #   The reference: "The KPA1500 requires approximately 5 milliseconds of ^TX or
@@ -64,7 +68,11 @@
 #     "^TX not expired"). Implemented as a bitmask: 1 = ^TX active, 2 = KEY IN
 #     pulled down, 3 = both.
 #   - ^VG TRINHIBIT bits: x01 = STANDBY (as in the reference's example),
-#     x02 = fault. The real amp's other bits are unknown and never set here.
+#     x02 = fault, x04 = ACC INHIBIT. The real amp's bits are undocumented.
+#   - ^NI defaults to 0 (INHIBIT line ignored); the real default is not stated.
+#     The reference's heading calls the command ^NH, but its GET and SET formats
+#     both say ^NI, so ^NI is what is implemented. No command reads the INHIBIT
+#     line's own state; the sim exposes it on the prompt and page only.
 #   - ^LQ bar thresholds (power: 31 LEDs linear to max power; SWR: one LED per
 #     0.1 above 1.0). The status-LED bits are the reference's.
 #   - Newest TCP connection wins, as in the sketch. The reference says only
@@ -168,6 +176,8 @@ class Amp:
         self.sw_deadline = None    # monotonic time ^TXnn; expires, or None
         self._sw_gen = 0
         self.keyin = False
+        self.ni_enabled = False    # ^NI: honour the ACC INHIBIT line?
+        self.inhibit_line = False  # the ACC connector INHIBIT input itself
         self.tr = "RX"             # where the T/R relays are
         self.tr_at = self.t0       # when they last started moving
         self._rx_gen = 0
@@ -227,8 +237,13 @@ class Amp:
         return self.sw_tx or self.keyin
 
     @property
+    def inhibited(self):
+        return self.ni_enabled and self.inhibit_line
+
+    @property
     def want_tx(self):
-        return self.powered and self.operate and self.fault == 0 and self.key_request
+        return (self.powered and self.operate and self.fault == 0 and not self.inhibited
+                and self.key_request)
 
     def tq(self):
         return (1 if self.sw_tx else 0) | (2 if self.keyin else 0)
@@ -350,6 +365,27 @@ class Amp:
             self._event(now, "keyin", on=self.keyin)
             self._evaluate(now, "KEY IN " + ("down" if on else "released"),
                            release=not on)
+
+    def set_inhibit_line(self, on):
+        """The ACC connector INHIBIT input. Only acts while ^NI1 is set."""
+        with self.lock:
+            now = _clock()
+            if self.inhibit_line == bool(on):
+                return
+            self.inhibit_line = bool(on)
+            self._event(now, "inhibit_line", on=self.inhibit_line,
+                        honoured=self.ni_enabled)
+            self._evaluate(now, "ACC INHIBIT " + ("asserted" if on else "released"))
+
+    def set_ni(self, enabled, who="?"):
+        """^NIx;: whether the INHIBIT line keeps the amplifier bypassed."""
+        with self.lock:
+            now = _clock()
+            if self.ni_enabled == bool(enabled):
+                return
+            self.ni_enabled = bool(enabled)
+            self._event(now, "ni", enabled=self.ni_enabled, by=who)
+            self._evaluate(now, "^NI" + ("1" if enabled else "0"))
 
     # ---- modes, power, faults --------------------------------------------------
     def set_operate(self, on, who="?"):
@@ -551,6 +587,11 @@ class Amp:
                 if 0 <= int(m.group(1)) <= 50:
                     self.tr_delay_ms = int(m.group(1))
                 return None
+            if c == "^NI;":
+                return f"^NI{1 if self.ni_enabled else 0};"
+            if c in ("^NI0;", "^NI1;"):
+                self.set_ni(c == "^NI1;", who=who)
+                return None
             if c == "^IP;":
                 return f"^IP {self.ip};"
             if c == "^LQ;":
@@ -575,7 +616,8 @@ class Amp:
 
     def _vg(self):
         tx = self.tr == "TX"
-        inhibit = (0x01 if not self.operate else 0) | (0x02 if self.fault else 0)
+        inhibit = ((0x01 if not self.operate else 0) | (0x02 if self.fault else 0)
+                   | (0x04 if self.inhibited else 0))
         return (f"^VG TRINHIBIT x{inhibit:02X} TR_STATE_{'TX' if tx else 'RX'} "
                 f"3R:{0 if tx else 1} 3T:{1 if tx else 0} Bias:{1 if tx else 0} "
                 f"PA {'OPER' if self.operate else 'STBY'} KeyIn:{1 if self.keyin else 0}"
@@ -597,6 +639,8 @@ class Amp:
                 "relay_ms": self.relay_ms,
                 "sw_tx": self.sw_tx, "sw_timeout_left_s": left,
                 "keyin": self.keyin, "tq": self.tq(),
+                "ni_enabled": self.ni_enabled, "inhibit_line": self.inhibit_line,
+                "inhibited": self.inhibited,
                 "rf_w": round(self.rf_w, 1),
                 "fwd_w": round(t["fwd_w"], 1), "ref_w": round(t["ref_w"], 1),
                 "input_w": round(t["input_w"], 1),
@@ -799,6 +843,7 @@ HELP = ("kpa commands:\n"
         "  oper 0|1                   STBY / OPER\n"
         "  power 0|1                  main supplies off / on\n"
         "  keyin 0|1                  the rear-panel KEY IN line\n"
+        "  inhibit 0|1 | ni 0|1       the ACC INHIBIT line / whether it is honoured (^NI)\n"
         "  tx [secs] | rx             network PTT, same as ^TX / ^TXnn / ^RX\n"
         "  rf <W>                     exciter drive at the input (0 = RF off)\n"
         "  cycle 0|1 [W]              a correctly sequenced over, repeated\n"
@@ -813,7 +858,7 @@ def status_line(amp):
     s = amp.state()
     lead = "-" if s["min_lead_ms"] is None else f"{s['min_lead_ms']:.2f} ms"
     return (f"  {'ON ' if s['powered'] else 'OFF'} {'OPER' if s['operate'] else 'STBY'} "
-            f"fault={s['fault']} T/R={s['tr']} ^TX={int(s['sw_tx'])} KEYIN={int(s['keyin'])} "
+            f"fault={s['fault']}{' INHIBITED' if s['inhibited'] else ''} T/R={s['tr']} ^TX={int(s['sw_tx'])} KEYIN={int(s['keyin'])} "
             f"TQ={s['tq']} | in {s['rf_w']:.0f} W  out {s['fwd_w']:.0f} W  SWR {s['swr']:.1f} "
             f"{s['temp_c']} C | overs={s['overs']} HOT SWITCHES={s['hot_switches']} "
             f"min lead={lead}")
@@ -836,6 +881,10 @@ def command(amp, line):
             amp.set_power(a[0] == "1")
         elif c == "keyin":
             amp.set_keyin(a[0] == "1")
+        elif c == "inhibit":
+            amp.set_inhibit_line(a[0] == "1")
+        elif c == "ni":
+            amp.set_ni(a[0] == "1", who="cli")
         elif c == "tx":
             amp.sw_key(int(a[0]) if a else None, who="cli")
         elif c == "rx":
@@ -914,6 +963,8 @@ input{width:70px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;borde
  <button onclick="c('oper 1')">OPER</button><button onclick="c('oper 0')">STBY</button>
  <button onclick="c('tx')">^TX</button><button onclick="c('tx 5')">^TX5</button><button onclick="c('rx')">^RX</button>
  <button onclick="c('keyin 1')">KEY IN down</button><button onclick="c('keyin 0')">KEY IN up</button>
+ <button onclick="c('ni 1')">^NI1</button><button onclick="c('ni 0')">^NI0</button>
+ <button onclick="c('inhibit 1')">INHIBIT on</button><button onclick="c('inhibit 0')">INHIBIT off</button>
 </div>
 <div class="row">
  <input id="w" value="50"> W <button onclick="c('rf '+w.value)">RF on</button><button onclick="c('rf 0')">RF off</button>
@@ -931,6 +982,7 @@ function poll(){
   g.innerHTML=cell('Power',s.powered?'ON':'OFF')+cell('Mode',s.operate?'OPER':'STBY',s.operate?'ok':'')
   +cell('Fault',s.fault+' '+s.fault_name,s.fault!='00'?'tx':'')
   +cell('T/R relays',s.tr,s.tr=='TX'?'tx':'')
+  +cell('^NI / INHIBIT line',(s.ni_enabled?'1':'0')+' / '+(s.inhibit_line?'on':'off'),s.inhibited?'tx':'')
   +cell('^TX / KEY IN / ^TQ',(s.sw_tx?'1':'0')+' / '+(s.keyin?'1':'0')+' / '+s.tq+(s.sw_timeout_left_s!=null?' ('+s.sw_timeout_left_s+'s)':''))
   +cell('Drive in',s.rf_w+' W')+cell('Output',s.fwd_w+' W',s.fwd_w>0?'tx':'')
   +cell('SWR / temp',s.swr.toFixed(1)+' / '+s.temp_c+' C')
