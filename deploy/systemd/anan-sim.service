@@ -1,0 +1,20 @@
+# anan-sim: an ANAN-G2 speaking openHPSDR Protocol 2 (RX), as an always-on service.
+# Install: see "Run as always-on services (Linux)" in the README.
+# Replace YOUR_USER and /home/YOUR_USER/flex-sim with your own user and clone path.
+
+[Unit]
+Description=anan-sim - openHPSDR Protocol 2 (ANAN-G2) test radio for AetherSDR
+Documentation=https://github.com/nigelfenton/flex-sim#anan--openhpsdr-protocol-2-simulator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/flex-sim
+ExecStart=/usr/bin/python3 -u /home/YOUR_USER/flex-sim/anan_sim.py --ip 0.0.0.0 --rate 48000 --pattern tone
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
