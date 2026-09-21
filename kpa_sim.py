@@ -21,6 +21,13 @@
 #     amp honours it: "1 (enabled) to use the INHIBIT line to keep the KPA1500
 #     amplifier bypassed". Enabled and asserted, it holds the relays in RX like
 #     STBY does, and asserting it mid-over drops them at once.
+#   - The internal ATU: ^AM; / ^AMI; / ^AMB; (mode, Inline or Bypassed), ^AI; /
+#     ^AI0; / ^AI1; (the bypass relays), ^AE; / ^AEn; / ^AEbb; / ^AEbbn; (which
+#     antenna connectors are enabled: 0 both, 1 ANT1, 2 ANT2), ^FT; (full-search
+#     tune), ^FE; (cancel) and ^TP; (tune in progress). A tune needs exciter RF to
+#     make progress, as the reference says, and when it completes or is cancelled
+#     the amp sends ^FT; unprompted, to the TCP client. The SWR the PA sees is the
+#     tuned match with the ATU inline, otherwise the antenna's own SWR.
 #
 # THE INTERLOCK MODEL — what "hot switching" means here
 #   The reference: "The KPA1500 requires approximately 5 milliseconds of ^TX or
@@ -69,6 +76,13 @@
 #     pulled down, 3 = both.
 #   - ^VG TRINHIBIT bits: x01 = STANDBY (as in the reference's example),
 #     x02 = fault, x04 = ACC INHIBIT. The real amp's bits are undocumented.
+#   - The ATU: a tune takes 1.5 s of RF, always finds SWR 1.1, and leaves the
+#     relays bypassed if the antenna is already better than 1.5:1. Antenna SWR
+#     defaults to 1.8. Only the V1-style ^AE and ^AM forms (current band, or ^AEbb)
+#     are implemented, not the 3.00 per-antenna forms. The reference gives ^AI's
+#     bypassed reply as "^AT0;", which reads as a typo for ^AI0;, so the sim sends
+#     ^AI0; - worth confirming on a real amp, since a client that follows the
+#     reference literally would look for AT.
 #   - ^NI defaults to 0 (INHIBIT line ignored); the real default is not stated.
 #     The reference's heading calls the command ^NH, but its GET and SET formats
 #     both say ^NI, so ^NI is what is implemented. No command reads the INHIBIT
@@ -116,6 +130,9 @@ EFFICIENCY = 0.60
 MAX_DRIVE_W = 100.0
 TEMP_FAULT_C = 80
 TEMP_CLEAR_C = 60
+TUNE_RF_S = 1.5                # seconds of exciter RF a full-search tune takes
+TUNE_STOP_SWR = 1.5            # antenna already this good: the tune leaves the ATU bypassed
+TUNED_SWR = 1.1                # the match a tune finds
 
 # Every timestamp comes from perf_counter, NOT time.monotonic(): on Windows
 # monotonic() ticks only every ~15.6 ms, which cannot resolve a 5 ms relay window
@@ -164,9 +181,17 @@ class Amp:
         self.fault = 0
         self.band = 5              # 20 m
         self.antenna = 1
-        self.atu_in = True
+        # ATU. The SWR the PA sees depends on it: with the ATU inline (mode I and
+        # relays in) it is the tuned match; otherwise the antenna's own SWR.
+        self.atu_mode = "I"        # ^AM: "I" inline or "B" bypassed
+        self.atu_inline = True     # ^AI: the bypass relays (can be out with mode I)
+        self.ant_swr = 1.8         # antenna SWR with the ATU bypassed
+        self.tuned_swr = 1.1       # SWR through the ATU after a tune
+        self.ae = {}               # ^AE per band: 0 = ANT1+ANT2, 1 = ANT1, 2 = ANT2
+        self.tuning = False
+        self._tune_rf_s = 0.0
+        self.push = []             # callables that deliver unsolicited replies (^FT;)
         self.temp = 25
-        self.swr = 1.1             # SWR of the load the PA sees
         self.pa_voltage = 52.0     # V
         self.fan_min = 0
         self.tr_delay_ms = 0
@@ -237,6 +262,22 @@ class Amp:
         return self.sw_tx or self.keyin
 
     @property
+    def atu_in_line(self):
+        return self.atu_mode == "I" and self.atu_inline
+
+    @property
+    def swr(self):
+        """The SWR the PA sees: the tuned match through the ATU, else the antenna."""
+        return self.tuned_swr if self.atu_in_line else self.ant_swr
+
+    @swr.setter
+    def swr(self, value):
+        if self.atu_in_line:
+            self.tuned_swr = value
+        else:
+            self.ant_swr = value
+
+    @property
     def inhibited(self):
         return self.ni_enabled and self.inhibit_line
 
@@ -251,7 +292,9 @@ class Amp:
     def telemetry(self):
         """Meter readings as the amp would report them right now."""
         with self.lock:
-            pa = self.tr == "TX"
+            # "Input power is shown as 0 whenever the amplifier's PA is bypassed
+            # (when in mode STBY, or during ATU tuning)."
+            pa = self.tr == "TX" and not self.tuning
             rf = self.rf_w if self.rf_present else 0.0
             fwd = min(float(self.max_power), rf * GAIN) if pa else rf
             gamma = (self.swr - 1.0) / (self.swr + 1.0)
@@ -365,6 +408,58 @@ class Amp:
             self._event(now, "keyin", on=self.keyin)
             self._evaluate(now, "KEY IN " + ("down" if on else "released"),
                            release=not on)
+
+    # ---- the ATU ------------------------------------------------------------
+    def _push(self, text):
+        for deliver in list(self.push):
+            try:
+                deliver(text)
+            except OSError:
+                pass
+
+    def start_tune(self, who="?"):
+        """^FT; a full-search tune. It needs exciter RF to make progress; when it
+        completes or is cancelled the amp sends ^FT; unprompted."""
+        with self.lock:
+            if self.tuning:
+                return
+            self.tuning = True
+            self._tune_rf_s = 0.0
+            self._event(_clock(), "tune", state="started", by=who)
+        threading.Thread(target=self._tune_loop, daemon=True).start()
+
+    def cancel_tune(self, who="?"):
+        """^FE;"""
+        with self.lock:
+            if not self.tuning:
+                return
+            self.tuning = False
+            self._event(_clock(), "tune", state="cancelled", by=who)
+        self._push("^FT;")
+
+    def _tune_loop(self):
+        last = _clock()
+        while True:
+            time.sleep(0.02)
+            with self.lock:
+                if not self.tuning:
+                    return
+                now = _clock()
+                if self.rf_present:
+                    self._tune_rf_s += now - last
+                last = now
+                if self._tune_rf_s < TUNE_RF_S:
+                    continue
+                self.tuning = False
+                self.atu_mode = "I"
+                # "the SWR of the antenna without the ATU is sufficiently low"
+                # leaves the relays bypassed; otherwise the ATU goes inline.
+                self.atu_inline = self.ant_swr > TUNE_STOP_SWR
+                self.tuned_swr = min(self.ant_swr, TUNED_SWR)
+                self._event(now, "tune", state="done", inline=self.atu_inline,
+                            swr=round(self.swr, 1))
+            self._push("^FT;")
+            return
 
     def set_inhibit_line(self, on):
         """The ACC connector INHIBIT input. Only acts while ^NI1 is set."""
@@ -587,6 +682,38 @@ class Amp:
                 if 0 <= int(m.group(1)) <= 50:
                     self.tr_delay_ms = int(m.group(1))
                 return None
+            # ---- ATU ----
+            if c == "^AM;":
+                return f"^AM{self.atu_mode};"
+            if c in ("^AMI;", "^AMB;"):
+                self.atu_mode = c[3]
+                self.atu_inline = self.atu_mode == "I"
+                return None
+            if c == "^AI;":
+                return f"^AI{1 if self.atu_inline else 0};"
+            if c in ("^AI0;", "^AI1;"):
+                self.atu_inline = c == "^AI1;"
+                return None
+            if c == "^AE;":
+                return f"^AE{self.ae.get(self.band, 0)};"
+            if c in ("^AE0;", "^AE1;", "^AE2;"):
+                self.ae[self.band] = int(c[3])
+                return None
+            m = re.fullmatch(r"\^AE(\d\d)([012]?);", c)
+            if m and 0 <= int(m.group(1)) <= 10:
+                bb = int(m.group(1))
+                if not m.group(2):
+                    return f"^AE{bb:02d}{self.ae.get(bb, 0)};"
+                self.ae[bb] = int(m.group(2))
+                return None
+            if c == "^FT;":
+                self.start_tune(who=who)
+                return None                        # the reply comes when the tune ends
+            if c == "^FE;":
+                self.cancel_tune(who=who)
+                return None
+            if c == "^TP;":
+                return f"^TP{1 if self.tuning else 0};"
             if c == "^NI;":
                 return f"^NI{1 if self.ni_enabled else 0};"
             if c in ("^NI0;", "^NI1;"):
@@ -610,7 +737,10 @@ class Amp:
         else:
             swr = 0
         mm = ((0x80 if self.fault else 0) | (0x20 if self.antenna == 2 else 0x10)
-              | (0x08 if self.atu_in else 0x04) | (0x02 if self.operate else 0)
+              # ATU IN follows the mode; ATU BYP the relays. With mode I and the
+              # relays bypassed "both ATU LEDs are illuminated", per ^AI.
+              | (0x08 if self.atu_mode == "I" else 0)
+              | (0x04 if not self.atu_in_line else 0) | (0x02 if self.operate else 0)
               | (0x01 if tx else 0))
         return f"{power:08X}{swr:04X}{mm:02X}"
 
@@ -635,7 +765,10 @@ class Amp:
                 "powered": self.powered, "operate": self.operate,
                 "fault": f"{self.fault:02X}", "fault_name": FAULTS.get(self.fault, "?"),
                 "band": self.band, "antenna": self.antenna, "temp_c": self.temp,
-                "swr": self.swr, "tr": self.tr, "tr_delay_ms": self.tr_delay_ms,
+                "swr": self.swr, "ant_swr": self.ant_swr, "atu_mode": self.atu_mode,
+                "atu_inline": self.atu_inline, "tuning": self.tuning,
+                "antenna_enable": self.ae.get(self.band, 0),
+                "tr": self.tr, "tr_delay_ms": self.tr_delay_ms,
                 "relay_ms": self.relay_ms,
                 "sw_tx": self.sw_tx, "sw_timeout_left_s": left,
                 "keyin": self.keyin, "tq": self.tq(),
@@ -741,6 +874,8 @@ class KpaServer:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             with self._client_lock:
                 old, self._client = self._client, conn
+                if self._push_to_client not in self.amp.push:
+                    self.amp.push.append(self._push_to_client)
             if old is not None:                    # newest connection wins
                 try:
                     old.close()
@@ -748,6 +883,13 @@ class KpaServer:
                     pass
             threading.Thread(target=self._client_loop, args=(conn, addr),
                              daemon=True).start()
+
+    def _push_to_client(self, text):
+        """Unsolicited replies (a finished tune's ^FT;) go to the TCP client."""
+        with self._client_lock:
+            conn = self._client
+        if conn is not None:
+            conn.sendall(text.encode("ascii"))
 
     def _client_loop(self, conn, addr):
         who = f"tcp {addr[0]}:{addr[1]}"
@@ -849,6 +991,7 @@ HELP = ("kpa commands:\n"
         "  cycle 0|1 [W]              a correctly sequenced over, repeated\n"
         "  fault <hex> | clear        inject / clear a fault (e.g. fault 60)\n"
         "  temp <C> | swr <v> | band <bb> | ant 1|2 | trdelay <ms> | relay <ms>\n"
+        "  atu I|B | antswr <v> | tune 1|0   ATU mode, antenna SWR, start/cancel a tune\n"
         "  events [n]                 the last n events (default 15)\n"
         "  reset                      clear the event log and counters\n"
         "  help")
@@ -905,6 +1048,18 @@ def command(amp, line):
             amp.clear_fault(who="cli")
         elif c == "temp":
             amp.set_temp(int(a[0]))
+        elif c == "atu":
+            with amp.lock:
+                amp.atu_mode = "B" if a[0].upper() == "B" else "I"
+                amp.atu_inline = amp.atu_mode == "I"
+        elif c == "antswr":
+            with amp.lock:
+                amp.ant_swr = max(1.0, float(a[0]))
+        elif c == "tune":
+            if a[0] == "1":
+                amp.start_tune(who="cli")
+            else:
+                amp.cancel_tune(who="cli")
         elif c == "swr":
             with amp.lock:
                 amp.swr = max(1.0, float(a[0]))
@@ -972,6 +1127,11 @@ input{width:70px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;borde
  <input id="f" value="60"> <button onclick="c('fault '+f.value)">Inject fault</button><button onclick="c('clear')">Clear fault</button>
  <button onclick="c('reset')">Reset log</button>
 </div>
+<div class="row">
+ <button onclick="c('tune 1')">ATU tune</button><button onclick="c('tune 0')">Cancel tune</button>
+ <button onclick="c('atu I')">ATU inline</button><button onclick="c('atu B')">ATU bypass</button>
+ <input id="asw" value="1.8"> ant SWR <button onclick="c('antswr '+asw.value)">Set</button>
+</div>
 <div id="ev"></div>
 <script>
 function c(x){fetch('/cmd?c='+encodeURIComponent(x)).then(poll)}
@@ -986,6 +1146,7 @@ function poll(){
   +cell('^TX / KEY IN / ^TQ',(s.sw_tx?'1':'0')+' / '+(s.keyin?'1':'0')+' / '+s.tq+(s.sw_timeout_left_s!=null?' ('+s.sw_timeout_left_s+'s)':''))
   +cell('Drive in',s.rf_w+' W')+cell('Output',s.fwd_w+' W',s.fwd_w>0?'tx':'')
   +cell('SWR / temp',s.swr.toFixed(1)+' / '+s.temp_c+' C')
+  +cell('ATU',(s.tuning?'TUNING':(s.atu_mode=='I'?'mode I':'mode B')+(s.atu_inline?', in':', bypassed'))+' (ant '+s.ant_swr.toFixed(1)+')',s.tuning?'warn':'')
   +cell('Overs',s.overs)+cell('HOT SWITCHES',s.hot_switches,s.hot_switches?'tx':'ok')
   +cell('Min lead',s.min_lead_ms==null?'-':s.min_lead_ms+' ms',s.min_lead_ms!=null&&s.min_lead_ms<s.relay_ms?'tx':'')
   +cell('Last tail',s.last_tail_ms==null?'-':s.last_tail_ms+' ms');
