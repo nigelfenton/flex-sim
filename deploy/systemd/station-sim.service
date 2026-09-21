@@ -1,0 +1,27 @@
+# station-sim: the accessory rack (Antenna Genius, PGXL, TGXL, SPE Expert, ACOM
+# and KPA1500) in one process, as a service.
+# Install: see "Run as always-on services (Linux)" in the README.
+# Replace YOUR_USER and /home/YOUR_USER/flex-sim with your own user and clone path.
+#
+# Its KPA1500 uses the same ports as kpa-sim, so the two cannot run together;
+# Conflicts= makes starting either one stop the other.
+# Consider leaving this one disabled at boot: its Antenna Genius beacon is
+# auto-discovered by every AetherSDR on the network.
+
+[Unit]
+Description=station-sim - accessory rack: Antenna Genius, PGXL, TGXL, SPE, ACOM and KPA1500 sims
+Documentation=https://github.com/nigelfenton/flex-sim#accessory-simulators--a-whole-station-no-hardware
+After=network-online.target
+Wants=network-online.target
+Conflicts=kpa-sim.service
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/flex-sim
+ExecStart=/usr/bin/python3 -u /home/YOUR_USER/flex-sim/station.py --no-cli
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

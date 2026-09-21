@@ -263,6 +263,43 @@ sudo ip addr add 172.17.189.200/20 dev eth0   # radio 3
 ```
 (These are cleared when WSL restarts — re-add them after a reboot.)
 
+## Run as always-on services (Linux)
+
+For a test bench that is simply *there*, like a real radio, run the sims as `systemd` services on a spare
+Linux box (a Pi, a NUC, a home server). They start at boot, restart if they crash, and log to the journal.
+Example units are in [`deploy/systemd/`](deploy/systemd/):
+
+| Unit | What | Ports |
+|---|---|---|
+| `flex-sim.service` | the Flex radio | 4992 (discovery + control), control page 8731 |
+| `anan-sim.service` | ANAN-G2, Protocol 2 | UDP 1024 and up |
+| `kpa-sim.service` | KPA1500 with network PTT | TCP+UDP 1500, RF sense UDP 1510, control page 8737 |
+| `station-sim.service` | AG, PGXL, TGXL, SPE, ACOM **and** KPA1500 | 9007, 9008, 9010, 4531, 9600, 1500 |
+
+Install (standard library only, nothing to `pip install`):
+```
+git clone https://github.com/nigelfenton/flex-sim.git ~/flex-sim
+cd ~/flex-sim/deploy/systemd
+for u in flex-sim anan-sim kpa-sim station-sim; do
+  sed "s#YOUR_USER#$USER#g" $u.service | sudo tee /etc/systemd/system/$u.service >/dev/null
+done
+sudo systemctl daemon-reload
+sudo systemctl enable --now flex-sim anan-sim kpa-sim   # station-sim: start it only when you need it
+```
+Pick the ones you want; each is independent, except that **`station-sim` and `kpa-sim` both run a KPA1500 on
+the same ports**. `station-sim` declares `Conflicts=kpa-sim.service`, so starting either one stops the other.
+Think twice before enabling `station-sim` at boot: its Antenna Genius beacon is auto-discovered by every
+AetherSDR on the network.
+
+Day to day:
+```
+systemctl status flex-sim                  # running? since when?
+journalctl -u flex-sim -f                  # its log, live
+cd ~/flex-sim && git pull && sudo systemctl restart flex-sim anan-sim kpa-sim   # update
+```
+The networking rule still applies: run `flex-sim` on a machine that is **not** running AetherSDR. To have the
+radio tell the KPA1500 sim when its RF is on, add `--rf-sense 127.0.0.1:1510` to `flex-sim`'s `ExecStart`.
+
 ## Docker
 On **Linux**, a `macvlan` network gives the container its own LAN IP (clean — see `docker-compose.yml`). On **Docker Desktop for Windows/Mac**, containers aren't reachable at their own IP from the host, so Docker does **not** solve the same-machine case there — use WSL. Docker is for a **separate Linux box**.
 
