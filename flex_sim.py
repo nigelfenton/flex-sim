@@ -1660,9 +1660,13 @@ class Radio:
             self.pans[pid]["center"] = freq                # pan frames on its slice at creation
             self.active_slice = idx
             self._sync_active_slice()                      # mirror active slice -> slice_freq/mode + pan centre
+            # Status BEFORE the reply: a client handling the reply looks the
+            # new slice up by index and must find it (AE's TCI VFO-B route
+            # drops the slice as "no settled slice" otherwise, then creates
+            # another on the next request).
+            self.emit_slice_status(conn, idx)
             self.reply(conn, seq, str(idx))
             log(f"[slice] create -> slice {idx} @ {freq:.5f} {mode} on pan 0x{pid:08X}  ({len(self.slices)}/{self.max_slices})")
-            self.emit_slice_status(conn, idx)
             self.emit_meter_status(conn)                   # (re)define S-meters incl. the new slice
             self.emit_pan_status(conn, pid)                # centre this pan/waterfall on its slice
         elif c.startswith("display pan set"):
@@ -1828,6 +1832,20 @@ class Radio:
             self.txchain_edge()
             log(f"[tx] tune {'ON' if self.tx_tune else 'OFF'}"
                 f"{' (' + self.tune_mode + ')' if self.tune_mode else ''}")
+        elif c.split()[:1] == ["xmit"]:                    # SmartSDR PTT verb: xmit 1 / xmit 0
+            # Keys like MOX. AE's TCI server (trx:N,true -> "xmit 1") and other
+            # API clients (CAT4OM's native Flex driver) use this, not
+            # "transmit set mox=". Without it the radio never reports keyed and
+            # AE fail-closes the TCI PTT after its confirmation timeout.
+            parts = c.split()
+            if len(parts) < 2 or parts[1] not in ("0", "1"):
+                self.reply(conn, seq, code=0x5000002D)    # "Bad field" (real-radio code); key nothing
+                return
+            self.tx_mox = parts[1] == "1"
+            self.reply(conn, seq)
+            self.emit_transmit_status()
+            self.txchain_edge()
+            log(f"[tx] xmit {'ON' if self.tx_mox else 'OFF'}")
         elif c.startswith("transmit set"):                 # AE keys TX (MOX / TUNE)
             kvs = parse_kvs(c)
             if "mox" in kvs:  self.tx_mox = kvs["mox"] == "1"
@@ -1874,6 +1892,19 @@ class Radio:
                     self.slices[idx]["mode"] = kvs["mode"]
                     if self.slices[idx].get("active"):
                         self.slice_mode = kvs["mode"]
+                # tx=1 moves the radio's ONE transmit slice here (split / VFO-B
+                # routes). The old TX slice loses it, and both are re-announced
+                # so the client's txSlice view follows. Diversity children are
+                # RX-only and never take it. tx=0 is ignored: a radio always has
+                # exactly one TX slice.
+                if kvs.get("tx") == "1" and not self.slices[idx].get("div_child"):
+                    moved = [j for j, sl in self.slices.items() if bool(sl.get("tx")) != (j == idx)]
+                    for j, sl in self.slices.items():
+                        sl["tx"] = (j == idx)
+                    for j in moved:
+                        self.emit_slice_status(conn, j)
+                    if moved:
+                        log(f"[slice] tx -> slice {idx}")
                 # ANF (Auto-Notch Filter) — radio-side, like TNF. AE sends
                 # 'slice set N anf=1'; the RADIO is expected to auto-detect steady
                 # tonal interference and notch it. We emulate: with anf on, the sim
