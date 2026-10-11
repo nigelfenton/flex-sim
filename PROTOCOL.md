@@ -132,3 +132,13 @@ Found driving AE 26.10.1's TCI server from CAT4OM (a third-party CAT hub). Each 
 1. **`xmit 1` / `xmit 0` is a PTT verb.** AE's TCI server turns `trx:N,true;` into `xmit 1`, and API clients such as CAT4OM's native Flex driver send it directly — not `transmit set mox=`. It keys like MOX and answers with the same `interlock` / `transmit` status pair (§8.7). Without it AE logged `TCI PTT confirmation timeout: radio never reported keyed` and unkeyed after ~1.25 s (correct fail-closed behaviour on AE's part). A malformed `xmit` keys nothing and is answered `0x5000002D` (Bad field).
 2. **`slice create` announces the slice before replying.** AE's TCI VFO-B route (`TciServer`, `vfo:N,1,<hz>;` with no second slice yet) looks the new slice up by the index in the reply. Reply first and the slice does not exist yet: AE logs `VFO-B create reply had no settled slice: <n>`, abandons it, and creates *another* slice on the next VFO-B or split request — slices leak (A, B, C …).
 3. **`slice set N tx=1` moves the radio's single TX slice.** It is how AE routes TX for TCI split / VFO B. The previous TX slice loses the flag and both slices are re-announced (`tx=1` / `tx=0`) so the client's TX-slice view follows. Diversity children never take TX; `tx=0` is ignored (a radio always has exactly one TX slice).
+
+## 10. TX audio state for the client-side voice keyer — 2026-10-11
+
+Found testing aethersdr/AetherSDR#6292 (client-side voice keyer, RFC #4214) against the sim. Pinned by `tests/test_tx_audio_state.py`.
+
+1. **Mic source.** `mic list` answers `MIC,BAL,LINE,ACC,PC` like a real 6000. AE selects the source with `mic input <src>` and reads it back from the `transmit` status, which now carries `mic_selection=<src>` and `dax=0|1`. #6292 refuses to record unless the radio reports `PC`.
+2. **Licence.** `sub license all` is answered with `license feature name=digital_voice_keyer enabled=1`, or `enabled=0` with `--no-dvk-license`. AE fails *open* when it hears nothing, so before this every sim looked DVK-licensed and the unlicensed path could not be exercised.
+3. **`remote_audio_tx` id.** It gets its own id (`0x88000000` + radio). It used to share `stream create netcw`'s `0x48000000`.
+4. **`sub tx all`** is answered with the current `interlock` / `transmit` status, so a client that reconnects while the radio is keyed learns it.
+5. **Client drop unkeys.** A client that disconnects while keyed (MOX, `xmit` or TUNE) is unkeyed, as its TX slice goes with it. The sim used to stay keyed, so the next client inherited a carrier nobody owned.
