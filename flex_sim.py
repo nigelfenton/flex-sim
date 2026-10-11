@@ -168,6 +168,9 @@ AUDIO_RATE   = 24000      # Hz
 AUDIO_INTERVAL = AUDIO_FRAMES / AUDIO_RATE   # ~5.333 ms / packet → ~187.5 Hz
 AUDIO_SID_BASE = 0x48000010  # base stream id for remote_audio_rx (per-radio: + radio_id)
 DAX_SID_BASE   = 0x48000040  # base stream id for dax_rx (per-radio: + radio_id*4 + (ch-1))
+REMOTE_TX_SID_BASE = 0x88000000  # remote_audio_tx (per-radio: + radio_id). Any id that is
+                                 # distinct works: AE takes it from the reply. It used to share
+                                 # netcw's 0x48000000, so AE held one id for two streams.
                              # AE routes dax_rx packets to its RADE/digital decoder ONLY when the
                              # stream id was registered via a 'stream <id> type=dax_rx ...' status
                              # line (TciServer::statusReceived -> registerDaxStream). The PCC/format
@@ -1323,6 +1326,8 @@ class Radio:
         # it can recur on the very radio that worked yesterday.
         self.daxtx_foreign_owner = 0    # 0 = we own it; else the handle holding TX
         self.tx_dax = False             # 'transmit set dax=1'
+        self.mic_selection = "MIC"       # 'mic input <src>'; reported in the transmit status
+        self.dvk_license = True         # 'license feature name=digital_voice_keyer enabled=' (--no-dvk-license)
         self.daxtx_pkts = 0             # VITA audio packets seen on :4991
         self.daxtx_bytes = 0
         self.daxtx_last_pkt = 0.0       # monotonic-ish wall time of the last packet
@@ -1585,6 +1590,13 @@ class Radio:
                 # Without it, stale slices/pans pile up across reconnects and the slice
                 # lettering drifts (A -> B -> C on each new connection).
                 self.slices.clear(); self.pans.clear(); self.pan_seq = 0; self.active_slice = 0
+                # The client that keyed is gone, and so is its TX slice: unkey, as a real
+                # radio does. Left keyed, the next client inherited a carrier nobody owned.
+                if self.tx_mox or self.tx_tune:
+                    self.tx_mox = self.tx_tune = False
+                    self.emit_transmit_status()            # conn is gone: this only updates rf-sense
+                    self.txchain_edge()
+                    log("[tx] client disconnected while keyed -> unkeyed")
 
     def handle(self, conn):
         self.conn = conn
@@ -1715,7 +1727,25 @@ class Radio:
             self.reply(conn, seq, f"model={self.model},chassis_serial={self.serial},callsign=SDRSIM,"
                                   f"name=flex-sim,software_ver={VERSION},ip={self.ip}")
         elif c == "mic list":
-            self.reply(conn, seq, "MIC,LINE")
+            self.reply(conn, seq, "MIC,BAL,LINE,ACC,PC")    # a real 6000's list; PC = the client's mic
+        elif c.startswith("mic input"):                    # AE picks the TX mic source with this
+            parts = c.split()
+            if len(parts) >= 3:
+                self.mic_selection = parts[2].upper()
+            self.reply(conn, seq)
+            self.emit_transmit_status()                    # AE reads mic_selection back from here
+        elif c == "sub license all":
+            # A real radio reports each licensed feature. AE fails OPEN while it has
+            # heard nothing, so without this line every sim looked DVK-licensed and
+            # the unlicensed path (client-side voice keyer, #6292) was untestable.
+            self.reply(conn, seq)
+            self.status(conn, "license feature name=digital_voice_keyer "
+                              f"enabled={1 if self.dvk_license else 0}")
+        elif c == "sub tx all":
+            # Answer the subscription with the current TX state, so a client that
+            # (re)connects while the radio is keyed learns it rather than assuming RX.
+            self.reply(conn, seq)
+            self.emit_transmit_status()
         elif c.startswith("client udpport"):
             # AE announces the UDP port it listens on for VITA data. On a single
             # host (AE owns :4992), AE's prime packet to our advertised port may
@@ -1784,6 +1814,8 @@ class Radio:
                     f"tx={int(self.daxtx_tx)}"
                     + ("" if self.daxtx_tx else
                        f" — TX bit held by FOREIGN client 0x{owner} (multiFLEX contention)"))
+            elif kvs.get("type") == "remote_audio_tx":
+                self.reply(conn, seq, f"0x{REMOTE_TX_SID_BASE + self.radio_id:08X}")
             else:
                 self.reply(conn, seq, "0x48000000")
         elif c.startswith("stream set"):
@@ -1854,6 +1886,7 @@ class Radio:
             # SOURCE is DAX — necessary but not sufficient; stage 5 (stream
             # tx=1) still has to name WHICH stream modulates.
             if "dax" in kvs:  self.tx_dax = kvs["dax"] == "1"
+            if "mic_selection" in kvs: self.mic_selection = kvs["mic_selection"].upper()
             # tune_mode selects what the RADIO generates while tuning. AE's
             # two-tone test sends 'tune_mode=two_tone' then 'transmit tune 1'
             # and sends NO audio of its own -- measured on the wire 2026-07-22.
@@ -2267,6 +2300,7 @@ class Radio:
                 f"tx_client_handle=0x{self.handle_hex}")
             self.status(self.conn,
                 f"transmit mox={1 if self.tx_mox else 0} tune={1 if self.tx_tune else 0} "
+                f"mic_selection={self.mic_selection} dax={1 if self.tx_dax else 0} "
                 f"freq={self.slice_freq:.6f} rfpower={int(self.tx_power_w)} "
                 f"tunepower={int(self.tx_power_w)}")
             log(f"[->] TX {'ON' if on else 'off'}  ({self.tx_power_w:.0f} W, SWR {self.tx_swr:.1f})")
@@ -3496,6 +3530,9 @@ def main():
                     help="send 'RF 1 <W>' / 'RF 0' over UDP to an amplifier sim on every "
                          "TX edge, e.g. --rf-sense 127.0.0.1:1510 for kpa_sim.py, so it "
                          "can time its T/R relays against this radio's RF. Repeatable")
+    ap.add_argument("--no-dvk-license", action="store_true",
+                    help="report the Digital Voice Keyer licence as OFF (a radio without "
+                         "SmartSDR+), so AE offers only its client-side voice keyer")
     args = ap.parse_args()
     ip = args.ip or local_ip()
     rf_sense = []
@@ -3511,6 +3548,7 @@ def main():
                     models=models, serial_prefix=args.serial)
         for r in rack.radios:
             r.rf_sense = rf_sense
+            r.dvk_license = not args.no_dvk_license
         rack.start()
         start_rack_control_server(rack, args.ctl_port)
         log(f"flex-sim {FLEX_SIM_VERSION} - RACK of {args.radios} radios on :{base}")
@@ -3531,6 +3569,7 @@ def main():
     radio.txlog = args.txlog
     radio.txlog_interval = args.txlog_interval
     radio.rf_sense = rf_sense
+    radio.dvk_license = not args.no_dvk_license
     if rf_sense:
         log("[rf-sense] TX edges -> " + ", ".join(f"{h}:{p}" for h, p in rf_sense))
     if args.txlog:
