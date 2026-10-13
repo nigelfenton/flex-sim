@@ -54,7 +54,7 @@ Patterns (each is a test signal; the control panel explains what to look for):
   tx_blank      periodic real TX gap -> repro #2126 / #1916
 Also handles AE's own CWX keyer (cwx send/wpm/qsk_enabled) for authentic CW TX.
 """
-import argparse, http.server, json, math, os, glob, random, socket, struct, subprocess, sys, threading, time, urllib.parse, uuid, wave
+import argparse, http.server, json, math, os, glob, random, re, socket, struct, subprocess, sys, threading, time, urllib.parse, uuid, wave
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES_DIR = os.path.join(HERE, "fixtures")
@@ -1327,7 +1327,13 @@ class Radio:
         self.daxtx_foreign_owner = 0    # 0 = we own it; else the handle holding TX
         self.tx_dax = False             # 'transmit set dax=1'
         self.mic_selection = "MIC"       # 'mic input <src>'; reported in the transmit status
-        self.dvk_license = True         # 'license feature name=digital_voice_keyer enabled=' (--no-dvk-license)
+        # Licensing, as a real radio reports it on 'sub license all' (FlexLib: license /
+        # license subscription / license feature). Settable at startup (--license-feature,
+        # --subscription, --no-dvk-license) and live from the control page (/license).
+        self.license_features = {"digital_voice_keyer": {"enabled": True, "reason": "plus"}}
+        self.subscription = "smartsdr+"            # none | smartsdr+ | early-access
+        self.subscription_expires = _default_expiry()
+        self.dvk_refuses = False        # answer every 'dvk ...' with 50004001, like a radio that won't record
         self.daxtx_pkts = 0             # VITA audio packets seen on :4991
         self.daxtx_bytes = 0
         self.daxtx_last_pkt = 0.0       # monotonic-ish wall time of the last packet
@@ -1460,6 +1466,24 @@ class Radio:
                 try: c.shutdown(socket.SHUT_RDWR); c.close()
                 except OSError: pass
 
+    def emit_license_status(self, conn):
+        """The three FlexLib licence objects: license, license subscription, license feature."""
+        if not conn:
+            return
+        self.status(conn, f"license radio_id={self.serial} highest_major_version=4 region=USA")
+        if self.subscription != "none":
+            name = {"smartsdr+": "smartsdr+", "early-access": "smartsdr+_early_access"}[self.subscription]
+            self.status(conn, f"license subscription name={name} "
+                              f"expiration={self.subscription_expires}T00:00:00Z")
+        for fname, f in self.license_features.items():
+            self.status(conn, f"license feature name={fname} enabled={1 if f['enabled'] else 0} "
+                              f"reason={f['reason']}")
+
+    def license_state(self):
+        return {"features": {k: dict(v) for k, v in self.license_features.items()},
+                "subscription": self.subscription, "expires": self.subscription_expires,
+                "dvk_refuses": self.dvk_refuses}
+
     def state(self):
         # Snapshot for the rack strip (polled by the panel).
         return {"id": self.radio_id, "serial": self.serial, "model": self.model, "ip": self.ip,
@@ -1470,7 +1494,8 @@ class Radio:
                 "slices": len(self.slices), "max_slices": self.max_slices,
                 "noise": self.noise_mixer.snapshot(),           # HF noise bench state
                 "noise_active": self.noise_mixer.any_enabled(),
-                "noise_wav": self.noise_wav_path}
+                "noise_wav": self.noise_wav_path,
+                "license": self.license_state()}
 
     def dbm_to_pixel(self, dbm):
         p = (self.max_dbm - dbm) / (self.max_dbm - self.min_dbm) * (self.y_pixels - 1)
@@ -1735,12 +1760,18 @@ class Radio:
             self.reply(conn, seq)
             self.emit_transmit_status()                    # AE reads mic_selection back from here
         elif c == "sub license all":
-            # A real radio reports each licensed feature. AE fails OPEN while it has
-            # heard nothing, so without this line every sim looked DVK-licensed and
-            # the unlicensed path (client-side voice keyer, #6292) was untestable.
+            # A real radio reports its licence, subscription and each feature. AE fails
+            # OPEN while it has heard nothing, so without these lines every sim looked
+            # DVK-licensed and the unlicensed path (client-side voice keyer, #6292) was
+            # untestable.
             self.reply(conn, seq)
-            self.status(conn, "license feature name=digital_voice_keyer "
-                              f"enabled={1 if self.dvk_license else 0}")
+            self.emit_license_status(conn)
+        elif c.split()[:1] == ["dvk"] and self.dvk_refuses:
+            # A radio without the DVK entitlement refuses dvk commands with 50004001,
+            # sometimes while still reporting the feature enabled. AE treats this as
+            # the reliable "not licensed" signal (DvkModel::licenseRefused).
+            self.reply(conn, seq, code=0x50004001)
+            log(f"[license] refused '{c}' with 50004001 (--dvk-refuses)")
         elif c == "sub tx all":
             # Answer the subscription with the current TX state, so a client that
             # (re)connects while the radio is keyed learns it rather than assuming RX.
@@ -3188,6 +3219,90 @@ def _grouped_pattern_options(current):
     return "".join(grouped)
 
 
+LICENSE_FEATURE_RE = re.compile(r"^([a-z0-9_]{1,40})=([01])(?::([a-z_]{1,20}))?$")
+SUBSCRIPTIONS = ("none", "smartsdr+", "early-access")
+
+
+def _default_expiry():
+    """One year from today: an active SmartSDR+ subscription unless told otherwise."""
+    import datetime
+    return (datetime.date.today() + datetime.timedelta(days=365)).isoformat()
+
+
+def _valid_date(text):
+    import datetime
+    try:
+        return datetime.date.fromisoformat(text).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_license_feature(spec):
+    """'NAME=0|1[:REASON]' -> (name, enabled, reason); None if malformed."""
+    m = LICENSE_FEATURE_RE.match(spec.strip().lower())
+    if not m:
+        return None
+    return m.group(1), m.group(2) == "1", (m.group(3) or ("plus" if m.group(2) == "1" else "none"))
+
+
+def apply_license_query(radio, q):
+    """Live licence changes from the control page. Validates everything before
+    changing anything, then pushes the new licence status to the connected client
+    so its mid-session handling can be tested without reconnecting."""
+    changes = []
+    if "feature" in q:
+        name = q["feature"][0].strip().lower()
+        enabled = q.get("enabled", [""])[0]
+        reason = q.get("reason", [""])[0].strip().lower()
+        spec = f"{name}={enabled}" + (f":{reason}" if reason else "")
+        parsed = parse_license_feature(spec)
+        if not parsed:
+            return {"ok": False, "error": "feature wants feature=NAME&enabled=0|1[&reason=WORD]"}
+        changes.append(("feature", parsed))
+    if "subscription" in q:
+        sub = q["subscription"][0].strip().lower()
+        if sub not in SUBSCRIPTIONS:
+            return {"ok": False, "error": "subscription must be one of " + ", ".join(SUBSCRIPTIONS)}
+        changes.append(("subscription", sub))
+    if "expires" in q:
+        d = _valid_date(q["expires"][0])
+        if not d:
+            return {"ok": False, "error": "expires wants YYYY-MM-DD"}
+        changes.append(("expires", d))
+    if "dvk_refuses" in q:
+        v = q["dvk_refuses"][0]
+        if v not in ("0", "1"):
+            return {"ok": False, "error": "dvk_refuses wants 0 or 1"}
+        changes.append(("dvk_refuses", v == "1"))
+    for kind, val in changes:
+        if kind == "feature":
+            name, enabled, reason = val
+            radio.license_features[name] = {"enabled": enabled, "reason": reason}
+        elif kind == "subscription":
+            radio.subscription = val
+        elif kind == "expires":
+            radio.subscription_expires = val
+        elif kind == "dvk_refuses":
+            radio.dvk_refuses = val
+    if changes:
+        log(f"[license] live change: {changes}")
+        radio.emit_license_status(radio.conn)
+    return {"ok": True, "license": radio.license_state()}
+
+
+def apply_license_args(radio, args):
+    """Startup licence options; argparse has already validated them."""
+    for spec in args.license_feature:
+        name, enabled, reason = parse_license_feature(spec)
+        radio.license_features[name] = {"enabled": enabled, "reason": reason}
+    if args.no_dvk_license:
+        radio.license_features["digital_voice_keyer"] = {"enabled": False, "reason": "none"}
+    radio.subscription = args.subscription
+    if args.subscription_expires:
+        radio.subscription_expires = args.subscription_expires
+    radio.dvk_refuses = args.dvk_refuses
+
+
 def start_control_server(radio, port):
     opts = _grouped_pattern_options(radio.pattern)
     page = CONTROL_HTML.format(options=opts, tt_khz=f"{TWO_TONE_SPACING_HZ / 1000.0:g}").encode()
@@ -3227,6 +3342,11 @@ def start_control_server(radio, port):
             if u.path == "/txchain":
                 # The #4510 chain verdict — radio-side stages + first missing.
                 return self._json(radio.txchain())
+            if u.path == "/license":
+                # Live licensing: ?feature=NAME&enabled=0|1[&reason=], ?subscription=none|
+                # smartsdr+|early-access[&expires=YYYY-MM-DD], ?dvk_refuses=0|1. No query
+                # = read the current state.
+                return self._json(apply_license_query(radio, urllib.parse.parse_qs(u.query)))
             if u.path == "/txchain/contend":
                 # multiFLEX contention (#4640): ?on=1 makes ANOTHER client hold
                 # the dax_tx TX bit, so our create no longer grants it and the
@@ -3452,6 +3572,17 @@ def start_rack_control_server(rack, port):
                 except Exception:
                     self.send_response(404); self.end_headers()
                     self.wfile.write(b"qa viewer not available"); return
+            if u.path == "/license":
+                q = urllib.parse.parse_qs(u.query)
+                try:
+                    r = rack.radios[int(q.get("radio", ["0"])[0])]
+                except (ValueError, IndexError):
+                    body = json.dumps({"ok": False, "error": "no such radio"}).encode()
+                else:
+                    body = json.dumps(apply_license_query(r, q)).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store"); self.end_headers()
+                self.wfile.write(body); return
             if u.path == "/state":
                 body = json.dumps([r.state() for r in rack.radios]).encode()
                 self.send_response(200); self.send_header("Content-Type", "application/json")
@@ -3533,6 +3664,30 @@ def main():
     ap.add_argument("--no-dvk-license", action="store_true",
                     help="report the Digital Voice Keyer licence as OFF (a radio without "
                          "SmartSDR+), so AE offers only its client-side voice keyer")
+    def _feature_arg(text):
+        if not parse_license_feature(text):
+            raise argparse.ArgumentTypeError("wants NAME=0|1[:REASON], e.g. digital_voice_keyer=0")
+        return text
+
+    def _date_arg(text):
+        d = _valid_date(text)
+        if not d:
+            raise argparse.ArgumentTypeError("wants YYYY-MM-DD")
+        return d
+
+    ap.add_argument("--license-feature", action="append", default=[], type=_feature_arg,
+                    metavar="NAME=0|1[:REASON]",
+                    help="report a licensed feature (repeatable), e.g. digital_voice_keyer=0 or "
+                         "digital_voice_keyer=1:built_in. Reason defaults to plus/none")
+    ap.add_argument("--subscription", choices=SUBSCRIPTIONS, default="smartsdr+",
+                    help="SmartSDR+ subscription the radio reports (default smartsdr+; "
+                         "'none' sends no subscription line)")
+    ap.add_argument("--subscription-expires", type=_date_arg, default=None, metavar="YYYY-MM-DD",
+                    help="subscription expiry date (default one year from today; a past date "
+                         "is an expired subscription)")
+    ap.add_argument("--dvk-refuses", action="store_true",
+                    help="refuse every 'dvk' command with 50004001, like a radio that cannot "
+                         "store recordings even if it reports the feature enabled")
     args = ap.parse_args()
     ip = args.ip or local_ip()
     rf_sense = []
@@ -3548,7 +3703,7 @@ def main():
                     models=models, serial_prefix=args.serial)
         for r in rack.radios:
             r.rf_sense = rf_sense
-            r.dvk_license = not args.no_dvk_license
+            apply_license_args(r, args)
         rack.start()
         start_rack_control_server(rack, args.ctl_port)
         log(f"flex-sim {FLEX_SIM_VERSION} - RACK of {args.radios} radios on :{base}")
@@ -3569,7 +3724,7 @@ def main():
     radio.txlog = args.txlog
     radio.txlog_interval = args.txlog_interval
     radio.rf_sense = rf_sense
-    radio.dvk_license = not args.no_dvk_license
+    apply_license_args(radio, args)
     if rf_sense:
         log("[rf-sense] TX edges -> " + ", ".join(f"{h}:{p}" for h, p in rf_sense))
     if args.txlog:

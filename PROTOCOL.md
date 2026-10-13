@@ -142,3 +142,24 @@ Found testing aethersdr/AetherSDR#6292 (client-side voice keyer, RFC #4214) agai
 3. **`remote_audio_tx` id.** It gets its own id (`0x88000000` + radio). It used to share `stream create netcw`'s `0x48000000`.
 4. **`sub tx all`** is answered with the current `interlock` / `transmit` status, so a client that reconnects while the radio is keyed learns it.
 5. **Client drop unkeys.** A client that disconnects while keyed (MOX, `xmit` or TUNE) is unkeyed, as its TX slice goes with it. The sim used to stay keyed, so the next client inherited a carrier nobody owned.
+
+## 11. Licensing options — 2026-10-12
+
+Asked for by K5PTB, to test AE against different licences. Pinned by `tests/test_licensing.py`; checked end to end against the #6292 build.
+
+1. **What the radio sends.** `sub license all` is answered with the three FlexLib licence objects:
+   - `license radio_id=<serial> highest_major_version=4 region=USA`
+   - `license subscription name=smartsdr+|smartsdr+_early_access expiration=<YYYY-MM-DD>T00:00:00Z` (left out for `none`)
+   - `license feature name=<feature> enabled=0|1 reason=<word>`, one per feature
+
+   Default: an active SmartSDR+ subscription (expires a year from today) and `digital_voice_keyer enabled=1 reason=plus`.
+2. **Startup flags.** `--subscription none|smartsdr+|early-access`, `--subscription-expires YYYY-MM-DD` (a past date is an expired subscription), `--license-feature NAME=0|1[:REASON]` (repeatable; reason defaults to `plus`/`none`), `--no-dvk-license` (kept; same as `--license-feature digital_voice_keyer=0`), `--dvk-refuses`. A malformed value stops the sim at startup.
+3. **Live changes.** `GET /license` on the control port reads the licence; with a query it changes it and pushes the new status lines to the connected client, no reconnect:
+   - `?feature=NAME&enabled=0|1[&reason=WORD]`
+   - `?subscription=none|smartsdr%2B|early-access[&expires=YYYY-MM-DD]`
+   - `?dvk_refuses=0|1`
+   - rack mode adds `&radio=N`
+
+   Everything is validated before anything changes; bad input gets `{"ok": false, "error": ...}` and changes nothing. `/state` carries the licence too.
+4. **DVK refusal.** With `dvk_refuses` on, every `dvk ...` command is answered `0x50004001`, as a radio that won't store recordings does, sometimes while it still reports the feature enabled. AE treats that refusal as the reliable "not licensed" signal.
+5. **What AE does with it (#6292 build, 2026-10-12).** With the keyer source on *Automatic*, AE follows a live change both ways: licence off → title `Digital Voice Keyer (Local)` and the *Radio DVK* item is removed from the menu; licence on → back to `(Radio)`. An explicit *Local* or *Radio* choice is saved in AE's settings and overrides the licence, so start from Automatic when testing. AE only upgrades its subscription label within a session, so test a downgrade with a fresh connection.

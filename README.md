@@ -70,6 +70,9 @@ python3 flex_sim.py --radios 10 \
 ## Control panel
 `http://<flex-sim-ip>:8731/` — pick a pattern (the hint box says what it exercises in AetherSDR), set the noise floor / signal level in **dBm (with S-units)**, signal width and noise colour; key **TX** (forward-power + SWR meters); send **CW** (normal / full break-in, driven from AetherSDR's own CWX keyer). Scroll down for the **[HF noise bench](#hf-noise-bench--test-aethersdrs-noise-reduction)** (live noise for testing noise reduction).
 
+### Licensing options
+The sim reports a licence like a real radio: by default an active SmartSDR+ subscription with the Digital Voice Keyer licensed. Change it at startup, e.g. `--subscription none`, `--subscription early-access --subscription-expires 2026-01-31`, `--license-feature digital_voice_keyer=0`, or `--dvk-refuses`. Or change it live, without reconnecting AetherSDR, from the control port: `http://<flex-sim-ip>:8731/license?feature=digital_voice_keyer&enabled=0`. Details in [PROTOCOL.md §11](PROTOCOL.md#11-licensing-options--2026-10-12).
+
 ## Patterns
 `noise_floor` · `ramp` · `staircase` · `carrier` · `swept_carrier` · `comb` · `cal_tones` · `two_tone` · `noise_cal` · `test_card` · `noise` · `ssb` · `cw` · `step` · `impulse` · `tx_blank`. The panel's hint box explains what each one exercises. (See also the **[HF noise bench](#hf-noise-bench--test-aethersdrs-noise-reduction)** for layered live noise, separate from these single patterns.)
 
