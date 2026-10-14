@@ -95,6 +95,39 @@ HANDLE_HEX = f"{HANDLE:08X}"
 PAN_ID = 0x40000000          # FFT stream id   (PCC 0x8003)
 WF_ID  = 0x42000000          # waterfall id    (PCC 0x8004)
 SERIAL, MODEL, VERSION = "EMULATE01", "FLEX-6600", "3.3.28.0"
+
+# Firmware the sim reports (--firmware). VERSION stays the default, so nothing
+# changes unless asked. 4.3 turns on the SmartSDR v4.3.16 wire changes that
+# aethersdr/AetherSDR#6437 maps (PROTOCOL.md section 12). Presets are the FlexLib
+# builds of each release.
+FW_PRESETS = {"3.3": VERSION, "4.1": "4.1.5.39794", "4.2": "4.2.20.41343",
+              "4.3": "4.3.16.42034"}
+
+
+def parse_firmware(text):
+    """'4.3' (a preset) or a full 'major.minor.patch.build' -> the version string,
+    or None if malformed."""
+    t = (text or "").strip()
+    if t in FW_PRESETS:
+        return FW_PRESETS[t]
+    parts = t.split(".")
+    if len(parts) == 4 and all(x.isdigit() and len(x) <= 6 for x in parts):
+        return t
+    return None
+
+
+def fw_tuple(version):
+    return tuple(int(x) for x in version.split(".")[:2])
+
+
+# Hardware PTT inputs, in the order a v4.3 interlock lists them (hardware first).
+HW_PTT_SOURCES = ("MIC", "ACC", "RCA")
+
+# Slice DSP level commands -> the status key v4.3 firmware reports them under
+# (FlexLib 4.3.16 Slice.cs parses nrl_level/anfl_level/nrs_level). Before 4.3 the
+# status echoes the command name.
+DSP_LEVEL_KEYS = {"lms_nr_level": "nrl_level", "lms_anf_level": "anfl_level",
+                  "speex_nr_level": "nrs_level", "nrf_level": "nrf_level"}
 MODELS = {                       # model -> caps; slice count drives the multi-slice axis later
     "FLEX-6300": {"slices": 2, "scu": 1}, "FLEX-6400": {"slices": 2, "scu": 1},
     "FLEX-6500": {"slices": 4, "scu": 1}, "FLEX-6600": {"slices": 4, "scu": 2},
@@ -163,6 +196,9 @@ AUDIO_OUI  = 0x00001C2D   # FlexRadio Systems IEEE OUI
 AUDIO_ICC  = 0x534C       # FlexRadio information class code ("SL")
 AUDIO_PCC       = 0x03E3  # PCC_IF_NARROW:         float32 stereo @ 24 kHz (full BW)
 AUDIO_PCC_MONO  = 0x0123  # PCC_IF_NARROW_REDUCED: int16   mono   @ 24 kHz (reduced BW)
+# v4.3 slice audio rates (FlexLib 4.3.16 Vita/VitaFlex.cs). 0x03E3/0x0123 now mean
+# 24 kHz specifically; a 48 or 96 kHz slice uses its own codes: (full BW, reduced BW).
+AUDIO_PCC_BY_RATE = {24000: (0x03E3, 0x0123), 48000: (0x03E4, 0x0124), 96000: (0x03E5, 0x0125)}
 AUDIO_FRAMES = 128        # frames per packet (stereo: 128×2 floats; mono: 128 int16)
 AUDIO_RATE   = 24000      # Hz
 AUDIO_INTERVAL = AUDIO_FRAMES / AUDIO_RATE   # ~5.333 ms / packet → ~187.5 Hz
@@ -254,19 +290,20 @@ def meter_packet(stream_id, seq, meter_id, value, scale=128.0):
     return vita_header(stream_id, PCC_METER, seq, len(payload)) + payload
 
 
-def audio_packet(stream_id, seq, samples, reduced_bw=False):
+def audio_packet(stream_id, seq, samples, reduced_bw=False, pcc=None):
     """VITA-49 remote_audio_rx packet.
     reduced_bw=False: PCC 0x03E3 — float32 stereo big-endian, 128 frames (1024 B payload).
     reduced_bw=True:  PCC 0x0123 — int16   mono  big-endian, 128 samples (256 B payload).
     AE selects the decoder by PCC; use reduced_bw to match what AE requested via
     'client set send_reduced_bw_dax=1'. OUI/ICC sourced from AetherSDR PanadapterStream.cpp.
     """
+    # pcc overrides the class code (a v4.3 48/96 kHz slice); the format is unchanged.
     if reduced_bw:
-        pcc = AUDIO_PCC_MONO
+        pcc = pcc or AUDIO_PCC_MONO
         raw = [max(-32767, min(32767, int(v * 32767))) for v in samples[:AUDIO_FRAMES]]
         payload = struct.pack(f">{AUDIO_FRAMES}h", *raw)   # 256 bytes = 64 words
     else:
-        pcc = AUDIO_PCC
+        pcc = pcc or AUDIO_PCC
         payload = struct.pack(f">{AUDIO_FRAMES * 2}f", *samples)  # 1024 bytes = 256 words
     total_words = 7 + len(payload) // 4
     word0 = (0x3 << 28) | (1 << 27) | ((seq & 0xF) << 16) | total_words
@@ -1327,6 +1364,16 @@ class Radio:
         self.daxtx_foreign_owner = 0    # 0 = we own it; else the handle holding TX
         self.tx_dax = False             # 'transmit set dax=1'
         self.mic_selection = "MIC"       # 'mic input <src>'; reported in the transmit status
+        # Firmware the radio reports (--firmware). >= 4.3 switches on the v4.3.16 wire
+        # changes (PROTOCOL.md section 12); the default is the long-standing VERSION.
+        self.fw_version = VERSION
+        # v4.3 PTT Override: when on, a HARDWARE PTT transmits the analog mic even
+        # while DAX or remote audio is selected (the pre-4.3 behaviour). Default off.
+        self.ptt_mic_override = False
+        self.hw_ptt = []                 # latched hardware PTT inputs (MIC/ACC/RCA/VOX), /hwptt
+        self.udp_keepalive = {"udp_register": 0, "ping": 0, "last": None}
+        self.daxtx_pcc = None            # class code of the last DAX TX audio packet
+        self.apd = {"enable": False, "configurable": True}   # SmartSignal (APD)
         # Licensing, as a real radio reports it on 'sub license all' (FlexLib: license /
         # license subscription / license feature). Settable at startup (--license-feature,
         # --subscription, --no-dvk-license) and live from the control page (/license).
@@ -1389,7 +1436,85 @@ class Radio:
 
     @property
     def tx_on(self):
-        return self.tx_mox or self.tx_tune
+        return self.tx_mox or self.tx_tune or bool(self.hw_ptt)
+
+    @property
+    def fw43(self):
+        """True when the sim reports SmartSDR v4.3 or later firmware."""
+        return fw_tuple(self.fw_version) >= (4, 3)
+
+    def interlock_source(self):
+        """What keyed the radio, as the interlock status reports it.
+
+        v4.3 lists EVERY latched source, hardware first, comma-joined (e.g.
+        MIC,VOX), and reports VOX as VOX. Before 4.3 it named one source and
+        VOX came through as SW (FlexLib Radio.cs, ParseInterlockStatus)."""
+        hw = [x for x in HW_PTT_SOURCES if x in self.hw_ptt]
+        vox = "VOX" in self.hw_ptt
+        sw = self.tx_mox or self.tx_tune
+        if self.fw43:
+            toks = hw + (["VOX"] if vox else []) + (["SW"] if sw else [])
+            return ",".join(toks) or "SW"
+        return hw[0] if hw else "SW"
+
+    def tx_audio_source(self):
+        """What the radio would put on the air now, or None when not keyed.
+
+        The v4.3 behaviour change (SMART-9340/12931, aethersdr/AetherSDR#6442):
+        before 4.3 a hardware PTT always forced the analog mic; on 4.3 it uses
+        the selected source, DAX and remote audio included, unless PTT Override
+        is on. MOX/TUNE/xmit and VOX always use the selected source."""
+        if not self.tx_on:
+            return None
+        selected = "DAX" if self.tx_dax else self.mic_selection
+        hw = any(x in self.hw_ptt for x in HW_PTT_SOURCES)
+        if hw and not (self.tx_mox or self.tx_tune):
+            digital = selected in ("DAX", "PC")
+            if not self.fw43 or (self.ptt_mic_override and digital):
+                return "MIC" if digital else selected
+        return selected
+
+    def audio_rate(self):
+        """RX audio rate of the active slice: 24 kHz unless a v4.3 slice says otherwise."""
+        if not self.fw43:
+            return 24000
+        sl = self.slices.get(self.active_slice) or {}
+        return sl.get("rate", 24000)
+
+    def tx_slice_rate(self):
+        for sl in self.slices.values():
+            if sl.get("tx"):
+                return sl.get("rate", 24000)
+        return 24000
+
+    def note_keepalive(self, data):
+        """Count a UDP keepalive from the client. FlexLib 4.2.20+ sends
+        'client udp_register handle=..' every 50 ms until the first VITA packet,
+        then every 5 s; older clients switch to 'client ping handle=..'. AE sends
+        them to the radio's port 4991, so they also land on the DAX TX observer."""
+        for kind in ("udp_register", "ping"):
+            if data.startswith(b"client " + kind.encode()):
+                self.udp_keepalive[kind] += 1
+                self.udp_keepalive["last"] = kind
+                return True
+        return False
+
+    def emit_apd_status(self, conn=None):
+        """SmartSignal (APD). v4.3 adds a lifecycle 'state=' key, and an
+        equalizer_active line carrying the ant/freq/rfpower it applies to."""
+        conn = conn or self.conn
+        if not conn:
+            return
+        a = self.apd
+        line = f"apd enable={1 if a['enable'] else 0} configurable={1 if a['configurable'] else 0}"
+        active = a["enable"] and self.tx_on
+        if self.fw43:
+            state = "OFF" if not a["enable"] else ("ACTIVE" if active else "IDLE")
+            self.status(conn, line + f" state={state}")
+            self.status(conn, f"apd equalizer_active={1 if active else 0} ant=ANT1 "
+                              f"freq={self.slice_freq:.6f} rfpower={int(self.tx_power_w)}")
+        else:
+            self.status(conn, line + f" equalizer_active={1 if active else 0}")
 
     # ---- DAX TX chain observer (#4510) -----------------------------------
     def txchain(self):
@@ -1408,6 +1533,12 @@ class Radio:
             ("4: radio keyed with dax=1",         bool(self.tx_on) and self.tx_dax),
             ("5: stream claimed as TX source",    self.daxtx_tx),   # foreign owner => False
         ]
+        if self.fw43:
+            # v4.3 firmware rejects TX audio whose rate differs from the TX
+            # slice's ("DAX TX source rate != slice rate").
+            want = AUDIO_PCC_BY_RATE.get(self.tx_slice_rate(), ())
+            stages.insert(2, ("3b: TX audio rate matches the TX slice",
+                              self.daxtx_pcc is not None and self.daxtx_pcc in want))
         first_missing = next((name for name, ok in stages if not ok), None)
         return {
             "stages": {name: ok for name, ok in stages},
@@ -1420,6 +1551,8 @@ class Radio:
             "contention": self.daxtx_foreign_owner != 0,
             "keyed": bool(self.tx_on),
             "dax": self.tx_dax,
+            "tx_audio_source": self.tx_audio_source(),
+            "audio_pcc": f"0x{self.daxtx_pcc:04X}" if self.daxtx_pcc is not None else None,
             "verdict": ("RF WOULD BE PRODUCED" if first_missing is None
                         else f"NO RF — first missing stage: {first_missing}"),
         }
@@ -1451,6 +1584,12 @@ class Radio:
                 data, _addr = s.recvfrom(4096)
             except OSError:
                 return
+            # AE sends its UDP keepalives to this port too ('client ping' every
+            # 5 s). They are not audio: counting them made stage 3 flicker true.
+            if self.note_keepalive(data):
+                continue
+            if len(data) >= 16:
+                self.daxtx_pcc = struct.unpack(">H", data[14:16])[0]
             self.daxtx_pkts += 1
             self.daxtx_bytes += len(data)
             self.daxtx_last_pkt = time.time()
@@ -1495,7 +1634,14 @@ class Radio:
                 "noise": self.noise_mixer.snapshot(),           # HF noise bench state
                 "noise_active": self.noise_mixer.any_enabled(),
                 "noise_wav": self.noise_wav_path,
-                "license": self.license_state()}
+                "license": self.license_state(),
+                "firmware": self.fw_version, "fw43": self.fw43,
+                "interlock_source": self.interlock_source(),
+                "tx_audio_source": self.tx_audio_source(),
+                "ptt_mic_override": self.ptt_mic_override, "hw_ptt": list(self.hw_ptt),
+                "udp_keepalive": dict(self.udp_keepalive),
+                "slice_rates": {str(k): v.get("rate", 24000) for k, v in self.slices.items()},
+                "apd": dict(self.apd)}
 
     def dbm_to_pixel(self, dbm):
         p = (self.max_dbm - dbm) / (self.max_dbm - self.min_dbm) * (self.y_pixels - 1)
@@ -1511,7 +1657,7 @@ class Radio:
         dests = [("255.255.255.255", DISCOVERY_PORT)] + ([(self.ae_ip, DISCOVERY_PORT)] if self.ae_ip else [])
         while self.run:
             if self.enabled:                       # "powered off" -> stop advertising
-                msg = (f"name=flex-sim model={self.model} serial={self.serial} version={VERSION} "
+                msg = (f"name=flex-sim model={self.model} serial={self.serial} version={self.fw_version} "
                        f"ip={self.ip} port={self.port} status=Available mf_enable=1 "
                        f"slices={self.max_slices} pans={self.max_slices} "   # capacity -> AE enables +RX
                        f"max_licensed_version=3").encode()   # rebuilt each tick -> live model change propagates
@@ -1590,6 +1736,7 @@ class Radio:
                 data, addr = s.recvfrom(2048)
             except OSError:
                 break
+            self.note_keepalive(data)
             if self.ae_peer_ip and addr[0] == self.ae_peer_ip and not self.vita_dest:
                 self.vita_dest = addr
                 log(f"[udp] captured VITA dest from prime: {addr} ({len(data)}B)")
@@ -1626,9 +1773,9 @@ class Radio:
     def handle(self, conn):
         self.conn = conn
         with self.send_lock:
-            conn.sendall(f"V{VERSION}\n".encode())
+            conn.sendall(f"V{self.fw_version}\n".encode())
             conn.sendall(f"H{self.handle_hex}\n".encode())
-        log(f"[tcp] sent V{VERSION} / H{self.handle_hex}")
+        log(f"[tcp] sent V{self.fw_version} / H{self.handle_hex}")
         buf = b""
         while self.run:
             chunk = conn.recv(4096)
@@ -1750,7 +1897,7 @@ class Radio:
             self.emit_radio_status(conn)                   # slice/pan capability -> AE enables +RX
         elif c.startswith("info"):
             self.reply(conn, seq, f"model={self.model},chassis_serial={self.serial},callsign=SDRSIM,"
-                                  f"name=flex-sim,software_ver={VERSION},ip={self.ip}")
+                                  f"name=flex-sim,software_ver={self.fw_version},ip={self.ip}")
         elif c == "mic list":
             self.reply(conn, seq, "MIC,BAL,LINE,ACC,PC")    # a real 6000's list; PC = the client's mic
         elif c.startswith("mic input"):                    # AE picks the TX mic source with this
@@ -1772,6 +1919,17 @@ class Radio:
             # the reliable "not licensed" signal (DvkModel::licenseRefused).
             self.reply(conn, seq, code=0x50004001)
             log(f"[license] refused '{c}' with 50004001 (--dvk-refuses)")
+        elif c == "sub apd all":
+            self.reply(conn, seq)
+            self.emit_apd_status(conn)
+        elif c.startswith("apd ") and "enable=" in c:
+            kvs = parse_kvs(c)
+            if kvs["enable"] not in ("0", "1"):
+                self.reply(conn, seq, code=0x5000002D)
+                return
+            self.apd["enable"] = kvs["enable"] == "1"
+            self.reply(conn, seq)
+            self.emit_apd_status(conn)
         elif c == "sub tx all":
             # Answer the subscription with the current TX state, so a client that
             # (re)connects while the radio is keyed learns it rather than assuming RX.
@@ -1918,6 +2076,13 @@ class Radio:
             # tx=1) still has to name WHICH stream modulates.
             if "dax" in kvs:  self.tx_dax = kvs["dax"] == "1"
             if "mic_selection" in kvs: self.mic_selection = kvs["mic_selection"].upper()
+            # v4.3 PTT Override (radio-wide). Older firmware has no such key: ignore it.
+            if "ptt_mic_override" in kvs and self.fw43:
+                if kvs["ptt_mic_override"] not in ("0", "1"):
+                    self.reply(conn, seq, code=0x5000002D)    # "Bad field"; change nothing
+                    return
+                self.ptt_mic_override = kvs["ptt_mic_override"] == "1"
+                log(f"[tx] ptt_mic_override={kvs['ptt_mic_override']}")
             # tune_mode selects what the RADIO generates while tuning. AE's
             # two-tone test sends 'tune_mode=two_tone' then 'transmit tune 1'
             # and sends NO audio of its own -- measured on the wire 2026-07-22.
@@ -1982,6 +2147,35 @@ class Radio:
                 # diversity=1'. The radio answers by creating a CHILD slice that
                 # is RX-only and shares the PARENT's panadapter — the two SCUs
                 # feed one combined receiver. Turning it off removes the child.
+                # DSP levels. The client sends the command names; v4.3 firmware
+                # reports them under different status keys, NRS tops out at 50
+                # (SMART-12540), and nrf_level is gone (NRF is tuned by
+                # nrf_wlen). Assumed ignored, not refused -- unverified (#6437).
+                for key in DSP_LEVEL_KEYS:
+                    if key not in kvs:
+                        continue
+                    if key == "nrf_level" and self.fw43:
+                        log(f"[slice] {idx} nrf_level ignored: removed in v4.3")
+                        continue
+                    try:
+                        v = int(float(kvs[key]))
+                    except ValueError:
+                        continue
+                    top = 50 if (key == "speex_nr_level" and self.fw43) else 100
+                    self.slices[idx].setdefault("dsp", {})[key] = max(0, min(top, v))
+                    self.emit_slice_status(conn, idx)
+                # v4.3 per-slice audio rate. Older firmware has one rate (24 kHz).
+                if "sample_rate" in kvs and self.fw43:
+                    try:
+                        rate = int(kvs["sample_rate"])
+                    except ValueError:
+                        rate = 0
+                    if rate not in AUDIO_PCC_BY_RATE:
+                        self.reply(conn, seq, code=0x5000002D)
+                        return
+                    self.slices[idx]["rate"] = rate
+                    log(f"[slice] {idx} sample_rate={rate}")
+                    self.emit_slice_status(conn, idx)
                 if "diversity" in kvs:
                     if kvs["diversity"] == "1":
                         self._diversity_on(conn, idx)
@@ -2215,10 +2409,13 @@ class Radio:
                f" diversity_parent={1 if sl.get('div_parent') else 0}"
                f" diversity_child={1 if sl.get('div_child') else 0}"
                f" diversity_index={sl.get('div_index', -1)}")
+        dsp = "".join(f" {DSP_LEVEL_KEYS[k] if self.fw43 else k}={v}"
+                      for k, v in sorted(sl.get("dsp", {}).items()))
+        rate = f" sample_rate={sl.get('rate', 24000)}" if self.fw43 else ""
         self.status(conn, f"slice {idx} client_handle=0x{self.handle_hex} pan=0x{pid:08X} "
                           f"RF_frequency={sl['freq']:.6f} mode={sl['mode']} in_use=1 "
                           f"tx={1 if sl.get('tx') else 0} "
-                          f"active={1 if sl['active'] else 0}{div}")
+                          f"active={1 if sl['active'] else 0}{div}{dsp}{rate}")
 
     def emit_radio_status(self, conn):
         # Capability advert. AE computes MaxSlices/SlicesRemaining from the radio status;
@@ -2327,13 +2524,19 @@ class Radio:
         on = self.tx_on
         try:
             self.status(self.conn,
-                f"interlock state={'TRANSMITTING' if on else 'READY'} source=SW "
+                f"interlock state={'TRANSMITTING' if on else 'READY'} "
+                f"source={self.interlock_source()} "
                 f"tx_client_handle=0x{self.handle_hex}")
+            # ptt_mic_override exists from v4.3; older firmware never reports it,
+            # which is how a client tells the two apart (#6442).
+            pmo = f" ptt_mic_override={1 if self.ptt_mic_override else 0}" if self.fw43 else ""
             self.status(self.conn,
                 f"transmit mox={1 if self.tx_mox else 0} tune={1 if self.tx_tune else 0} "
                 f"mic_selection={self.mic_selection} dax={1 if self.tx_dax else 0} "
                 f"freq={self.slice_freq:.6f} rfpower={int(self.tx_power_w)} "
-                f"tunepower={int(self.tx_power_w)}")
+                f"tunepower={int(self.tx_power_w)}{pmo}")
+            if self.apd["enable"]:
+                self.emit_apd_status()
             log(f"[->] TX {'ON' if on else 'off'}  ({self.tx_power_w:.0f} W, SWR {self.tx_swr:.1f})")
         except OSError:
             pass
@@ -2374,6 +2577,10 @@ class Radio:
             q1 = c.find('"'); q2 = c.find('"', q1 + 1)
             if q1 >= 0 and q2 > q1:
                 text = c[q1 + 1:q2].replace("\x7f", " ")   # 0x7f = AE-encoded space
+                # v4.3: 0x1E stands in for a quote inside the quoted text, so
+                # text with a '"' no longer ends the argument early.
+                if self.fw43:
+                    text = text.replace("\x1e", '"')
                 self.start_cwx(text)
         elif rest.startswith("clear") or rest.startswith("erase"):
             if self.cwx_active:
@@ -2461,6 +2668,8 @@ class Radio:
         last_route = None   # log only when the route/format actually changes
 
         seq      = 0
+        it       = 0   # loop iterations: one 24 kHz block each, whatever the rate
+        prev_sample = 0.0   # carried across blocks by the 48/96 kHz upsampler
         sample_t = 0   # phase counter for tone source
         t_start  = time.monotonic()
         amp      = 0.1  # −20 dBFS
@@ -2479,8 +2688,10 @@ class Radio:
                 dax_on   = self.dax_channel is not None
                 reduced  = False if dax_on else self.audio_reduced_bw
                 stream_id = self.audio_stream_id
+                rate = self.audio_rate()
                 route = (f"dax_rx ch{self.dax_channel} (full-BW f32)" if dax_on
                          else f"remote_audio_rx ({'mono int16' if reduced else 'stereo f32'})")
+                route += f" @ {rate // 1000} kHz"
                 if route != last_route:
                     log(f"[audio] route -> {route}, sid 0x{stream_id:08X}")
                     last_route = route
@@ -2519,20 +2730,37 @@ class Radio:
 
                 sample_t += AUDIO_FRAMES  # harmless for non-tone sources
 
-                if reduced:
-                    samples = mono
-                else:
-                    samples = []
-                    for v in mono: samples.extend([v, v])
+                # A v4.3 48/96 kHz slice: the sources make 24 kHz audio, so
+                # upsample this block by linear interpolation and send it as
+                # rate/24k packets of AUDIO_FRAMES each -- same duration per
+                # iteration, so the pacing below is unchanged.
+                factor = rate // AUDIO_RATE
+                if factor > 1:
+                    ext = [prev_sample] + list(mono)
+                    mono = [ext[k // factor] + (ext[k // factor + 1] - ext[k // factor])
+                            * (k % factor) / factor for k in range(len(ext[1:]) * factor)]
+                    prev_sample = ext[-1]
+                pcc = AUDIO_PCC_BY_RATE[rate][1 if reduced else 0]
+                sent_ok = True
+                for b in range(max(1, factor)):
+                    block = mono[b * AUDIO_FRAMES:(b + 1) * AUDIO_FRAMES]
+                    if reduced:
+                        samples = block
+                    else:
+                        samples = []
+                        for v in block: samples.extend([v, v])
+                    try:
+                        s.sendto(audio_packet(stream_id, seq & 0xF, samples, reduced_bw=reduced,
+                                              pcc=pcc), dest)
+                    except OSError as e:
+                        log("[audio] send error:", e); sent_ok = False; break
+                    seq += 1
+                if not sent_ok:
+                    break
 
-                try:
-                    s.sendto(audio_packet(stream_id, seq & 0xF, samples, reduced_bw=reduced), dest)
-                except OSError as e:
-                    log("[audio] send error:", e); break
-
-                seq += 1
+                it += 1
                 # Absolute deadline — prevents accumulated drift
-                deadline = t_start + seq * AUDIO_INTERVAL
+                deadline = t_start + it * AUDIO_INTERVAL
                 wait = deadline - time.monotonic()
                 if wait > 0:
                     time.sleep(wait)
@@ -3290,6 +3518,27 @@ def apply_license_query(radio, q):
     return {"ok": True, "license": radio.license_state()}
 
 
+def apply_hwptt_query(radio, q):
+    """Simulate a hardware PTT from the control page: ?src=MIC|ACC|RCA|VOX&on=0|1.
+    Keys the radio like a footswitch would, so the v4.3 interlock list and the
+    PTT Override source flip can be watched in AE. No query = read the state."""
+    if "src" in q:
+        src = q["src"][0].strip().upper()
+        on = q.get("on", ["1"])[0]
+        if src not in HW_PTT_SOURCES + ("VOX",) or on not in ("0", "1"):
+            return {"ok": False, "error": "wants src=MIC|ACC|RCA|VOX&on=0|1"}
+        if on == "1" and src not in radio.hw_ptt:
+            radio.hw_ptt.append(src)
+        elif on == "0" and src in radio.hw_ptt:
+            radio.hw_ptt.remove(src)
+        log(f"[ptt] hardware {src} {'down' if on == '1' else 'up'} -> "
+            f"interlock source={radio.interlock_source()} audio={radio.tx_audio_source()}")
+        radio.emit_transmit_status()
+        radio.txchain_edge()
+    return {"ok": True, "hw_ptt": list(radio.hw_ptt), "interlock_source": radio.interlock_source(),
+            "tx_audio_source": radio.tx_audio_source(), "firmware": radio.fw_version}
+
+
 def apply_license_args(radio, args):
     """Startup licence options; argparse has already validated them."""
     for spec in args.license_feature:
@@ -3342,6 +3591,8 @@ def start_control_server(radio, port):
             if u.path == "/txchain":
                 # The #4510 chain verdict — radio-side stages + first missing.
                 return self._json(radio.txchain())
+            if u.path == "/hwptt":
+                return self._json(apply_hwptt_query(radio, urllib.parse.parse_qs(u.query)))
             if u.path == "/license":
                 # Live licensing: ?feature=NAME&enabled=0|1[&reason=], ?subscription=none|
                 # smartsdr+|early-access[&expires=YYYY-MM-DD], ?dvk_refuses=0|1. No query
@@ -3572,14 +3823,15 @@ def start_rack_control_server(rack, port):
                 except Exception:
                     self.send_response(404); self.end_headers()
                     self.wfile.write(b"qa viewer not available"); return
-            if u.path == "/license":
+            if u.path in ("/license", "/hwptt"):
                 q = urllib.parse.parse_qs(u.query)
                 try:
                     r = rack.radios[int(q.get("radio", ["0"])[0])]
                 except (ValueError, IndexError):
                     body = json.dumps({"ok": False, "error": "no such radio"}).encode()
                 else:
-                    body = json.dumps(apply_license_query(r, q)).encode()
+                    fn = apply_license_query if u.path == "/license" else apply_hwptt_query
+                    body = json.dumps(fn(r, q)).encode()
                 self.send_response(200); self.send_header("Content-Type", "application/json")
                 self.send_header("Cache-Control", "no-store"); self.end_headers()
                 self.wfile.write(body); return
@@ -3685,6 +3937,18 @@ def main():
     ap.add_argument("--subscription-expires", type=_date_arg, default=None, metavar="YYYY-MM-DD",
                     help="subscription expiry date (default one year from today; a past date "
                          "is an expired subscription)")
+    def _fw_arg(text):
+        v = parse_firmware(text)
+        if not v:
+            raise argparse.ArgumentTypeError(
+                "wants a preset (" + ", ".join(FW_PRESETS) + ") or major.minor.patch.build")
+        return v
+
+    ap.add_argument("--firmware", type=_fw_arg, default=VERSION, metavar="VERSION",
+                    help="firmware version the radio reports: a preset ("
+                         + ", ".join(FW_PRESETS) + ") or a full version. 4.3 or later "
+                         "switches on the SmartSDR v4.3.16 wire changes (PROTOCOL.md section "
+                         "12). Default " + VERSION)
     ap.add_argument("--dvk-refuses", action="store_true",
                     help="refuse every 'dvk' command with 50004001, like a radio that cannot "
                          "store recordings even if it reports the feature enabled")
@@ -3704,6 +3968,7 @@ def main():
         for r in rack.radios:
             r.rf_sense = rf_sense
             apply_license_args(r, args)
+            r.fw_version = args.firmware
         rack.start()
         start_rack_control_server(rack, args.ctl_port)
         log(f"flex-sim {FLEX_SIM_VERSION} - RACK of {args.radios} radios on :{base}")
@@ -3725,6 +3990,7 @@ def main():
     radio.txlog_interval = args.txlog_interval
     radio.rf_sense = rf_sense
     apply_license_args(radio, args)
+    radio.fw_version = args.firmware
     if rf_sense:
         log("[rf-sense] TX edges -> " + ", ".join(f"{h}:{p}" for h, p in rf_sense))
     if args.txlog:

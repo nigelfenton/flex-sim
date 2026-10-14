@@ -163,3 +163,37 @@ Asked for by K5PTB, to test AE against different licences. Pinned by `tests/test
    Everything is validated before anything changes; bad input gets `{"ok": false, "error": ...}` and changes nothing. `/state` carries the licence too.
 4. **DVK refusal.** With `dvk_refuses` on, every `dvk ...` command is answered `0x50004001`, as a radio that won't store recordings does, sometimes while it still reports the feature enabled. AE treats that refusal as the reliable "not licensed" signal.
 5. **What AE does with it (#6292 build, 2026-10-12).** With the keyer source on *Automatic*, AE follows a live change both ways: licence off → title `Digital Voice Keyer (Local)` and the *Radio DVK* item is removed from the menu; licence on → back to `(Radio)`. An explicit *Local* or *Radio* choice is saved in AE's settings and overrides the licence, so start from Automatic when testing. AE only upgrades its subscription label within a session, so test a downgrade with a fresh connection.
+
+## 12. SmartSDR v4.3 firmware (`--firmware 4.3`) — 2026-10-14
+
+SmartSDR v4.3.16 (released 2026-10-13, FlexLib 4.3.16.42034) changed parts of the wire protocol. aethersdr/AetherSDR#6437 maps every change from FlexLib 4.1.5. `--firmware 4.3` turns on the ones below, so AE's 4.3 work can be tested without upgrading a radio. The default (`3.3.28.0`) is unchanged. Other presets are `3.3`, `4.1` and `4.2`, or give a full version string; anything 4.3 or later gets these behaviours. Pinned by `tests/test_firmware_43.py`, which checks each one against both an old-firmware sim and a 4.3 sim.
+
+1. **Version.** Discovery `version=`, the `V` line and `info` `software_ver=` all report the chosen version, e.g. `4.3.16.42034`.
+2. **PTT Override** (#6442). The transmit status gains `ptt_mic_override=0|1` (default 0). Older firmware never reports the key, which is how a client tells the two apart. `transmit set ptt_mic_override=0|1` sets it, and any other value gets `0x5000002D` (Bad field). On older firmware the key is ignored.
+3. **Interlock source list.** `interlock source=` lists **every** latched source, hardware first, comma-joined: `MIC,VOX`, `MIC,VOX,SW`. VOX is reported as `VOX`. Older firmware names one source (hardware wins) and reports VOX as `SW`.
+4. **What a hardware PTT transmits.** Before 4.3 a hardware PTT (MIC, ACC or RCA) always forced the analog mic. On 4.3 it transmits the **selected** source, DAX included, unless PTT Override is on. MOX, TUNE, `xmit` and VOX always use the selected source. `/state` and `/txchain` report the result as `tx_audio_source`.
+   - **Simulate a footswitch** from the control port: `GET /hwptt?src=MIC|ACC|RCA|VOX&on=0|1` (rack: `&radio=N`). It keys the radio and emits interlock and transmit status like a real PTT.
+5. **Slice DSP levels.** The client sends `lms_nr_level`, `lms_anf_level` and `speex_nr_level`, and v4.3 reports them as `nrl_level`, `anfl_level` and `nrs_level`. NRS is clamped to 0..50 (SMART-12540; was 0..100). `nrf_level` is gone (NRF is tuned by `nrf_wlen`), so the sim ignores it and doesn't echo it. *Assumption: whether real 4.3 firmware ignores `nrf_level` or refuses it is unverified (#6437).* Older firmware echoes the command names.
+6. **Per-slice audio rate.** `slice set N sample_rate=24000|48000|96000`, reported as `sample_rate=` in slice status; any other rate gets Bad field. RX audio for a 48 or 96 kHz active slice uses the new class codes:
+
+   | Rate | Full BW (float32 stereo) | Reduced BW (int16 mono) |
+   |---|---|---|
+   | 24 kHz | `0x03E3` | `0x0123` |
+   | 48 kHz | `0x03E4` | `0x0124` |
+   | 96 kHz | `0x03E5` | `0x0125` |
+
+   Packets stay 128 frames, so 48 kHz sends twice as many and 96 kHz four times as many. The sim's sources make 24 kHz audio, which is upsampled by linear interpolation; that's fine for testing the routing, not for judging audio quality. Older firmware has no `sample_rate` and streams 24 kHz only.
+7. **APD (SmartSignal).** `sub apd all` and `apd enable=0|1` are answered.
+   - **v4.3** adds `state=OFF|IDLE|ACTIVE` (OFF when disabled, ACTIVE while keyed), plus `apd equalizer_active=<0|1> ant=ANT1 freq=<MHz> rfpower=<W>`.
+   - **Older firmware** sends `equalizer_active` on the enable line.
+   - TRAINING, HOLD and FAULT aren't simulated.
+8. **UDP keepalives.**
+   - FlexLib 4.2.20+ sends `client udp_register handle=..` every 50 ms until the first VITA packet arrives, then every 5 s. Older clients sent `client ping handle=..`.
+   - AE sends them to the radio's port 4991, the DAX TX port. The sim counts both kinds (`/state` → `udp_keepalive`).
+   - **Fixed:** they used to be counted as DAX TX audio, so a `client ping` every 5 s could make txchain stage 3 flicker true.
+9. **DAX TX rate.** v4.3 firmware rejects TX audio whose rate differs from the TX slice's ("DAX TX source rate != slice rate"). On 4.3 the txchain gains stage **3b: TX audio rate matches the TX slice**, judged from the class code of the incoming packets (`/txchain` → `audio_pcc`).
+10. **CWX quote stand-in.** Byte `0x1E` inside the quoted text of `cwx send` is read as `"`, so a quote no longer ends the argument early.
+
+**Not covered:** SmartLink WAN sessions, and anything 8000/Aurora-only (AutoDX, NTP, Noise Floor Range).
+
+**Checked against a real AE:** the #6292 build connected to a `--firmware 4.3` sim, showed version 4.3.16.42034, and took `ptt_mic_override` in the transmit status without complaint (2026-10-14).
