@@ -73,6 +73,18 @@ python3 flex_sim.py --radios 10 \
 ### Licensing options
 The sim reports a licence like a real radio: by default an active SmartSDR+ subscription with the Digital Voice Keyer licensed. Change it at startup, e.g. `--subscription none`, `--subscription early-access --subscription-expires 2026-01-31`, `--license-feature digital_voice_keyer=0`, or `--dvk-refuses`. Or change it live, without reconnecting AetherSDR, from the control port: `http://<flex-sim-ip>:8731/license?feature=digital_voice_keyer&enabled=0`. Details in [PROTOCOL.md §11](PROTOCOL.md#11-licensing-options--2026-10-12).
 
+### SmartSDR v4.3 firmware
+`--firmware 4.3` makes the sim behave like a radio on SmartSDR v4.3.16:
+- it reports version 4.3.16.42034
+- PTT Override (`ptt_mic_override`), and a hardware PTT that sends the *selected* source (DAX included) unless the override is on
+- comma-joined interlock sources (`MIC,VOX`)
+- the new DSP level keys and the 0–50 NRS range
+- 48 and 96 kHz slice audio
+- APD `state=`
+- `udp_register` keepalives
+
+Simulate a footswitch live with `http://<flex-sim-ip>:8731/hwptt?src=MIC&on=1`. The default is unchanged. Details in [PROTOCOL.md §12](PROTOCOL.md#12-smartsdr-v43-firmware---firmware-43--2026-10-14).
+
 ## Patterns
 `noise_floor` · `ramp` · `staircase` · `carrier` · `swept_carrier` · `comb` · `cal_tones` · `two_tone` · `noise_cal` · `test_card` · `noise` · `ssb` · `cw` · `step` · `impulse` · `tx_blank`. The panel's hint box explains what each one exercises. (See also the **[HF noise bench](#hf-noise-bench--test-aethersdrs-noise-reduction)** for layered live noise, separate from these single patterns.)
 
