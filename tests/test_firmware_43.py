@@ -140,6 +140,31 @@ def kv_of(lines, prefix):
 AUDIO_PCCS = {0x03E3, 0x03E4, 0x03E5, 0x0123, 0x0124, 0x0125}
 
 
+def sample_audio(udp, settle=0.5, window=1.0):
+    """(audio class codes seen, audio packets per second), measured AFTER
+    `settle` seconds of discarding. Two things make an unsettled read lie on a
+    slow runner: the socket buffer still holds packets from before a change,
+    and the sender catches up in a burst if its first iteration started late."""
+    end = time.time() + settle
+    while time.time() < end:
+        try:
+            udp.recv(4096)
+        except socket.timeout:
+            break
+    pccs, n, t0 = set(), 0, time.time()
+    while time.time() - t0 < window:
+        try:
+            d = udp.recv(4096)
+        except socket.timeout:
+            break
+        if len(d) >= 16:
+            pcc = struct.unpack(">H", d[14:16])[0]
+            if pcc in AUDIO_PCCS:                      # the port also carries pan/wf/meters
+                pccs.add(pcc)
+                n += 1
+    return pccs, n / max(1e-3, time.time() - t0)
+
+
 def vita(pcc, sid=0x08000001):
     """A minimal VITA-49 packet with the given class code (header only + 16 B)."""
     word0 = (0x1 << 28) | 11
@@ -238,40 +263,15 @@ def main():
         udp.settimeout(2)
         b.cmd(f"client udpport {udp.getsockname()[1]}")
         b.cmd("stream create type=remote_audio_rx compression=none")
-        pccs, t0, n = set(), time.time(), 0
-        while time.time() - t0 < 1.0:
-            try:
-                d = udp.recv(4096)
-            except socket.timeout:
-                break
-            if len(d) >= 16:
-                pcc = struct.unpack(">H", d[14:16])[0]
-                if pcc in AUDIO_PCCS:                  # the port also carries pan/wf/meters
-                    pccs.add(pcc)
-                    n += 1
-        rate = n / max(1e-3, time.time() - t0)
+        pccs, rate = sample_audio(udp, settle=0.6, window=1.5)
         check("a 48 kHz slice streams class 0x03E4", pccs == {0x03E4}, sorted(hex(x) for x in pccs))
         check("...at twice the 24 kHz packet rate (~375/s)", 300 < rate < 450, f"{rate:.0f}/s")
         b.cmd("slice set 0 sample_rate=96000")
-        time.sleep(0.3)
-        pccs = set()
-        for _ in range(50):
-            try:
-                d = udp.recv(4096)
-                pccs.add(struct.unpack(">H", d[14:16])[0])
-            except socket.timeout:
-                break
-        check("a 96 kHz slice switches to class 0x03E5 live", 0x03E5 in pccs, sorted(hex(x) for x in pccs))
+        pccs, _ = sample_audio(udp, settle=0.6, window=0.4)
+        check("a 96 kHz slice switches to class 0x03E5 live", pccs == {0x03E5}, sorted(hex(x) for x in pccs))
         b.cmd("client set send_reduced_bw_dax=1")
-        time.sleep(0.3)
-        pccs = set()
-        for _ in range(50):
-            try:
-                d = udp.recv(4096)
-                pccs.add(struct.unpack(">H", d[14:16])[0])
-            except socket.timeout:
-                break
-        check("reduced bandwidth at 96 kHz uses class 0x0125", 0x0125 in pccs, sorted(hex(x) for x in pccs))
+        pccs, _ = sample_audio(udp, settle=0.6, window=0.4)
+        check("reduced bandwidth at 96 kHz uses class 0x0125", pccs == {0x0125}, sorted(hex(x) for x in pccs))
         b.cmd("client set send_reduced_bw_dax=0")
         udp.close()
 
