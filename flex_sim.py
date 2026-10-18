@@ -2152,12 +2152,12 @@ class Radio:
         if not pan: return
         wid, cfreq = pan["wf_id"], self._pan_center(pid)
         self.status(conn,
-            f"display pan 0x{pid:08X} client_handle=0x{self.gui_owner_handle()} waterfall=0x{wid:08X} "
+            f"display pan 0x{pid:08X} client_handle=0x{self.handle_hex} waterfall=0x{wid:08X} "
             f"center={cfreq:.6f} bandwidth={self.span_mhz:.6f} min_dbm={self.min_dbm:.0f} "
             f"max_dbm={self.max_dbm:.0f} x_pixels={self.bins} y_pixels={self.y_pixels} fps={self.fps} "
             f"ant_list=ANT1 rxant=ANT1")
         self.status(conn,
-            f"display waterfall 0x{wid:08X} client_handle=0x{self.gui_owner_handle()} panadapter=0x{pid:08X} "
+            f"display waterfall 0x{wid:08X} client_handle=0x{self.handle_hex} panadapter=0x{pid:08X} "
             f"line_duration=100 center={cfreq:.6f} bandwidth={self.span_mhz:.6f} "
             f"auto_black=1 black_level=15 color_gain=50")
         log(f"[->] pan 0x{pid:08X} / wf 0x{wid:08X} status @ {cfreq:.5f}")
@@ -2316,6 +2316,10 @@ class Radio:
         else:
             log(f"[->] client list -> {sent} station(s)")
 
+    # NB: display pan / waterfall deliberately keep the RADIO handle. Re-stamping
+    # them with the GUI client's handle stopped AetherSDR rendering its own
+    # waterfall (observed 2026-10-18). Only the SLICE and the TX slice need the
+    # GUI client's handle for a bound controller to accept them.
     def gui_owner_handle(self):
         # The handle that OWNS slices, panadapters and the TX slice: the GUI
         # client's, not the radio's.
