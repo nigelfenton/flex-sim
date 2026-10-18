@@ -91,6 +91,8 @@ SERIAL_PREFIX = _default_serial_prefix()   # serial = <prefix><radio_id:02d>; --
                                            # (pass --serial FLEXSIM for the pre-2026-07-31 default)
                              # -> set e.g. 5992 to run on the SAME host as AE without a :4992 clash
 HANDLE = 0x1A2B3C4D
+# Stable GUI-client id for the simulated client (real radios use a UUID).
+CLIENT_ID = "00000000-0000-4000-8000-0000F1E55100"
 HANDLE_HEX = f"{HANDLE:08X}"
 PAN_ID = 0x40000000          # FFT stream id   (PCC 0x8003)
 WF_ID  = 0x42000000          # waterfall id    (PCC 0x8004)
@@ -1267,6 +1269,13 @@ class Radio:
         self.serial = f"{serial_prefix}{radio_id:02d}"
         self.client_handle = HANDLE + radio_id   # NB: NOT self.handle — that's the method!
         self.handle_hex = f"{self.client_handle:08X}"
+        # MultiFlex GUI-client identity. A real Flex registers each GUI client and
+        # broadcasts a 'client <handle> connected ...' status carrying its station
+        # name; the CTR2-Max waits for that before it will send ANY command, which
+        # is why knobs registered on its own display but produced no traffic.
+        self.gui_station = ""          # set by 'client station <name>'
+        self.gui_program = "AetherSDR" # set by 'client program <name>'
+        self.gui_registered = False    # True once 'client gui' has run
         self.pan_id = PAN_ID + radio_id * 16     # FFT stream-id BASE; AE stacks a panadapter per +RX,
         self.wf_id = WF_ID + radio_id * 16       # waterfall base. pan k -> base+k (16 ids/radio, no overlap)
         self.pans = {}                           # pan_id -> {"wf_id":int,"slice":global_idx|None,"y_pixels":int}
@@ -1617,13 +1626,38 @@ class Radio:
         seq, c = head[1:], cmd.strip()
         log("[<-]", f"C{seq}|{c}")
         if c.startswith("client gui"):
-            self.reply(conn, seq, str(uuid.uuid4()).upper())
+            # 'client gui' may carry a client id: 'client gui <uuid>'. Echo the
+            # supplied one if present, else mint one, like a real radio.
+            parts_gui = c.split()
+            cid = parts_gui[2].upper() if len(parts_gui) > 2 else str(uuid.uuid4()).upper()
+            self.gui_registered = True
+            self.reply(conn, seq, cid)
+            self.emit_client_status(conn)
+        elif c.startswith("client station"):
+            # 'client station <name>' = FlexLib SetClientStationName. Store it and
+            # re-broadcast, so subscribers to 'sub client all' learn the station.
+            name = c[len("client station"):].strip()
+            self.gui_station = name
+            self.reply(conn, seq)
+            self.emit_client_status(conn)
+            log(f"[client] station={name!r}")
+        elif c.startswith("client program"):
+            name = c[len("client program"):].strip()
+            self.gui_program = name
+            self.reply(conn, seq)
+            self.emit_client_status(conn)
+            log(f"[client] program={name!r}")
         elif c.startswith("client set"):
             if "send_reduced_bw_dax=1" in c:
                 self.audio_reduced_bw = True
             elif "send_reduced_bw_dax=0" in c:
                 self.audio_reduced_bw = False
             self.reply(conn, seq)
+        elif c.startswith("sub client"):
+            # AE subscribes with 'sub client all'; a real radio answers with the
+            # current GUI-client list. Without this the CTR2 never sees a station.
+            self.reply(conn, seq)
+            self.emit_client_status(conn)
         elif c == "slice list":
             self.reply(conn, seq, "")
         elif c.startswith("display panafall create") or c.startswith("display pan create"):
@@ -2124,6 +2158,16 @@ class Radio:
                           f"RF_frequency={sl['freq']:.6f} mode={sl['mode']} in_use=1 "
                           f"tx={1 if sl.get('tx') else 0} "
                           f"active={1 if sl['active'] else 0}{div}")
+
+    def emit_client_status(self, conn):
+        # MultiFlex GUI-client advert. Real format (SmartSDR/FlexLib):
+        #   client 0x<handle> connected station=<name> program=<prog> local_ptt=0
+        # The CTR2-Max waits for a station to bind to before sending commands.
+        station = self.gui_station or "FlexSim"
+        self.status(conn, f"client 0x{self.handle_hex} connected "
+                          f"station={station} program={self.gui_program} "
+                          f"local_ptt=0 client_id={CLIENT_ID}")
+        log(f"[->] client status: station={station} program={self.gui_program}")
 
     def emit_radio_status(self, conn):
         # Capability advert. AE computes MaxSlices/SlicesRemaining from the radio status;
