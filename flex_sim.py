@@ -1880,11 +1880,27 @@ class Radio:
             # prime path still works as a fallback (e.g. WSL2 separate stacks).
             try:
                 up = int(c.split()[-1])
-                if self.ae_peer_ip and not self.vita_dest:
-                    self.vita_dest = (self.ae_peer_ip, up)
-                    log(f"[udp] VITA dest from client udpport: {self.vita_dest}")
+                try: _ip = conn.getpeername()[0]
+                except Exception: _ip = self.ae_peer_ip
+                info = self.client_info.get(conn)
+                if info is not None:
+                    info["udpport"] = up
+                # MultiFlex: whoever announced FIRST used to win, and with a
+                # controller connected that was the CTR2 -- the panadapter stream
+                # went to its port and AetherSDR's waterfall stayed blank
+                # ("no VITA-49 UDP data received after 10s", udpSeen=false).
+                # The VITA stream belongs to the GUI client: it is the one that
+                # renders it, and a HID-relayed controller cannot consume 20 fps
+                # of panadapter data anyway. A GUI client's port therefore always
+                # takes precedence; a non-GUI client only seeds it if nothing else
+                # has.
+                is_gui = bool(info and info.get("gui"))
+                if _ip and (is_gui or not self.vita_dest):
+                    self.vita_dest = (_ip, up)
+                    log(f"[udp] VITA dest from client udpport: {self.vita_dest}"
+                        f" ({'GUI' if is_gui else 'non-GUI'})")
                 else:
-                    log("[tcp] AE udpport =", up)
+                    log("[tcp] client udpport =", up, "(not adopted)")
             except ValueError:
                 pass
             self.reply(conn, seq)
