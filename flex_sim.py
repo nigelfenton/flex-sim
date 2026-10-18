@@ -1308,6 +1308,8 @@ class Radio:
         self._next_tnf_id = 1
         self.active_slice = 0       # the slice the pan/waterfall/primary carrier follow
         self.conn = None            # active TCP conn (so the control panel can push TX status)
+        self.clients = set()        # every live client conn (MultiFlex: AE + CTR2 + ...)
+        self.clients_lock = threading.Lock()
         self.tx_mox = False         # live: TX keyed (panel toggle or AE's 'transmit set mox=1')
         # --txlog: characterise UDP arriving FROM AE (TX audio discovery).
         self.txlog = False
@@ -1578,24 +1580,54 @@ class Radio:
     def serve(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((self.ip, self.port)); srv.listen(1)   # bind our own IP (rack: each radio a distinct IP)
+        srv.bind((self.ip, self.port)); srv.listen(8)   # bind our own IP (rack: each radio a distinct IP)
         log(f"[tcp] listening on :{self.port}  (radio ip {self.ip}, pattern={self.pattern})")
         while self.run:
             conn, addr = srv.accept()
-            log(f"[tcp] AE connected from {addr}")
+            # MultiFlex: a real radio serves several GUI clients at once, and the
+            # CTR2-Max opens its OWN session alongside AetherSDR's. Serving them
+            # inline (the old 'self.handle(conn)' here) left every later connection
+            # accepted by the kernel but never read -- visible as a growing Recv-Q
+            # in 'ss -tn' while only the first peer was ever logged.
+            threading.Thread(target=self._serve_one, args=(conn, addr),
+                             daemon=True).start()
+
+    def _serve_one(self, conn, addr):
+        # One client session. The radio's own state (slices, pans, handle) stays
+        # SHARED on purpose: for a bench sim both clients seeing the same slices is
+        # the useful behaviour, and it keeps every existing client_handle=...
+        # attribution working untouched.
+        with self.clients_lock:
+            self.clients.add(conn)
+            first = len(self.clients) == 1
+        log(f"[tcp] client connected from {addr} (now {len(self.clients)})")
+        if first:
             self.ae_peer_ip = addr[0]; self.vita_dest = None
-            try: self.handle(conn)
-            except Exception as e: log("[tcp] conn error:", e)
-            finally:
-                conn.close()
-                self.streaming = False; self.ae_peer_ip = None; self.conn = None; self.vita_dest = None
+        try: self.handle(conn)
+        except Exception as e: log("[tcp] conn error:", e)
+        finally:
+            conn.close()
+            with self.clients_lock:
+                self.clients.discard(conn)
+                last = not self.clients
+            log(f"[tcp] client {addr} gone ({len(self.clients)} left)")
+            if self.conn is conn:
+                self.conn = next(iter(self.clients), None)
+            # Only tear the radio down when the LAST client leaves, otherwise one
+            # client disconnecting would clear the other's slices mid-session.
+            if last:
+                self.streaming = False; self.ae_peer_ip = None; self.conn = None
+                self.vita_dest = None
                 self.audio_stop.set(); self.audio_stream_id = None; self.dax_channel = None
-                # Free this client's receivers/panadapters on disconnect, like a real radio.
-                # Without it, stale slices/pans pile up across reconnects and the slice
-                # lettering drifts (A -> B -> C on each new connection).
+                # Free receivers/panadapters on disconnect, like a real radio.
+                # Without it, stale slices/pans pile up across reconnects and the
+                # slice lettering drifts (A -> B -> C on each new connection).
                 self.slices.clear(); self.pans.clear(); self.pan_seq = 0; self.active_slice = 0
 
     def handle(self, conn):
+        # 'self.conn' is the push target for unsolicited status (control panel TX,
+        # CWX). With several clients it tracks the most recent one; broadcast_status()
+        # is what reaches them all.
         self.conn = conn
         with self.send_lock:
             conn.sendall(f"V{VERSION}\n".encode())
@@ -1618,6 +1650,16 @@ class Radio:
     def status(self, conn, obj_kvs):
         with self.send_lock:
             conn.sendall(f"S{self.handle_hex}|{obj_kvs}\n".encode())
+
+    def broadcast_status(self, obj_kvs):
+        # Send one status line to EVERY connected client. A real radio's status
+        # stream is per-radio, not per-connection: when a slice moves, every GUI
+        # client hears about it.
+        with self.clients_lock:
+            targets = list(self.clients)
+        for c in targets:
+            try: self.status(c, obj_kvs)
+            except Exception: pass
 
     def on_line(self, conn, line):
         if not line.startswith("C") or "|" not in line:
