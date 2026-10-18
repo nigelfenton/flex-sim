@@ -1750,7 +1750,14 @@ class Radio:
             self.reply(conn, seq)
             if target:
                 # Confirm the bind on the TARGET's handle, as a real radio does.
-                self.status(conn, f"client 0x{target['handle']} connected "
+                # Name the handle that OWNS the slices (the radio/GUI handle),
+                # not the synthetic one used to advertise the peer. AetherSDR
+                # needs the ADVERTISED peer handle to differ from its own or it
+                # never registers a MultiFlex client; the controller needs slice
+                # ownership to match what it bound to. Those are different
+                # fields, so the bind confirmation points it at the owning
+                # handle while the client list keeps the distinct one.
+                self.status(conn, f"client 0x{self.handle_hex} connected "
                                   f"station={target.get('station') or 'FlexSim'} "
                                   f"program={target.get('program') or 'SmartSDR'} "
                                   f"local_ptt=0 client_id={want} bound_client_id={want}",
@@ -2296,7 +2303,7 @@ class Radio:
                f" diversity_parent={1 if sl.get('div_parent') else 0}"
                f" diversity_child={1 if sl.get('div_child') else 0}"
                f" diversity_index={sl.get('div_index', -1)}")
-        self.status(conn, f"slice {idx} client_handle=0x{self.gui_owner_handle()} pan=0x{pid:08X} "
+        self.status(conn, f"slice {idx} client_handle=0x{self.handle_hex} pan=0x{pid:08X} "
                           f"RF_frequency={sl['freq']:.6f} mode={sl['mode']} in_use=1 "
                           f"tx={1 if sl.get('tx') else 0} "
                           f"active={1 if sl['active'] else 0}{div}")
@@ -2472,7 +2479,7 @@ class Radio:
         try:
             self.status(self.conn,
                 f"interlock state={'TRANSMITTING' if on else 'READY'} source=SW "
-                f"tx_client_handle=0x{self.gui_owner_handle()}")
+                f"tx_client_handle=0x{self.handle_hex}")
             self.status(self.conn,
                 f"transmit mox={1 if self.tx_mox else 0} tune={1 if self.tx_tune else 0} "
                 f"freq={self.slice_freq:.6f} rfpower={int(self.tx_power_w)} "
