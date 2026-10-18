@@ -1616,7 +1616,7 @@ class Radio:
             self._next_cl_handle += 1
             self.client_info[conn] = {
                 "station": "", "program": "",
-                "handle": self.handle_hex,
+                "handle": f"{self.client_handle + self._next_cl_handle:08X}",
                 "gui": False,
             }
         log(f"[tcp] client connected from {addr} (now {len(self.clients)})")
@@ -2152,12 +2152,12 @@ class Radio:
         if not pan: return
         wid, cfreq = pan["wf_id"], self._pan_center(pid)
         self.status(conn,
-            f"display pan 0x{pid:08X} client_handle=0x{self.handle_hex} waterfall=0x{wid:08X} "
+            f"display pan 0x{pid:08X} client_handle=0x{self.gui_owner_handle()} waterfall=0x{wid:08X} "
             f"center={cfreq:.6f} bandwidth={self.span_mhz:.6f} min_dbm={self.min_dbm:.0f} "
             f"max_dbm={self.max_dbm:.0f} x_pixels={self.bins} y_pixels={self.y_pixels} fps={self.fps} "
             f"ant_list=ANT1 rxant=ANT1")
         self.status(conn,
-            f"display waterfall 0x{wid:08X} client_handle=0x{self.handle_hex} panadapter=0x{pid:08X} "
+            f"display waterfall 0x{wid:08X} client_handle=0x{self.gui_owner_handle()} panadapter=0x{pid:08X} "
             f"line_duration=100 center={cfreq:.6f} bandwidth={self.span_mhz:.6f} "
             f"auto_black=1 black_level=15 color_gain=50")
         log(f"[->] pan 0x{pid:08X} / wf 0x{wid:08X} status @ {cfreq:.5f}")
@@ -2280,7 +2280,7 @@ class Radio:
                f" diversity_parent={1 if sl.get('div_parent') else 0}"
                f" diversity_child={1 if sl.get('div_child') else 0}"
                f" diversity_index={sl.get('div_index', -1)}")
-        self.status(conn, f"slice {idx} client_handle=0x{self.handle_hex} pan=0x{pid:08X} "
+        self.status(conn, f"slice {idx} client_handle=0x{self.gui_owner_handle()} pan=0x{pid:08X} "
                           f"RF_frequency={sl['freq']:.6f} mode={sl['mode']} in_use=1 "
                           f"tx={1 if sl.get('tx') else 0} "
                           f"active={1 if sl['active'] else 0}{div}")
@@ -2308,7 +2308,32 @@ class Radio:
                               f"client_id={info['client_id']}",
                         only=True)
             sent += 1
-        log(f"[->] client list -> {sent} station(s)")
+        if sent == 0:
+            with self.clients_lock:
+                _dump = [(i.get('program'), i.get('station'), i.get('client_id'))
+                         for i in self.client_info.values()]
+            log(f"[->] client list -> 0 station(s)  known={_dump}")
+        else:
+            log(f"[->] client list -> {sent} station(s)")
+
+    def gui_owner_handle(self):
+        # The handle that OWNS slices, panadapters and the TX slice: the GUI
+        # client's, not the radio's.
+        #
+        # AetherSDR only registers a MultiFlex peer when the advertised client
+        # handle DIFFERS from the radio handle -- its log prints
+        # "noted Multi-Flex client connect ... handle=0x1a2b3c4f" for 0x..4F and
+        # nothing at all for 0x..4D. So the client record must keep its own
+        # handle. But a bound controller then filters out every slice stamped
+        # with the RADIO handle, which is why the CTR2-Max drew its operate
+        # screen with --.---.--- and an empty S-meter.
+        #
+        # Both are satisfied by stamping ownership with the GUI client's handle.
+        with self.clients_lock:
+            for i in self.client_info.values():
+                if i.get("gui") and i.get("station"):
+                    return i["handle"]
+        return self.handle_hex          # no GUI client yet: fall back to the radio
 
     def broadcast_client_status(self):
         # Whenever any client's identity changes, tell EVERY client. This is what
@@ -2427,7 +2452,7 @@ class Radio:
         try:
             self.status(self.conn,
                 f"interlock state={'TRANSMITTING' if on else 'READY'} source=SW "
-                f"tx_client_handle=0x{self.handle_hex}")
+                f"tx_client_handle=0x{self.gui_owner_handle()}")
             self.status(self.conn,
                 f"transmit mox={1 if self.tx_mox else 0} tune={1 if self.tx_tune else 0} "
                 f"freq={self.slice_freq:.6f} rfpower={int(self.tx_power_w)} "
