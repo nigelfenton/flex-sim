@@ -91,6 +91,8 @@ SERIAL_PREFIX = _default_serial_prefix()   # serial = <prefix><radio_id:02d>; --
                                            # (pass --serial FLEXSIM for the pre-2026-07-31 default)
                              # -> set e.g. 5992 to run on the SAME host as AE without a :4992 clash
 HANDLE = 0x1A2B3C4D
+# Stable GUI-client id for the simulated client (real radios use a UUID).
+CLIENT_ID = "00000000-0000-4000-8000-0000F1E55100"
 HANDLE_HEX = f"{HANDLE:08X}"
 PAN_ID = 0x40000000          # FFT stream id   (PCC 0x8003)
 WF_ID  = 0x42000000          # waterfall id    (PCC 0x8004)
@@ -1307,6 +1309,13 @@ class Radio:
         self.serial = f"{serial_prefix}{radio_id:02d}"
         self.client_handle = HANDLE + radio_id   # NB: NOT self.handle — that's the method!
         self.handle_hex = f"{self.client_handle:08X}"
+        # MultiFlex GUI-client identity. A real Flex registers each GUI client and
+        # broadcasts a 'client <handle> connected ...' status carrying its station
+        # name; the CTR2-Max waits for that before it will send ANY command, which
+        # is why knobs registered on its own display but produced no traffic.
+        self.gui_station = ""          # set by 'client station <name>'
+        self.gui_program = "AetherSDR" # set by 'client program <name>'
+        self.gui_registered = False    # True once 'client gui' has run
         self.pan_id = PAN_ID + radio_id * 16     # FFT stream-id BASE; AE stacks a panadapter per +RX,
         self.wf_id = WF_ID + radio_id * 16       # waterfall base. pan k -> base+k (16 ids/radio, no overlap)
         self.pans = {}                           # pan_id -> {"wf_id":int,"slice":global_idx|None,"y_pixels":int}
@@ -1339,6 +1348,14 @@ class Radio:
         self._next_tnf_id = 1
         self.active_slice = 0       # the slice the pan/waterfall/primary carrier follow
         self.conn = None            # active TCP conn (so the control panel can push TX status)
+        self.clients = set()        # every live client conn (MultiFlex: AE + CTR2 + ...)
+        self.clients_lock = threading.Lock()
+        # Per-CONNECTION GUI-client identity. This must NOT be radio-global: the
+        # CTR2-Max subscribes with 'sub client all' and waits to see ANOTHER
+        # client's station (AetherSDR's). Sharing one station/program field meant
+        # the CTR2 was told about itself and waited forever.
+        self.client_info = {}       # conn -> {"station","program","handle","gui"}
+        self._next_cl_handle = 1
         self.tx_mox = False         # live: TX keyed (panel toggle or AE's 'transmit set mox=1')
         # --txlog: characterise UDP arriving FROM AE (TX audio discovery).
         self.txlog = False
@@ -1746,21 +1763,62 @@ class Radio:
     def serve(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((self.ip, self.port)); srv.listen(1)   # bind our own IP (rack: each radio a distinct IP)
+        srv.bind((self.ip, self.port)); srv.listen(8)   # bind our own IP (rack: each radio a distinct IP)
         log(f"[tcp] listening on :{self.port}  (radio ip {self.ip}, pattern={self.pattern})")
         while self.run:
             conn, addr = srv.accept()
-            log(f"[tcp] AE connected from {addr}")
+            # MultiFlex: a real radio serves several GUI clients at once, and the
+            # CTR2-Max opens its OWN session alongside AetherSDR's. Serving them
+            # inline (the old 'self.handle(conn)' here) left every later connection
+            # accepted by the kernel but never read -- visible as a growing Recv-Q
+            # in 'ss -tn' while only the first peer was ever logged.
+            threading.Thread(target=self._serve_one, args=(conn, addr),
+                             daemon=True).start()
+
+    def _serve_one(self, conn, addr):
+        # One client session. The radio's own state (slices, pans, handle) stays
+        # SHARED on purpose: for a bench sim both clients seeing the same slices is
+        # the useful behaviour, and it keeps every existing client_handle=...
+        # attribution working untouched.
+        with self.clients_lock:
+            self.clients.add(conn)
+            first = len(self.clients) == 1
+            # IMPORTANT: a GUI client's handle must be the handle that OWNS the
+            # slices, i.e. the radio's own handle. Minting a per-connection handle
+            # here broke the correspondence: the CTR2 bound to a client whose
+            # handle was 0x..4F while slice status was stamped 0x..4D, so it
+            # filtered every slice out and sat on a populated-but-empty screen.
+            # Non-GUI clients (the CTR2 itself) never own slices, so sharing the
+            # handle is harmless for them.
+            self._next_cl_handle += 1
+            self.client_info[conn] = {
+                "station": "", "program": "",
+                "handle": f"{self.client_handle + self._next_cl_handle:08X}",
+                "gui": False,
+            }
+        log(f"[tcp] client connected from {addr} (now {len(self.clients)})")
+        if first:
             self.ae_peer_ip = addr[0]; self.vita_dest = None
-            try: self.handle(conn)
-            except Exception as e: log("[tcp] conn error:", e)
-            finally:
-                conn.close()
-                self.streaming = False; self.ae_peer_ip = None; self.conn = None; self.vita_dest = None
+        try: self.handle(conn)
+        except Exception as e: log("[tcp] conn error:", e)
+        finally:
+            conn.close()
+            with self.clients_lock:
+                self.clients.discard(conn)
+                self.client_info.pop(conn, None)
+                last = not self.clients
+            log(f"[tcp] client {addr} gone ({len(self.clients)} left)")
+            if self.conn is conn:
+                self.conn = next(iter(self.clients), None)
+            # Only tear the radio down when the LAST client leaves, otherwise one
+            # client disconnecting would clear the other's slices mid-session.
+            if last:
+                self.streaming = False; self.ae_peer_ip = None; self.conn = None
+                self.vita_dest = None
                 self.audio_stop.set(); self.audio_stream_id = None; self.dax_channel = None
-                # Free this client's receivers/panadapters on disconnect, like a real radio.
-                # Without it, stale slices/pans pile up across reconnects and the slice
-                # lettering drifts (A -> B -> C on each new connection).
+                # Free receivers/panadapters on disconnect, like a real radio.
+                # Without it, stale slices/pans pile up across reconnects and the
+                # slice lettering drifts (A -> B -> C on each new connection).
                 self.slices.clear(); self.pans.clear(); self.pan_seq = 0; self.active_slice = 0
                 # The client that keyed is gone, and so is its TX slice: unkey, as a real
                 # radio does. Left keyed, the next client inherited a carrier nobody owned.
@@ -1771,6 +1829,9 @@ class Radio:
                     log("[tx] client disconnected while keyed -> unkeyed")
 
     def handle(self, conn):
+        # 'self.conn' is the push target for unsolicited status (control panel TX,
+        # CWX). With several clients it tracks the most recent one; broadcast_status()
+        # is what reaches them all.
         self.conn = conn
         with self.send_lock:
             conn.sendall(f"V{self.fw_version}\n".encode())
@@ -1790,24 +1851,130 @@ class Radio:
         with self.send_lock:
             conn.sendall(f"R{seq}|{code:X}|{body}\n".encode())
 
-    def status(self, conn, obj_kvs):
-        with self.send_lock:
-            conn.sendall(f"S{self.handle_hex}|{obj_kvs}\n".encode())
+    def status(self, conn, obj_kvs, only=False):
+        # A real radio's status stream is PER-RADIO: when a slice moves or a
+        # meter updates, EVERY bound client hears it. The emit_* helpers all
+        # funnel through here, so fanning out here covers them in one place.
+        #
+        # Without this a second client (the CTR2-Max) got the one-off snapshot
+        # sent at bind time and then silence -- it came off its splash screen
+        # and sat there locked, while AetherSDR's slice/tx updates went only
+        # to AetherSDR.
+        #
+        # only=True targets just this conn, for genuinely per-client replies.
+        with self.clients_lock:
+            targets = [conn] if only else (list(self.clients) or [conn])
+        _payload = f"S{self.handle_hex}|{obj_kvs}\n".encode()
+        for _t in targets:
+            try:
+                with self.send_lock:
+                    _t.sendall(_payload)
+            except Exception:
+                pass
+
+    def broadcast_status(self, obj_kvs):
+        # Send one status line to EVERY connected client. A real radio's status
+        # stream is per-radio, not per-connection: when a slice moves, every GUI
+        # client hears about it.
+        with self.clients_lock:
+            targets = list(self.clients)
+        for c in targets:
+            try: self.status(c, obj_kvs)
+            except Exception: pass
 
     def on_line(self, conn, line):
         if not line.startswith("C") or "|" not in line:
             log("[<-] (non-C)", line); return
         head, cmd = line.split("|", 1)
         seq, c = head[1:], cmd.strip()
-        log("[<-]", f"C{seq}|{c}")
+        try: _pp = conn.getpeername()[1]
+        except Exception: _pp = 0
+        log("[<-]", f"(:{_pp}) C{seq}|{c}")
         if c.startswith("client gui"):
-            self.reply(conn, seq, str(uuid.uuid4()).upper())
+            # 'client gui' may carry a client id: 'client gui <uuid>'. Echo the
+            # supplied one if present, else mint one, like a real radio.
+            parts_gui = c.split()
+            cid = parts_gui[2].upper() if len(parts_gui) > 2 else str(uuid.uuid4()).upper()
+            self.gui_registered = True
+            info = self.client_info.get(conn)
+            if info is not None:
+                info["gui"] = True
+                info["client_id"] = cid
+            self.reply(conn, seq, cid)
+            # Broadcast AFTER the id is recorded: a subscriber that asked before
+            # this point was told '0 station(s)' and needs the update to arrive.
+            self.broadcast_client_status()
+        elif c.startswith("client station"):
+            # 'client station <name>' = FlexLib SetClientStationName. Store it and
+            # re-broadcast, so subscribers to 'sub client all' learn the station.
+            name = c[len("client station"):].strip()
+            self.gui_station = name
+            info = self.client_info.get(conn)
+            if info is not None:
+                info["station"] = name
+                info["gui"] = True      # only a GUI client names a station
+            self.reply(conn, seq)
+            self.broadcast_client_status()
+            log(f"[client] station={name!r} (:{_pp})")
+        elif c.startswith("client bind"):
+            # 'client bind client_id=<uuid>' -- MultiFlex: a non-GUI client (the
+            # CTR2-Max) binds itself to an EXISTING GUI client's session so that
+            # slice/tx/meter status it receives is that station's. Real radios
+            # answer OK and then report the binding on the bound client's handle.
+            kvb = parse_kvs(c)
+            want = (kvb.get("client_id") or "").upper()
+            target = None
+            with self.clients_lock:
+                for _c, i in self.client_info.items():
+                    if (i.get("client_id") or "").upper() == want:
+                        target = dict(i); break
+            info = self.client_info.get(conn)
+            if info is not None:
+                info["bound_to"] = want
+            self.reply(conn, seq)
+            if target:
+                # Confirm the bind on the TARGET's handle, as a real radio does.
+                # Name the handle that OWNS the slices (the radio/GUI handle),
+                # not the synthetic one used to advertise the peer. AetherSDR
+                # needs the ADVERTISED peer handle to differ from its own or it
+                # never registers a MultiFlex client; the controller needs slice
+                # ownership to match what it bound to. Those are different
+                # fields, so the bind confirmation points it at the owning
+                # handle while the client list keeps the distinct one.
+                self.status(conn, f"client 0x{self.handle_hex} connected "
+                                  f"station={target.get('station') or 'FlexSim'} "
+                                  f"program={target.get('program') or 'SmartSDR'} "
+                                  f"local_ptt=0 client_id={want} bound_client_id={want}",
+                            only=True)
+                log(f"[client] bind OK (:{_pp}) -> station={target.get('station')!r}")
+                # A freshly bound client has no state yet: give it the radio and
+                # every existing slice, or it sits on its home screen waiting.
+                self.emit_radio_status(conn)
+                for idx in list(self.slices):
+                    try: self.emit_slice_status(conn, idx)
+                    except Exception: pass
+            else:
+                log(f"[client] bind FAILED (:{_pp}) - no client_id {want}")
+        elif c.startswith("client program"):
+            name = c[len("client program"):].strip()
+            self.gui_program = name
+            info = self.client_info.get(conn)
+            if info is not None:
+                info["program"] = name
+            self.reply(conn, seq)
+            self.broadcast_client_status()
+            log(f"[client] program={name!r} (:{_pp})")
         elif c.startswith("client set"):
             if "send_reduced_bw_dax=1" in c:
                 self.audio_reduced_bw = True
             elif "send_reduced_bw_dax=0" in c:
                 self.audio_reduced_bw = False
             self.reply(conn, seq)
+        elif c.startswith("sub client"):
+            # AE subscribes with 'sub client all'; a real radio answers with the
+            # current GUI-client list. Without this the CTR2 never sees a station.
+            self.reply(conn, seq)
+            self.send_client_list(conn)
         elif c == "slice list":
             self.reply(conn, seq, "")
         elif c.startswith("display panafall create") or c.startswith("display pan create"):
@@ -1943,11 +2110,27 @@ class Radio:
             # prime path still works as a fallback (e.g. WSL2 separate stacks).
             try:
                 up = int(c.split()[-1])
-                if self.ae_peer_ip and not self.vita_dest:
-                    self.vita_dest = (self.ae_peer_ip, up)
-                    log(f"[udp] VITA dest from client udpport: {self.vita_dest}")
+                try: _ip = conn.getpeername()[0]
+                except Exception: _ip = self.ae_peer_ip
+                info = self.client_info.get(conn)
+                if info is not None:
+                    info["udpport"] = up
+                # MultiFlex: whoever announced FIRST used to win, and with a
+                # controller connected that was the CTR2 -- the panadapter stream
+                # went to its port and AetherSDR's waterfall stayed blank
+                # ("no VITA-49 UDP data received after 10s", udpSeen=false).
+                # The VITA stream belongs to the GUI client: it is the one that
+                # renders it, and a HID-relayed controller cannot consume 20 fps
+                # of panadapter data anyway. A GUI client's port therefore always
+                # takes precedence; a non-GUI client only seeds it if nothing else
+                # has.
+                is_gui = bool(info and info.get("gui"))
+                if _ip and (is_gui or not self.vita_dest):
+                    self.vita_dest = (_ip, up)
+                    log(f"[udp] VITA dest from client udpport: {self.vita_dest}"
+                        f" ({'GUI' if is_gui else 'non-GUI'})")
                 else:
-                    log("[tcp] AE udpport =", up)
+                    log("[tcp] client udpport =", up, "(not adopted)")
             except ValueError:
                 pass
             self.reply(conn, seq)
@@ -2416,6 +2599,69 @@ class Radio:
                           f"RF_frequency={sl['freq']:.6f} mode={sl['mode']} in_use=1 "
                           f"tx={1 if sl.get('tx') else 0} "
                           f"active={1 if sl['active'] else 0}{div}{dsp}{rate}")
+
+    def send_client_list(self, conn):
+        # Answer 'sub client all' with EVERY known GUI client, one status line each.
+        # The CTR2-Max subscribes and then waits for a station that is not its own,
+        # so a client must be able to see the OTHERS -- not just itself.
+        with self.clients_lock:
+            items = [(c, dict(i)) for c, i in self.client_info.items()]
+        sent = 0
+        for _c, info in items:
+            if not info.get("station"):
+                continue                      # nothing to advertise yet
+            # Only advertise a client whose REAL id we know. 'client_id' is set by
+            # 'client gui <uuid>'; if station arrives first, falling back to the
+            # CLIENT_ID placeholder advertised an id that binds to nothing, and the
+            # CTR2 either bound to a dead id or never sent 'client bind' at all.
+            if not info.get("client_id"):
+                continue
+            self.status(conn, f"client 0x{info['handle']} connected "
+                              f"station={info['station']} "
+                              f"program={info.get('program') or 'SmartSDR'} "
+                              f"local_ptt=0 "
+                              f"client_id={info['client_id']}",
+                        only=True)
+            sent += 1
+        if sent == 0:
+            with self.clients_lock:
+                _dump = [(i.get('program'), i.get('station'), i.get('client_id'))
+                         for i in self.client_info.values()]
+            log(f"[->] client list -> 0 station(s)  known={_dump}")
+        else:
+            log(f"[->] client list -> {sent} station(s)")
+
+    # NB: display pan / waterfall deliberately keep the RADIO handle. Re-stamping
+    # them with the GUI client's handle stopped AetherSDR rendering its own
+    # waterfall (observed 2026-10-18). Only the SLICE and the TX slice need the
+    # GUI client's handle for a bound controller to accept them.
+    def gui_owner_handle(self):
+        # The handle that OWNS slices, panadapters and the TX slice: the GUI
+        # client's, not the radio's.
+        #
+        # AetherSDR only registers a MultiFlex peer when the advertised client
+        # handle DIFFERS from the radio handle -- its log prints
+        # "noted Multi-Flex client connect ... handle=0x1a2b3c4f" for 0x..4F and
+        # nothing at all for 0x..4D. So the client record must keep its own
+        # handle. But a bound controller then filters out every slice stamped
+        # with the RADIO handle, which is why the CTR2-Max drew its operate
+        # screen with --.---.--- and an empty S-meter.
+        #
+        # Both are satisfied by stamping ownership with the GUI client's handle.
+        with self.clients_lock:
+            for i in self.client_info.values():
+                if i.get("gui") and i.get("station"):
+                    return i["handle"]
+        return self.handle_hex          # no GUI client yet: fall back to the radio
+
+    def broadcast_client_status(self):
+        # Whenever any client's identity changes, tell EVERY client. This is what
+        # lets a late subscriber (the CTR2) learn that AetherSDR holds a station.
+        with self.clients_lock:
+            targets = list(self.clients)
+        for t in targets:
+            try: self.send_client_list(t)
+            except Exception: pass
 
     def emit_radio_status(self, conn):
         # Capability advert. AE computes MaxSlices/SlicesRemaining from the radio status;
