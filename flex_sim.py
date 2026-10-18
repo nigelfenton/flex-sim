@@ -1660,9 +1660,26 @@ class Radio:
         with self.send_lock:
             conn.sendall(f"R{seq}|{code:X}|{body}\n".encode())
 
-    def status(self, conn, obj_kvs):
-        with self.send_lock:
-            conn.sendall(f"S{self.handle_hex}|{obj_kvs}\n".encode())
+    def status(self, conn, obj_kvs, only=False):
+        # A real radio's status stream is PER-RADIO: when a slice moves or a
+        # meter updates, EVERY bound client hears it. The emit_* helpers all
+        # funnel through here, so fanning out here covers them in one place.
+        #
+        # Without this a second client (the CTR2-Max) got the one-off snapshot
+        # sent at bind time and then silence -- it came off its splash screen
+        # and sat there locked, while AetherSDR's slice/tx updates went only
+        # to AetherSDR.
+        #
+        # only=True targets just this conn, for genuinely per-client replies.
+        with self.clients_lock:
+            targets = [conn] if only else (list(self.clients) or [conn])
+        _payload = f"S{self.handle_hex}|{obj_kvs}\n".encode()
+        for _t in targets:
+            try:
+                with self.send_lock:
+                    _t.sendall(_payload)
+            except Exception:
+                pass
 
     def broadcast_status(self, obj_kvs):
         # Send one status line to EVERY connected client. A real radio's status
@@ -1727,7 +1744,8 @@ class Radio:
                 self.status(conn, f"client 0x{target['handle']} connected "
                                   f"station={target.get('station') or 'FlexSim'} "
                                   f"program={target.get('program') or 'SmartSDR'} "
-                                  f"local_ptt=0 client_id={want} bound_client_id={want}")
+                                  f"local_ptt=0 client_id={want} bound_client_id={want}",
+                            only=True)
                 log(f"[client] bind OK (:{_pp}) -> station={target.get('station')!r}")
                 # A freshly bound client has no state yet: give it the radio and
                 # every existing slice, or it sits on its home screen waiting.
@@ -2272,7 +2290,8 @@ class Radio:
                               f"station={info['station']} "
                               f"program={info.get('program') or 'SmartSDR'} "
                               f"local_ptt=0 "
-                              f"client_id={info.get('client_id', CLIENT_ID)}")
+                              f"client_id={info.get('client_id', CLIENT_ID)}",
+                        only=True)
             sent += 1
         log(f"[->] client list -> {sent} station(s)")
 
