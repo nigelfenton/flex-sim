@@ -1606,10 +1606,17 @@ class Radio:
         with self.clients_lock:
             self.clients.add(conn)
             first = len(self.clients) == 1
+            # IMPORTANT: a GUI client's handle must be the handle that OWNS the
+            # slices, i.e. the radio's own handle. Minting a per-connection handle
+            # here broke the correspondence: the CTR2 bound to a client whose
+            # handle was 0x..4F while slice status was stamped 0x..4D, so it
+            # filtered every slice out and sat on a populated-but-empty screen.
+            # Non-GUI clients (the CTR2 itself) never own slices, so sharing the
+            # handle is harmless for them.
             self._next_cl_handle += 1
             self.client_info[conn] = {
                 "station": "", "program": "",
-                "handle": f"{self.client_handle + self._next_cl_handle:08X}",
+                "handle": self.handle_hex,
                 "gui": False,
             }
         log(f"[tcp] client connected from {addr} (now {len(self.clients)})")
@@ -1710,6 +1717,8 @@ class Radio:
                 info["gui"] = True
                 info["client_id"] = cid
             self.reply(conn, seq, cid)
+            # Broadcast AFTER the id is recorded: a subscriber that asked before
+            # this point was told '0 station(s)' and needs the update to arrive.
             self.broadcast_client_status()
         elif c.startswith("client station"):
             # 'client station <name>' = FlexLib SetClientStationName. Store it and
@@ -2286,11 +2295,17 @@ class Radio:
         for _c, info in items:
             if not info.get("station"):
                 continue                      # nothing to advertise yet
+            # Only advertise a client whose REAL id we know. 'client_id' is set by
+            # 'client gui <uuid>'; if station arrives first, falling back to the
+            # CLIENT_ID placeholder advertised an id that binds to nothing, and the
+            # CTR2 either bound to a dead id or never sent 'client bind' at all.
+            if not info.get("client_id"):
+                continue
             self.status(conn, f"client 0x{info['handle']} connected "
                               f"station={info['station']} "
                               f"program={info.get('program') or 'SmartSDR'} "
                               f"local_ptt=0 "
-                              f"client_id={info.get('client_id', CLIENT_ID)}",
+                              f"client_id={info['client_id']}",
                         only=True)
             sent += 1
         log(f"[->] client list -> {sent} station(s)")
