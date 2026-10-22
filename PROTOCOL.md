@@ -197,3 +197,28 @@ SmartSDR v4.3.16 (released 2026-10-13, FlexLib 4.3.16.42034) changed parts of th
 **Not covered:** SmartLink WAN sessions, and anything 8000/Aurora-only (AutoDX, NTP, Noise Floor Range).
 
 **Checked against a real AE:** the #6292 build connected to a `--firmware 4.3` sim, showed version 4.3.16.42034, and took `ptt_mic_override` in the transmit status without complaint (2026-10-14).
+
+## 13. Multiple clients (MultiFlex + non-GUI controllers) — 2026-10-21
+
+A real radio serves several API clients at once. The case that drove this is a front-panel controller (a CTR2-Max running custom firmware) reaching the radio through AetherSDR's CTR2 USB relay: AE opens a **second, dedicated TCP connection** to the radio and relays the controller's Flex API bytes unchanged. Single-client, the sim never answered it. Pinned by `tests/test_multiclient.py`.
+
+1. **One thread per TCP connection.** Each gets `V<version>` and its **own** `H<handle>`, and has its own send lock. The first connection keeps the long-standing handle (`0x1A2B3C4D` + radio id), so a lone client sees exactly what it always did; later ones step in bit 20 (`0x1A3B3C4D`, …). Status lines are sent as `S<recipient's handle>|…`.
+2. **Shared radio state stays single** (slices, pans, TX, TNFs), serialised by one lock around command handling. Each slice and pan records its **owner**, and its status always carries `client_handle=<owner>`, whichever client caused the change.
+3. **Who gets a status line.** Status for a shared object goes to the client whose command caused it, the primary GUI client, and every client that sent `sub <topic> …` for it (`slice`, `pan`, `tx` for transmit and interlock, `meter`, `client`, `cwx`, `apd`, `tnf`, `amplifier`, `license`). Answers to a `sub` go only to the subscriber. `sub slice all` and `sub client all` report what already exists; `sub meter all` sends meter definitions once a slice exists.
+4. **GUI and non-GUI clients.** A client that sends `client gui [<id>]` is a GUI client. The reply is its `client_id`, which is the id it offered (AE persists it) or a new UUID. It is then reported to `client` subscribers as `client 0x<handle> connected local_ptt=<0|1> client_id=<uuid> program=<program> station=<station>`, again after `client station`/`client program`, and as `client 0x<handle> disconnected forced=0 wan_validation_failed=0 duplicate_client_id=0` when it leaves. Spaces in program/station are sent as `0x7F`. A client that never sends `client gui` is non-GUI and is never reported.
+5. **`client bind client_id=<uuid>`** (FlexLib `Radio.BindGUIClient`) binds a non-GUI client to that GUI client. Objects it creates (`slice create`, pans) then belong to the GUI client, and `slice list` lists the GUI client's slices. It can drive any slice: `slice tune N <MHz>`, `slice set N mode=…`, `slice set N audio_level=|audio_pan=|agc_mode=|agc_threshold=`, `filt N <lo> <hi>` (reported as `filter_lo=`/`filter_hi=`), and `xmit 0|1` / `transmit set mox=`. A `mode=`, `audio_level=` (etc.) or `filt` change is echoed as slice status to everyone, so the GUI client follows the panel.
+6. **The primary client** gets the spectrum, waterfall, meter and audio streams (`vita_dest`). It is the first connection until a client sends `client gui`; if the first connection was not a GUI client, the GUI client takes over. When the primary leaves, the next GUI client, if any, becomes primary. Its streams restart when it creates a panadapter.
+7. **TX ownership.** `tx_client_handle=` in the interlock status is the owner of the TX slice. With no slices it is the bound GUI client of whoever keyed, or the primary client.
+8. **Disconnect is per client.** Only the leaving client's own slices (`slice N in_use=0` to the others) and pans are removed. TX is unkeyed only if that client keyed it or owns the TX slice. A lone client therefore gets the old behaviour: everything is cleared and TX is unkeyed. A controller that leaves while keyed unkeys; another client coming and going does not.
+9. **Meters for a non-GUI client.** `client udpport <port>` from a client other than the primary registers `(its IP, port)`, and the meter packets (PCC `0x8002`) the primary gets are copied there. The spectrum and audio stay with the primary. Meters only flow while the primary is streaming. A controller behind AE's USB relay can't receive UDP anyway, so it reads state from status lines instead.
+
+**What changed for a lone AE** (checked by diffing the wire output of AE's connect sequence before and after): the `client gui` reply echoes the id AE offered; AE now gets its own `client … connected` status; and `slice set N mode=` (and the new set-only keys) is echoed as slice status. All three are what a real radio sends. AE ignores its own `client connected` line apart from noting it (`RadioModel::onStatusReceived` only announces other handles). Nothing else changed.
+
+**Guesses, not checked against a real radio:**
+- The error code for `client bind` with an unknown `client_id` (the sim uses `0x5000002D`).
+- Whether a real radio stops a non-GUI client from driving a slice that isn't its bound GUI client's. The sim doesn't enforce ownership.
+- Who a real radio reports as `tx_client_handle` when a bound controller keys (the sim reports the TX slice's owner).
+- Whether a real radio sends `client connected` for non-GUI clients without a `client_id` (the sim sends none).
+- Whether `local_ptt` starts at 1 for the first GUI client.
+
+**Not covered:** duplicate `client_id` (a real radio drops the older session with `duplicate_client_id=1`), `client disconnect <handle>`, per-client panadapter streams for a second GUI client, a second GUI client's remote audio, and discovery's `gui_client_*` fields (still advertised as none: see §1).
