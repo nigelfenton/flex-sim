@@ -222,3 +222,17 @@ A real radio serves several API clients at once. The case that drove this is a f
 - Whether `local_ptt` starts at 1 for the first GUI client.
 
 **Not covered:** duplicate `client_id` (a real radio drops the older session with `duplicate_client_id=1`), `client disconnect <handle>`, per-client panadapter streams for a second GUI client, a second GUI client's remote audio, and discovery's `gui_client_*` fields (still advertised as none: see §1).
+
+## 14. flex-sim extension: `sim` verbs — 2026-10-21
+
+Not part of the Flex API. They let a client with only the API connection (a front-panel controller behind AE's CTR2 relay, with no HTTP access to the control panel) read and set the simulated signal. A real radio answers them with an error, so a client should send them only after `info` reports `name=flex-sim`. Any client may use them, bound controllers included. Pinned by `tests/test_multiclient.py`.
+
+| Command | Reply |
+|---|---|
+| `sim get` | `R<seq>\|0\|level=<dBm> floor=<dBm> pattern=<name>` |
+| `sim set level=<dBm>` | `R<seq>\|0\|`. Sets what the control panel's signal-level slider sets, clamped to its range (-130 to -10 dBm). |
+| anything else, or a non-numeric level | `0x5000002D` |
+
+The change shows on the next spectrum frame. No status line is sent: the level isn't a radio object.
+
+**Autopan fix (same date).** `slice tune N <MHz> autopan=1` (and `slice set … autopan=1`) re-centres the slice's panadapter. It now re-announces `display pan … center=` (and the waterfall line) to every client that gets that pan's status, the way `display pan set center=` already did. Before, the client kept the old centre while the sim framed the FFT on the new one, so the `carrier` pattern (drawn at the VFO bin) appeared away from the slice flag.
