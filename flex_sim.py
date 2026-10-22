@@ -1316,6 +1316,9 @@ class ClientSession:
             pass
 
 
+# Range of the control panel's signal-level slider; 'sim set level=' clamps to it.
+SIG_LEVEL_MIN_DBM, SIG_LEVEL_MAX_DBM = -130.0, -10.0
+
 # 'slice set' keys stored as given and echoed in the slice status once set
 # (they are what a front-panel controller turns: AF gain, pan, AGC).
 SLICE_ECHO_KEYS = ("audio_level", "audio_pan", "agc_mode", "agc_threshold")
@@ -2466,12 +2469,44 @@ class Radio:
                 for s in self.slices.values(): s["active"] = False
                 sl["active"] = True
                 self.active_slice = idx
+            panned = None
             if kvs.get("autopan") == "1":                  # Pan Lock on: the pan re-centres on the slice
                 pid = sl.get("pan")
-                if pid in self.pans: self.pans[pid]["center"] = sl["freq"]
+                if pid in self.pans:
+                    self.pans[pid]["center"] = sl["freq"]
+                    panned = pid
             self.reply(conn, seq)
             self._sync_active_slice()
             self.emit_slice_status(conn, idx)
+            if panned is not None:
+                # Re-announce the new centre, as 'display pan set center=' does.
+                # Without it the client kept the old centre while the FFT was
+                # framed on the new one, so a carrier at the VFO drew off the flag.
+                self.emit_pan_status(conn, panned)
+        elif c.split()[:1] == ["sim"]:
+            # flex-sim extension (not a Flex verb): lets an API-only client (a
+            # front-panel controller) read and set what the control panel's
+            # signal-level slider sets. A real radio answers it with an error.
+            #   sim get              -> level=<dBm> floor=<dBm> pattern=<name>
+            #   sim set level=<dBm>  -> clamped to the slider's range
+            parts = c.split()
+            sub = parts[1] if len(parts) > 1 else ""
+            if sub == "get":
+                self.reply(conn, seq, f"level={self.sig_level_dbm:g} floor={self.noise_floor_dbm:g} "
+                                      f"pattern={self.pattern}")
+            elif sub == "set" and "level" in parse_kvs(c):
+                try:
+                    v = float(parse_kvs(c)["level"])
+                except ValueError:
+                    v = float("nan")
+                if v != v:                                 # not a number
+                    self.reply(conn, seq, code=0x5000002D)
+                    return
+                self.sig_level_dbm = max(SIG_LEVEL_MIN_DBM, min(SIG_LEVEL_MAX_DBM, v))
+                self.reply(conn, seq)
+                log(f"[sim] level -> {self.sig_level_dbm:g} dBm (client 0x{conn.handle_hex})")
+            else:
+                self.reply(conn, seq, code=0x5000002D)
         elif c.split()[:1] == ["filt"]:
             # 'filt <idx> <low_hz> <high_hz>' (FlexLib Slice.UpdateFilter) -> filter_lo/hi status.
             parts = c.split()

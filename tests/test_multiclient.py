@@ -15,6 +15,9 @@ Checks:
   4. the controller tunes / sets mode / audio_level / filter on the GUI
      client's slice and the GUI client receives each resulting slice status,
      still carrying ITS client_handle;
+     `slice tune .. autopan=1` re-announces the pan's new centre to the GUI
+     client; the flex-sim-only `sim get` / `sim set level=` verbs work from
+     either client, clamp, and refuse bad input;
   5. the controller keys TX; the GUI client sees it, owned by the GUI client;
   6. per-client cleanup: the controller leaving unkeys only what it keyed and
      leaves the GUI client's slice; another client coming and going does not
@@ -212,6 +215,33 @@ def main():
             ctl.cmd(cmd)
             check(f"controller '{cmd}': GUI client receives it",
                   gui.wait_for(pat, since=mark) is not None)
+        # ---- 4b. autopan re-announces the pan centre ----
+        mark = len(gui.seen)
+        ctl.cmd("slice tune 0 14.250000 autopan=1")
+        hit = gui.wait_for(r"\|display pan 0x40000000 .*center=14\.250000", since=mark)
+        check("controller 'slice tune .. autopan=1': GUI client receives the new pan centre",
+              hit is not None, str(gui.seen[mark:]))
+
+        # ---- 4c. flex-sim extension: sim get / sim set level= ----
+        code, body = ctl.reply(ctl.cmd("sim get"))
+        st = dict(t.split("=", 1) for t in body.split() if "=" in t)
+        check("'sim get' replies level/floor/pattern",
+              code == 0 and {"level", "floor", "pattern"} <= set(st), body)
+        code, _ = ctl.reply(ctl.cmd("sim set level=-50"))
+        _, body = ctl.reply(ctl.cmd("sim get"))
+        check("bound controller 'sim set level=-50' sets the signal level",
+              code == 0 and "level=-50 " in body + " ", body)
+        ctl.cmd("sim set level=-200")
+        _, body = ctl.reply(ctl.cmd("sim get"))
+        check("'sim set level=' clamps to the slider range (-130)", "level=-130 " in body + " ", body)
+        gui.cmd("sim set level=-5")
+        _, body = gui.reply(gui.cmd("sim get"))
+        check("GUI client may use it too; clamps high to -10", "level=-10 " in body + " ", body)
+        for bad in ("sim set level=abc", "sim set", "sim frob"):
+            code, _ = ctl.reply(ctl.cmd(bad))
+            check(f"'{bad}': refused with an error code", code != 0)
+        ctl.cmd("sim set level=-73")
+
         check("GUI client never hears of the non-GUI controller as a client",
               not any(f"client 0x{ctl.handle}" in line for line in gui.seen))
 
