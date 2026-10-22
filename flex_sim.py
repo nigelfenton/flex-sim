@@ -1284,6 +1284,48 @@ def load_noise_preset(radio, name):
     log(f"[noise] preset '{name}' -> {', '.join(scene)}")
 
 
+class ClientSession:
+    """One TCP API connection. A real radio serves several at once: GUI
+    clients (MultiFlex) and non-GUI ones (front-panel controllers, loggers)
+    that never send 'client gui' and instead 'client bind' to a GUI client.
+    Shared radio state (slices, pans, TX) stays on Radio; this holds only
+    what is per connection."""
+
+    def __init__(self, conn, addr, handle):
+        self.conn, self.peer_ip = conn, addr[0]
+        self.handle = handle
+        self.handle_hex = f"{handle:08X}"
+        self.send_lock = threading.Lock()   # this connection's writes: its own thread vs status pushed from others
+        self.gui = False                    # set by 'client gui'
+        self.client_id = None               # the GUI client's UUID (the 'client gui' reply)
+        self.program = ""
+        self.station = ""
+        self.bound_to = None                # non-GUI: handle of the GUI client it bound to
+        self.subs = set()                   # status topics from 'sub <topic> ...'
+        self.udp_dest = None                # (ip, port) from 'client udpport'
+
+    def send(self, text):
+        with self.send_lock:
+            self.conn.sendall(text.encode())
+
+    def close(self):
+        try:
+            self.conn.shutdown(socket.SHUT_RDWR)
+            self.conn.close()
+        except OSError:
+            pass
+
+
+# 'slice set' keys stored as given and echoed in the slice status once set
+# (they are what a front-panel controller turns: AF gain, pan, AGC).
+SLICE_ECHO_KEYS = ("audio_level", "audio_pan", "agc_mode", "agc_threshold")
+
+# Status object -> the 'sub <topic>' that receives it on a real radio.
+STATUS_TOPICS = {"slice": "slice", "display": "pan", "transmit": "tx", "interlock": "tx",
+                 "meter": "meter", "cwx": "cwx", "apd": "apd", "license": "license",
+                 "amplifier": "amplifier", "tnf": "tnf", "radio": "radio", "client": "client"}
+
+
 class Radio:
     def __init__(self, ip, ae_ip, pattern="ramp", bins=BINS, fps=FPS, width_khz=SIGNAL_WIDTH_KHZ,
                  port=DEFAULT_PORT, radio_id=0, model=MODEL, serial_prefix=SERIAL_PREFIX):
@@ -1305,7 +1347,9 @@ class Radio:
         # to that verb, and AE silently takes whichever it found first. The
         # per-radio :02d suffix is preserved so rack mode stays unique.
         self.serial = f"{serial_prefix}{radio_id:02d}"
-        self.client_handle = HANDLE + radio_id   # NB: NOT self.handle — that's the method!
+        # Handle of the FIRST connection (NB: NOT self.handle — that's the method!).
+        # Later concurrent connections get their own (see _alloc_handle).
+        self.client_handle = HANDLE + radio_id
         self.handle_hex = f"{self.client_handle:08X}"
         self.pan_id = PAN_ID + radio_id * 16     # FFT stream-id BASE; AE stacks a panadapter per +RX,
         self.wf_id = WF_ID + radio_id * 16       # waterfall base. pan k -> base+k (16 ids/radio, no overlap)
@@ -1319,9 +1363,19 @@ class Radio:
         self.sig_level_dbm = S9_DBM     # live (control panel, dBm; default S9 = -73)
         self.noise_color = 0.0          # live (noise tilt: 0=white, >0=pink)
         self.noise_cal_full = True      # live: noise_cal full-span (standard) vs width-limited
-        self.vita_dest = None
+        self.vita_dest = None           # the PRIMARY client's VITA-49 destination
         self.run = True
-        self.send_lock = threading.Lock()   # serialize TCP writes: stream thread (status) vs command thread (replies)
+        # Multi-client. Each TCP connection is a ClientSession on its own thread
+        # with its own send lock; self.lock serialises command handling against
+        # the shared radio state. The PRIMARY session is the GUI client the
+        # spectrum/audio streams go to (the first connection until one sends
+        # 'client gui'); ae_peer_ip / vita_dest belong to it.
+        self.sessions = []
+        self.sessions_lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.primary = None
+        self._acting = None             # the session whose command is being handled
+        self.tx_keyer = None            # the session that keyed MOX/TUNE (None = panel/pattern)
         self.streaming = False
         self.paused = False             # Stop/Go: when True, stay connected but send NO pan/wf/meter data
                                         # (AE keeps the radio; panadapter + waterfall go dead). Go resumes.
@@ -1338,7 +1392,6 @@ class Radio:
         self.tnfs = {}
         self._next_tnf_id = 1
         self.active_slice = 0       # the slice the pan/waterfall/primary carrier follow
-        self.conn = None            # active TCP conn (so the control panel can push TX status)
         self.tx_mox = False         # live: TX keyed (panel toggle or AE's 'transmit set mox=1')
         # --txlog: characterise UDP arriving FROM AE (TX audio discovery).
         self.txlog = False
@@ -1438,6 +1491,72 @@ class Radio:
     def tx_on(self):
         return self.tx_mox or self.tx_tune or bool(self.hw_ptt)
 
+    # ---- multi-client -----------------------------------------------------
+    @property
+    def conn(self):
+        """The primary client session, or None (kept for the panel/rack callers)."""
+        return self.primary
+
+    def _alloc_handle(self):
+        # The first connection keeps the long-standing handle, so a lone client
+        # sees exactly what it always did; others step in bit 20 upward, clear of
+        # the per-radio offset in the low bits (rack mode).
+        used = {s.handle for s in self.sessions}
+        n = 0
+        while self.client_handle + (n << 20) in used:
+            n += 1
+        return self.client_handle + (n << 20)
+
+    def _session_by_handle(self, handle):
+        return next((s for s in list(self.sessions) if s.handle == handle), None)
+
+    def _acting_owner(self):
+        """Handle that owns objects the current command creates: a bound
+        non-GUI client acts for its GUI client, as on a real radio."""
+        s = self._acting or self.primary
+        if s is None:
+            return self.client_handle
+        return s.bound_to if s.bound_to is not None else s.handle
+
+    def tx_owner_handle(self):
+        """tx_client_handle: the owner of the TX slice, else whoever keyed."""
+        for sl in self.slices.values():
+            if sl.get("tx") and "owner" in sl:
+                return sl["owner"]
+        k = self.tx_keyer
+        if k is not None:
+            return k.bound_to if k.bound_to is not None else k.handle
+        return self.primary.handle if self.primary else self.client_handle
+
+    def _note_keyer(self, conn):
+        self.tx_keyer = conn if (self.tx_mox or self.tx_tune) else None
+
+    def publish(self, obj_kvs, origin=None):
+        """Status for a shared object: to the client whose command caused it,
+        the primary GUI client (which always heard everything when the sim was
+        single-client), and every client subscribed to the object's topic."""
+        topic = STATUS_TOPICS.get(obj_kvs.split(" ", 1)[0])
+        with self.sessions_lock:
+            others = [s for s in self.sessions if s is not origin
+                      and (s is self.primary or topic in s.subs)]
+        if origin is not None:
+            self.status(origin, obj_kvs)
+        for s in others:
+            try:
+                self.status(s, obj_kvs)
+            except OSError:
+                pass                        # that client is going; its own thread cleans up
+
+    def client_status(self, s):
+        prog = (s.program or "").replace(" ", "\x7f")
+        stn = (s.station or "").replace(" ", "\x7f")
+        return (f"client 0x{s.handle_hex} connected local_ptt={1 if s is self.primary else 0} "
+                f"client_id={s.client_id} program={prog} station={stn}")
+
+    def drop_clients(self):
+        for s in list(self.sessions):
+            s.close()
+
     @property
     def fw43(self):
         """True when the sim reports SmartSDR v4.3 or later firmware."""
@@ -1499,22 +1618,20 @@ class Radio:
                 return True
         return False
 
-    def emit_apd_status(self, conn=None):
+    def emit_apd_status(self, conn=None, to_all=True):
         """SmartSignal (APD). v4.3 adds a lifecycle 'state=' key, and an
         equalizer_active line carrying the ant/freq/rfpower it applies to."""
-        conn = conn or self.conn
-        if not conn:
-            return
+        out = (lambda kvs: self.publish(kvs, conn)) if to_all else (lambda kvs: self.status(conn, kvs))
         a = self.apd
         line = f"apd enable={1 if a['enable'] else 0} configurable={1 if a['configurable'] else 0}"
         active = a["enable"] and self.tx_on
         if self.fw43:
             state = "OFF" if not a["enable"] else ("ACTIVE" if active else "IDLE")
-            self.status(conn, line + f" state={state}")
-            self.status(conn, f"apd equalizer_active={1 if active else 0} ant=ANT1 "
-                              f"freq={self.slice_freq:.6f} rfpower={int(self.tx_power_w)}")
+            out(line + f" state={state}")
+            out(f"apd equalizer_active={1 if active else 0} ant=ANT1 "
+                f"freq={self.slice_freq:.6f} rfpower={int(self.tx_power_w)}")
         else:
-            self.status(conn, line + f" equalizer_active={1 if active else 0}")
+            out(line + f" equalizer_active={1 if active else 0}")
 
     # ---- DAX TX chain observer (#4510) -----------------------------------
     def txchain(self):
@@ -1600,23 +1717,24 @@ class Radio:
         self.enabled = bool(on)
         if not on:
             self.streaming = False
-            c = self.conn
-            if c:
-                try: c.shutdown(socket.SHUT_RDWR); c.close()
-                except OSError: pass
+            self.drop_clients()
 
-    def emit_license_status(self, conn):
+    def emit_license_status(self, conn, to_all=False):
         """The three FlexLib licence objects: license, license subscription, license feature."""
-        if not conn:
+        if to_all:
+            out = lambda kvs: self.publish(kvs, conn)
+        elif conn:
+            out = lambda kvs: self.status(conn, kvs)
+        else:
             return
-        self.status(conn, f"license radio_id={self.serial} highest_major_version=4 region=USA")
+        out(f"license radio_id={self.serial} highest_major_version=4 region=USA")
         if self.subscription != "none":
             name = {"smartsdr+": "smartsdr+", "early-access": "smartsdr+_early_access"}[self.subscription]
-            self.status(conn, f"license subscription name={name} "
-                              f"expiration={self.subscription_expires}T00:00:00Z")
+            out(f"license subscription name={name} "
+                f"expiration={self.subscription_expires}T00:00:00Z")
         for fname, f in self.license_features.items():
-            self.status(conn, f"license feature name={fname} enabled={1 if f['enabled'] else 0} "
-                              f"reason={f['reason']}")
+            out(f"license feature name={fname} enabled={1 if f['enabled'] else 0} "
+                f"reason={f['reason']}")
 
     def license_state(self):
         return {"features": {k: dict(v) for k, v in self.license_features.items()},
@@ -1626,7 +1744,11 @@ class Radio:
     def state(self):
         # Snapshot for the rack strip (polled by the panel).
         return {"id": self.radio_id, "serial": self.serial, "model": self.model, "ip": self.ip,
-                "on": self.enabled, "connected": self.conn is not None,
+                "on": self.enabled, "connected": self.primary is not None,
+                "clients": [{"handle": f"0x{s.handle_hex}", "gui": s.gui, "program": s.program,
+                             "station": s.station, "peer": s.peer_ip,
+                             "bound_to": f"0x{s.bound_to:08X}" if s.bound_to is not None else None}
+                            for s in list(self.sessions)],
                 "freq": round(self.slice_freq, 5), "mode": self.slice_mode, "tx": self.tx_on,
                 "pattern": self.pattern, "power_w": round(self.tx_power_w),
                 "meter_dbm": round(self.last_vfo_dbm, 1),
@@ -1746,70 +1868,180 @@ class Radio:
     def serve(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((self.ip, self.port)); srv.listen(1)   # bind our own IP (rack: each radio a distinct IP)
+        srv.bind((self.ip, self.port)); srv.listen(8)   # bind our own IP (rack: each radio a distinct IP)
         log(f"[tcp] listening on :{self.port}  (radio ip {self.ip}, pattern={self.pattern})")
         while self.run:
             conn, addr = srv.accept()
-            log(f"[tcp] AE connected from {addr}")
-            self.ae_peer_ip = addr[0]; self.vita_dest = None
-            try: self.handle(conn)
-            except Exception as e: log("[tcp] conn error:", e)
-            finally:
-                conn.close()
-                self.streaming = False; self.ae_peer_ip = None; self.conn = None; self.vita_dest = None
-                self.audio_stop.set(); self.audio_stream_id = None; self.dax_channel = None
-                # Free this client's receivers/panadapters on disconnect, like a real radio.
-                # Without it, stale slices/pans pile up across reconnects and the slice
-                # lettering drifts (A -> B -> C on each new connection).
-                self.slices.clear(); self.pans.clear(); self.pan_seq = 0; self.active_slice = 0
-                # The client that keyed is gone, and so is its TX slice: unkey, as a real
-                # radio does. Left keyed, the next client inherited a carrier nobody owned.
-                if self.tx_mox or self.tx_tune:
-                    self.tx_mox = self.tx_tune = False
-                    self.emit_transmit_status()            # conn is gone: this only updates rf-sense
-                    self.txchain_edge()
-                    log("[tx] client disconnected while keyed -> unkeyed")
+            # One thread per connection, like a real radio serving MultiFlex GUI
+            # clients plus non-GUI ones (a CTR2 front panel relayed by AE, a logger).
+            threading.Thread(target=self._serve_client, args=(conn, addr), daemon=True,
+                             name=f"client-{self.radio_id}-{addr[1]}").start()
 
-    def handle(self, conn):
-        self.conn = conn
-        with self.send_lock:
-            conn.sendall(f"V{self.fw_version}\n".encode())
-            conn.sendall(f"H{self.handle_hex}\n".encode())
-        log(f"[tcp] sent V{self.fw_version} / H{self.handle_hex}")
+    def _serve_client(self, conn, addr):
+        with self.lock:
+            with self.sessions_lock:
+                sess = ClientSession(conn, addr, self._alloc_handle())
+                self.sessions.append(sess)
+            if self.primary is None:
+                self.primary = sess
+                self.ae_peer_ip = addr[0]; self.vita_dest = None
+        log(f"[tcp] client 0x{sess.handle_hex} connected from {addr}"
+            f"  ({len(self.sessions)} connected)")
+        try: self.handle(sess)
+        except Exception as e: log(f"[tcp] client 0x{sess.handle_hex} conn error:", e)
+        finally:
+            conn.close()
+            with self.lock:
+                self._client_gone(sess)
+
+    def _client_gone(self, sess):
+        """Per-client disconnect cleanup, as a real radio does it: only the
+        leaving client's own slices/pans go, and TX is unkeyed only if that
+        client keyed it or owns the TX slice. A lone client therefore still
+        gets the old clear-everything behaviour."""
+        tx_owner = self.tx_owner_handle()                  # before its TX slice is removed
+        with self.sessions_lock:
+            if sess in self.sessions:
+                self.sessions.remove(sess)
+        log(f"[tcp] client 0x{sess.handle_hex} disconnected  ({len(self.sessions)} left)")
+        if sess.gui:
+            self.publish(f"client 0x{sess.handle_hex} disconnected forced=0 "
+                         f"wan_validation_failed=0 duplicate_client_id=0")
+        for s in self.sessions:                            # its bound controllers lose their GUI client
+            if s.bound_to == sess.handle:
+                s.bound_to = None
+        if sess is self.primary:
+            self.streaming = False; self.ae_peer_ip = None; self.primary = None; self.vita_dest = None
+            self.audio_stop.set(); self.audio_stream_id = None; self.dax_channel = None
+            nxt = next((s for s in self.sessions if s.gui), None)
+            if nxt is not None:                            # MultiFlex: another GUI client takes over
+                self.primary = nxt
+                self.ae_peer_ip = nxt.peer_ip; self.vita_dest = nxt.udp_dest
+                log(f"[tcp] primary -> client 0x{nxt.handle_hex}")
+        # Free this client's receivers/panadapters on disconnect, like a real radio.
+        # Without it, stale slices/pans pile up across reconnects and the slice
+        # lettering drifts (A -> B -> C on each new connection).
+        gone = [g for g, sl in self.slices.items() if sl.get("owner") == sess.handle]
+        for g in gone:
+            self.slices.pop(g, None)
+            self.publish(f"slice {g} in_use=0")
+        for pid in [p for p, pan in self.pans.items() if pan.get("owner") == sess.handle]:
+            self.pans.pop(pid, None)
+        if not self.pans:
+            self.pan_seq = 0
+        if not self.slices:
+            self.active_slice = 0
+        elif self.active_slice not in self.slices:
+            self.active_slice = next(iter(self.slices))
+        self._sync_active_slice()
+        # The client that keyed is gone, and so is its TX slice: unkey, as a real
+        # radio does. Left keyed, the next client inherited a carrier nobody owned.
+        if (self.tx_mox or self.tx_tune) and (self.tx_keyer is sess or tx_owner == sess.handle):
+            self.tx_mox = self.tx_tune = False
+            self.tx_keyer = None
+            self.emit_transmit_status()                    # tells any remaining clients + rf-sense
+            self.txchain_edge()
+            log("[tx] client disconnected while keyed -> unkeyed")
+        if self.tx_keyer is sess:
+            self.tx_keyer = None
+
+    def handle(self, sess):
+        sess.send(f"V{self.fw_version}\nH{sess.handle_hex}\n")
+        log(f"[tcp] sent V{self.fw_version} / H{sess.handle_hex}")
         buf = b""
         while self.run:
-            chunk = conn.recv(4096)
+            chunk = sess.conn.recv(4096)
             if not chunk: break
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 line = line.decode(errors="replace").strip()
-                if line: self.on_line(conn, line)
+                if line:
+                    with self.lock:
+                        self._acting = sess
+                        try: self.on_line(sess, line)
+                        finally: self._acting = None
 
     def reply(self, conn, seq, body="", code=0):
-        with self.send_lock:
-            conn.sendall(f"R{seq}|{code:X}|{body}\n".encode())
+        conn.send(f"R{seq}|{code:X}|{body}\n")
 
     def status(self, conn, obj_kvs):
-        with self.send_lock:
-            conn.sendall(f"S{self.handle_hex}|{obj_kvs}\n".encode())
+        conn.send(f"S{conn.handle_hex}|{obj_kvs}\n")
 
     def on_line(self, conn, line):
         if not line.startswith("C") or "|" not in line:
             log("[<-] (non-C)", line); return
         head, cmd = line.split("|", 1)
         seq, c = head[1:], cmd.strip()
-        log("[<-]", f"C{seq}|{c}")
+        log("[<-]", f"C{seq}|{c}" if len(self.sessions) < 2 else f"0x{conn.handle_hex} C{seq}|{c}")
+        words = c.split()
+        if words[:1] in (["sub"], ["unsub"]) and len(words) > 1:
+            (conn.subs.add if words[0] == "sub" else conn.subs.discard)(words[1])
         if c.startswith("client gui"):
-            self.reply(conn, seq, str(uuid.uuid4()).upper())
-        elif c.startswith("client set"):
-            if "send_reduced_bw_dax=1" in c:
-                self.audio_reduced_bw = True
-            elif "send_reduced_bw_dax=0" in c:
-                self.audio_reduced_bw = False
+            # A client that sends this is a GUI client; one that never does is
+            # non-GUI. The reply is its client_id: a real radio keeps the id the
+            # client offers (AE persists it), else issues a fresh one.
+            conn.gui = True
+            offered = words[2] if len(words) > 2 else ""
+            try:
+                conn.client_id = str(uuid.UUID(offered)).upper()
+            except ValueError:
+                conn.client_id = str(uuid.uuid4()).upper()
+            if self.primary is not conn and not (self.primary and self.primary.gui):
+                # The first connection was only provisionally primary (it never
+                # said 'client gui'): the streams belong to the GUI client.
+                self.primary = conn
+                self.ae_peer_ip = conn.peer_ip; self.vita_dest = conn.udp_dest
+                log(f"[tcp] primary -> GUI client 0x{conn.handle_hex}")
+            self.reply(conn, seq, conn.client_id)
+            self.publish(self.client_status(conn), conn)
+        elif c.startswith("client program") or c.startswith("client station"):
+            val = c.split(None, 2)[2] if len(words) > 2 else ""
+            setattr(conn, words[1], val.replace("\x7f", " "))
             self.reply(conn, seq)
+            if conn.gui:
+                self.publish(self.client_status(conn), conn)
+        elif c.startswith("client bind"):
+            # Non-GUI client (CTR2 front panel, logger) attaches to a GUI client:
+            # it then sees and drives that client's slices, and objects it creates
+            # belong to it (FlexLib Radio.BindGUIClient -> 'client bind client_id=').
+            want = parse_kvs(c).get("client_id", "").upper()
+            gui = next((s for s in list(self.sessions) if s.gui and s.client_id == want), None)
+            if gui is None:
+                self.reply(conn, seq, code=0x5000002D)     # unknown client_id (code is a guess)
+                log(f"[tcp] client 0x{conn.handle_hex} bind refused: no GUI client {want}")
+                return
+            conn.bound_to = gui.handle
+            self.reply(conn, seq)
+            log(f"[tcp] client 0x{conn.handle_hex} bound to GUI client 0x{gui.handle_hex}")
+        elif c.startswith("client set"):
+            if conn is self.primary:                       # the remote-audio stream is the primary's
+                if "send_reduced_bw_dax=1" in c:
+                    self.audio_reduced_bw = True
+                elif "send_reduced_bw_dax=0" in c:
+                    self.audio_reduced_bw = False
+            self.reply(conn, seq)
+        elif c == "sub client all":
+            # A real radio answers with every connected GUI client (AE's
+            # multiFLEX peek), then reports joins/leaves as they happen.
+            self.reply(conn, seq)
+            for s in list(self.sessions):
+                if s.gui:
+                    self.status(conn, self.client_status(s))
+        elif c == "sub slice all":
+            self.reply(conn, seq)
+            for g in sorted(self.slices):                  # existing slices (none for a fresh lone client)
+                self.emit_slice_status(conn, g, to_all=False)
+        elif c == "sub meter all":
+            self.reply(conn, seq)
+            if self.slices:                                # definitions, once there is something to meter
+                self.emit_meter_status(conn, to_all=False)
         elif c == "slice list":
-            self.reply(conn, seq, "")
+            # This client's (or its bound GUI client's) slices; empty for a fresh
+            # GUI client, which then goes standalone and creates its own pan.
+            mine = self._acting_owner()
+            self.reply(conn, seq, " ".join(str(g) for g, sl in sorted(self.slices.items())
+                                           if sl.get("owner") == mine))
         elif c.startswith("display panafall create") or c.startswith("display pan create"):
             pid = self._new_pan()                          # AE's +RX = a NEW stacked panadapter
             self.reply(conn, seq, f"0x{pid:08X},0x{self.pans[pid]['wf_id']:08X}")
@@ -1839,7 +2071,7 @@ class Radio:
             # takes it. Diversity children are RX-only and never claim it.
             is_tx = not any(s.get("tx") for s in self.slices.values())
             self.slices[idx] = {"freq": freq, "mode": mode, "active": True, "pan": pid,
-                                "tx": is_tx}
+                                "tx": is_tx, "owner": self._acting_owner()}
             self.pans[pid]["slice"] = idx
             self.pans[pid]["center"] = freq                # pan frames on its slice at creation
             self.active_slice = idx
@@ -1905,7 +2137,7 @@ class Radio:
             if len(parts) >= 3:
                 self.mic_selection = parts[2].upper()
             self.reply(conn, seq)
-            self.emit_transmit_status()                    # AE reads mic_selection back from here
+            self.emit_transmit_status(conn)                # AE reads mic_selection back from here
         elif c == "sub license all":
             # A real radio reports its licence, subscription and each feature. AE fails
             # OPEN while it has heard nothing, so without these lines every sim looked
@@ -1921,7 +2153,7 @@ class Radio:
             log(f"[license] refused '{c}' with 50004001 (--dvk-refuses)")
         elif c == "sub apd all":
             self.reply(conn, seq)
-            self.emit_apd_status(conn)
+            self.emit_apd_status(conn, to_all=False)
         elif c.startswith("apd ") and "enable=" in c:
             kvs = parse_kvs(c)
             if kvs["enable"] not in ("0", "1"):
@@ -1934,7 +2166,7 @@ class Radio:
             # Answer the subscription with the current TX state, so a client that
             # (re)connects while the radio is keyed learns it rather than assuming RX.
             self.reply(conn, seq)
-            self.emit_transmit_status()
+            self.emit_transmit_status(conn, to_all=False)
         elif c.startswith("client udpport"):
             # AE announces the UDP port it listens on for VITA data. On a single
             # host (AE owns :4992), AE's prime packet to our advertised port may
@@ -1943,7 +2175,12 @@ class Radio:
             # prime path still works as a fallback (e.g. WSL2 separate stacks).
             try:
                 up = int(c.split()[-1])
-                if self.ae_peer_ip and not self.vita_dest:
+                conn.udp_dest = (conn.peer_ip, up)
+                if conn is not self.primary:
+                    # A non-GUI client (controller) gets meter packets here; the
+                    # spectrum/audio streams stay with the primary GUI client.
+                    log(f"[udp] client 0x{conn.handle_hex} meters -> {conn.udp_dest}")
+                elif self.ae_peer_ip and not self.vita_dest:
                     self.vita_dest = (self.ae_peer_ip, up)
                     log(f"[udp] VITA dest from client udpport: {self.vita_dest}")
                 else:
@@ -1977,7 +2214,7 @@ class Radio:
                 # The registration status line — must carry our client_handle so AE's
                 # streamStatusBelongsToUs() accepts it, and the dax_channel it asked for.
                 self.status(conn, f"stream 0x{sid:08X} type=dax_rx dax_channel={ch} "
-                                  f"client_handle=0x{self.handle_hex}")
+                                  f"client_handle=0x{conn.handle_hex}")
                 log(f"[dax] registered dax_rx stream 0x{sid:08X} channel={ch}")
                 self._start_audio_thread()
             elif kvs.get("type") == "dax_tx":
@@ -1994,7 +2231,7 @@ class Radio:
                 self.daxtx_bytes = 0
                 self.daxtx_last_pkt = 0.0
                 self.reply(conn, seq, f"0x{sid:08X}")
-                owner = (self.handle_hex if self.daxtx_tx
+                owner = (conn.handle_hex if self.daxtx_tx
                          else f"{self.daxtx_foreign_owner:08X}")
                 self.status(conn, f"stream 0x{sid:08X} type=dax_tx "
                                   f"client_handle=0x{owner} "
@@ -2027,7 +2264,7 @@ class Radio:
                 log(f"[txchain] stream 0x{sid:08X} tx={kvs['tx']} — TX source "
                     f"{'CLAIMED' if self.daxtx_tx else 'released'} by client")
                 self.status(conn, f"stream 0x{sid:08X} type=dax_tx "
-                                  f"client_handle=0x{self.handle_hex} tx={kvs['tx']}")
+                                  f"client_handle=0x{conn.handle_hex} tx={kvs['tx']}")
             self.reply(conn, seq)
         elif c.startswith("stream remove"):
             for tok in c.split():
@@ -2048,8 +2285,9 @@ class Radio:
             # the sim never keyed, so power stayed at the un-keyed floor.
             parts = c.split()
             self.tx_tune = (len(parts) > 2 and parts[2] == "1")
+            self._note_keyer(conn)
             self.reply(conn, seq)
-            self.emit_transmit_status()
+            self.emit_transmit_status(conn)
             self.txchain_edge()
             log(f"[tx] tune {'ON' if self.tx_tune else 'OFF'}"
                 f"{' (' + self.tune_mode + ')' if self.tune_mode else ''}")
@@ -2063,14 +2301,16 @@ class Radio:
                 self.reply(conn, seq, code=0x5000002D)    # "Bad field" (real-radio code); key nothing
                 return
             self.tx_mox = parts[1] == "1"
+            self._note_keyer(conn)
             self.reply(conn, seq)
-            self.emit_transmit_status()
+            self.emit_transmit_status(conn)
             self.txchain_edge()
             log(f"[tx] xmit {'ON' if self.tx_mox else 'OFF'}")
         elif c.startswith("transmit set"):                 # AE keys TX (MOX / TUNE)
             kvs = parse_kvs(c)
             if "mox" in kvs:  self.tx_mox = kvs["mox"] == "1"
             if "tune" in kvs: self.tx_tune = kvs["tune"] == "1"
+            if "mox" in kvs or "tune" in kvs: self._note_keyer(conn)
             # Stage 4 of the #4510 chain: dax=1 tells the radio the TX audio
             # SOURCE is DAX — necessary but not sufficient; stage 5 (stream
             # tx=1) still has to name WHICH stream modulates.
@@ -2097,11 +2337,11 @@ class Radio:
                     try: self.tx_power_w = max(0.0, float(kvs[k]))
                     except ValueError: pass
             self.reply(conn, seq)
-            self.emit_transmit_status()
+            self.emit_transmit_status(conn)
             self.txchain_edge()
         elif c == "sub amplifier all":                      # AE subscribes to amplifier presence
             self.reply(conn, seq)
-            self.emit_amplifier_status(conn)                # -> AE hasAmplifier=true; AMP applet un-gates
+            self.emit_amplifier_status(conn, to_all=False)  # -> AE hasAmplifier=true; AMP applet un-gates
         elif c.startswith("amplifier set"):                 # AE toggles OPERATE / STANDBY
             kvs = parse_kvs(c)
             if "operate" in kvs: self.amp_operate = (kvs["operate"] == "1")
@@ -2117,10 +2357,16 @@ class Radio:
                 if "audio_mute" in kvs:
                     self.slices[idx]["muted"] = (kvs["audio_mute"] == "1")
                     log(f"[slice] {idx} audio_mute={kvs['audio_mute']}")
-                if "mode" in kvs:
+                echo = False                               # status back to every client (a bound
+                if "mode" in kvs:                          # controller's change must reach the GUI)
                     self.slices[idx]["mode"] = kvs["mode"]
                     if self.slices[idx].get("active"):
                         self.slice_mode = kvs["mode"]
+                    echo = True
+                for key in SLICE_ECHO_KEYS:
+                    if key in kvs:
+                        self.slices[idx].setdefault("extra", {})[key] = kvs[key]
+                        echo = True
                 # tx=1 moves the radio's ONE transmit slice here (split / VFO-B
                 # routes). The old TX slice loses it, and both are re-announced
                 # so the client's txSlice view follows. Diversity children are
@@ -2181,6 +2427,8 @@ class Radio:
                         self._diversity_on(conn, idx)
                     else:
                         self._diversity_off(conn, idx)
+                if echo:
+                    self.emit_slice_status(conn, idx)
             self.reply(conn, seq)
         elif c.startswith("slice remove"):
             idx = self._slice_index_from(c)
@@ -2194,7 +2442,7 @@ class Radio:
                 if pid is not None and not any(s.get("pan") == pid for s in self.slices.values()):
                     self.pans.pop(pid, None)
             self.reply(conn, seq)
-            self.status(conn, f"slice {idx} in_use=0")
+            self.publish(f"slice {idx} in_use=0", conn)
             log(f"[slice] remove -> slice {idx}  ({len(self.slices)}/{self.max_slices})")
             if idx == self.active_slice and self.slices:
                 self.active_slice = next(iter(self.slices))
@@ -2204,7 +2452,8 @@ class Radio:
             kvs = parse_kvs(c)
             idx = self._slice_index_from(c)
             sl = self.slices.setdefault(idx, {"freq": self.slice_freq, "mode": self.slice_mode,
-                                              "active": False, "pan": self._primary_pan()})
+                                              "active": False, "pan": self._primary_pan(),
+                                              "owner": self._acting_owner()})
             if "mode" in kvs: sl["mode"] = kvs["mode"]
             for k in ("RF_frequency", "freq"):
                 if k in kvs: sl["freq"] = float(kvs[k])
@@ -2222,6 +2471,20 @@ class Radio:
                 if pid in self.pans: self.pans[pid]["center"] = sl["freq"]
             self.reply(conn, seq)
             self._sync_active_slice()
+            self.emit_slice_status(conn, idx)
+        elif c.split()[:1] == ["filt"]:
+            # 'filt <idx> <low_hz> <high_hz>' (FlexLib Slice.UpdateFilter) -> filter_lo/hi status.
+            parts = c.split()
+            try:
+                idx, lo, hi = int(parts[1]), int(float(parts[2])), int(float(parts[3]))
+            except (IndexError, ValueError):
+                self.reply(conn, seq, code=0x5000002D)
+                return
+            if idx not in self.slices:
+                self.reply(conn, seq, code=0x5000002D)
+                return
+            self.slices[idx].setdefault("extra", {}).update(filter_lo=lo, filter_hi=hi)
+            self.reply(conn, seq)
             self.emit_slice_status(conn, idx)
         elif c.startswith("tnf "):
             self._handle_tnf(conn, seq, c)
@@ -2262,7 +2525,7 @@ class Radio:
             tid = int(parts[2])
             self.tnfs.pop(tid, None)
             self.reply(conn, seq)
-            self.status(conn, f"tnf {tid} removed=1")   # AE clears the marker
+            self.publish(f"tnf {tid} removed=1", conn)   # AE clears the marker
             log(f"[tnf] remove id={tid}")
         else:
             self.reply(conn, seq)
@@ -2272,23 +2535,24 @@ class Radio:
         if not t or not conn:
             return
         # Status shape AE parses (RadioModel.cpp:6320): width in Hz, freq in MHz.
-        self.status(conn, f"tnf {tid} freq={t['freq']:.6f} width={t['width']} "
-                          f"depth={t['depth']} permanent={t['permanent']}")
+        self.publish(f"tnf {tid} freq={t['freq']:.6f} width={t['width']} "
+                          f"depth={t['depth']} permanent={t['permanent']}", conn)
 
     def emit_pan_status(self, conn, pid=None):
         if pid is None: pid = self._primary_pan()
         pan = self.pans.get(pid)
         if not pan: return
         wid, cfreq = pan["wf_id"], self._pan_center(pid)
-        self.status(conn,
-            f"display pan 0x{pid:08X} client_handle=0x{self.handle_hex} waterfall=0x{wid:08X} "
+        owner = pan.get("owner", self.client_handle)
+        self.publish(
+            f"display pan 0x{pid:08X} client_handle=0x{owner:08X} waterfall=0x{wid:08X} "
             f"center={cfreq:.6f} bandwidth={self.span_mhz:.6f} min_dbm={self.min_dbm:.0f} "
             f"max_dbm={self.max_dbm:.0f} x_pixels={self.bins} y_pixels={self.y_pixels} fps={self.fps} "
-            f"ant_list=ANT1 rxant=ANT1")
-        self.status(conn,
-            f"display waterfall 0x{wid:08X} client_handle=0x{self.handle_hex} panadapter=0x{pid:08X} "
+            f"ant_list=ANT1 rxant=ANT1", conn)
+        self.publish(
+            f"display waterfall 0x{wid:08X} client_handle=0x{owner:08X} panadapter=0x{pid:08X} "
             f"line_duration=100 center={cfreq:.6f} bandwidth={self.span_mhz:.6f} "
-            f"auto_black=1 black_level=15 color_gain=50")
+            f"auto_black=1 black_level=15 color_gain=50", conn)
         log(f"[->] pan 0x{pid:08X} / wf 0x{wid:08X} status @ {cfreq:.5f}")
         if not self.streaming:
             self.streaming = True
@@ -2298,7 +2562,8 @@ class Radio:
         pid, wid = self.pan_id + self.pan_seq, self.wf_id + self.pan_seq
         self.pan_seq += 1
         self.pans[pid] = {"wf_id": wid, "slice": None, "y_pixels": self.y_pixels,
-                          "center": self.slice_freq}     # framing centre; fixed unless AE pans (autopan)
+                          "center": self.slice_freq,     # framing centre; fixed unless AE pans (autopan)
+                          "owner": self._acting_owner()}
         log(f"[pan] create -> 0x{pid:08X}/0x{wid:08X}  ({len(self.pans)} panadapter(s))")
         return pid
 
@@ -2360,6 +2625,7 @@ class Radio:
             "pan": pid,                                     # SAME pan as the parent
             "tx": False,                                    # RX-only, always
             "diversity": True, "div_parent": False, "div_child": True, "div_index": 1,
+            "owner": parent.get("owner", self._acting_owner()),
         }
         self.emit_slice_status(conn, parent_idx)
         self.emit_slice_status(conn, child_idx)
@@ -2383,14 +2649,14 @@ class Radio:
                                       div_child=False, div_index=-1)
         if child_idx is not None:
             self.slices.pop(child_idx, None)
-            self.status(conn, f"slice {child_idx} in_use=0")
+            self.publish(f"slice {child_idx} in_use=0", conn)
             if self.active_slice == child_idx and self.slices:
                 self.active_slice = next(iter(self.slices))
                 self._sync_active_slice()
         self.emit_slice_status(conn, parent_idx)
         log(f"[slice] diversity OFF -> parent {parent_idx}, child {child_idx} removed")
 
-    def emit_slice_status(self, conn, idx=None):
+    def emit_slice_status(self, conn, idx=None, to_all=True):
         if idx is None: idx = self.active_slice
         sl = self.slices.get(idx)
         if not sl: return
@@ -2412,10 +2678,19 @@ class Radio:
         dsp = "".join(f" {DSP_LEVEL_KEYS[k] if self.fw43 else k}={v}"
                       for k, v in sorted(sl.get("dsp", {}).items()))
         rate = f" sample_rate={sl.get('rate', 24000)}" if self.fw43 else ""
-        self.status(conn, f"slice {idx} client_handle=0x{self.handle_hex} pan=0x{pid:08X} "
-                          f"RF_frequency={sl['freq']:.6f} mode={sl['mode']} in_use=1 "
-                          f"tx={1 if sl.get('tx') else 0} "
-                          f"active={1 if sl['active'] else 0}{div}{dsp}{rate}")
+        # Set-only keys (audio_level, filter_lo/hi, ...) appear once a client sets them.
+        extra = "".join(f" {k}={v}" for k, v in sl.get("extra", {}).items())
+        # client_handle stays the OWNER's, whichever client caused the change:
+        # that is how each client tells its own slices from another's.
+        owner = sl.get("owner", self.client_handle)
+        line = (f"slice {idx} client_handle=0x{owner:08X} pan=0x{pid:08X} "
+                f"RF_frequency={sl['freq']:.6f} mode={sl['mode']} in_use=1 "
+                f"tx={1 if sl.get('tx') else 0} "
+                f"active={1 if sl['active'] else 0}{div}{dsp}{rate}{extra}")
+        if to_all:
+            self.publish(line, conn)
+        else:
+            self.status(conn, line)
 
     def emit_radio_status(self, conn):
         # Capability advert. AE computes MaxSlices/SlicesRemaining from the radio status;
@@ -2429,7 +2704,7 @@ class Radio:
                           f"callsign=SDRSIM nickname=flex-sim")
         log(f"[->] radio status: slices(in-use)={len(self.slices)} max_slices={self.max_slices}")
 
-    def emit_meter_status(self, conn):
+    def emit_meter_status(self, conn, to_all=True):
         # Define the radio's meters. NB: meter status is '#'-separated
         # index.key=value tokens after "meter " (NOT space-separated, and NO
         # leading "meter N") -- RadioModel::handleMeterStatus.
@@ -2451,7 +2726,10 @@ class Radio:
         for i, num, src, nam, unit, lo, hi in defs:
             toks = "#".join([f"{i}.src={src}", f"{i}.num={num}", f"{i}.nam={nam}",
                              f"{i}.unit={unit}", f"{i}.low={lo}", f"{i}.hi={hi}"])
-            self.status(conn, f"meter {toks}")
+            if to_all:
+                self.publish(f"meter {toks}", conn)
+            else:
+                self.status(conn, f"meter {toks}")
         log(f"[->] emitted meter defs: {len(self.slices) or 1} S-meter(s) + TX FWDPWR/SWR + AMP FWD/RL/TEMP")
 
     def tx_envelope(self, t):
@@ -2515,33 +2793,35 @@ class Radio:
             except OSError as e:
                 log(f"[rf-sense] send to {target[0]}:{target[1]} failed: {e}")
 
-    def emit_transmit_status(self):
+    def emit_transmit_status(self, origin=None, to_all=True):
         # interlock state drives AE's m_radioTransmitting; transmit status drives
-        # the MOX/TUNE UI. tx_client_handle = our handle => AE sees us as TX owner.
+        # the MOX/TUNE UI. tx_client_handle = the TX slice's owner => that client
+        # sees itself as TX owner, whoever keyed (a bound controller keys for it).
         self.notify_rf_sense()
-        if not self.conn:
+        if not self.sessions:
             return
         on = self.tx_on
+        out = self.publish if to_all else (lambda kvs, o: self.status(o, kvs))
         try:
-            self.status(self.conn,
+            out(
                 f"interlock state={'TRANSMITTING' if on else 'READY'} "
                 f"source={self.interlock_source()} "
-                f"tx_client_handle=0x{self.handle_hex}")
+                f"tx_client_handle=0x{self.tx_owner_handle():08X}", origin)
             # ptt_mic_override exists from v4.3; older firmware never reports it,
             # which is how a client tells the two apart (#6442).
             pmo = f" ptt_mic_override={1 if self.ptt_mic_override else 0}" if self.fw43 else ""
-            self.status(self.conn,
+            out(
                 f"transmit mox={1 if self.tx_mox else 0} tune={1 if self.tx_tune else 0} "
                 f"mic_selection={self.mic_selection} dax={1 if self.tx_dax else 0} "
                 f"freq={self.slice_freq:.6f} rfpower={int(self.tx_power_w)} "
-                f"tunepower={int(self.tx_power_w)}{pmo}")
+                f"tunepower={int(self.tx_power_w)}{pmo}", origin)
             if self.apd["enable"]:
-                self.emit_apd_status()
+                self.emit_apd_status(origin, to_all=to_all)
             log(f"[->] TX {'ON' if on else 'off'}  ({self.tx_power_w:.0f} W, SWR {self.tx_swr:.1f})")
         except OSError:
             pass
 
-    def emit_amplifier_status(self, conn):
+    def emit_amplifier_status(self, conn, to_all=True):
         # Radio-side amplifier advert (answers 'sub amplifier all'). This is what
         # flips AE's hasAmplifier true, so the AMP applet/button, the status-bar amp
         # indicator, and the peakfwd->S-meter feed all un-gate. Rich telemetry
@@ -2549,19 +2829,17 @@ class Radio:
         # (pgxl_sim); this line establishes presence + OPERATE state.  model must be
         # exactly "PowerGeniusXL" for AE to classify it as a power amplifier.
         try:
-            self.status(conn,
+            (self.publish if to_all else lambda kvs, o: self.status(o, kvs))(
                 f"amplifier 0x{self.amp_handle:08X} model=PowerGeniusXL serial=PGXL-SIM "
-                f"operate={1 if self.amp_operate else 0} ant=ANT1 ip={self.ip} port=9008")
+                f"operate={1 if self.amp_operate else 0} ant=ANT1 ip={self.ip} port=9008", conn)
             log(f"[->] amplifier: PowerGeniusXL operate={1 if self.amp_operate else 0}")
         except OSError:
             pass
 
     def emit_cwx_status(self, **kv):
-        if not self.conn:
-            return
         body = " ".join(f"{k}={v}" for k, v in kv.items())
         try:
-            self.status(self.conn, f"cwx {body}")
+            self.publish(f"cwx {body}")
         except OSError:
             pass
 
@@ -2783,10 +3061,19 @@ class Radio:
         ctx = PatternCtx(self.bins, self.bins // 2, self.min_dbm, self.max_dbm)
         gen = PATTERNS[self.pattern]
         fseq = wseq = mseq = fi = 0
+        meter_extra = []                                            # non-GUI clients' 'client udpport'
+
+        def send_meter(pkt):
+            s.sendto(pkt, dest)
+            for d in meter_extra:
+                try: s.sendto(pkt, d)
+                except OSError: pass
         last_tc = -1                                                # throttle pan/wf to one per row
         start = time.time()
         while self.run and self.streaming:
             now = time.time()
+            meter_extra = [x.udp_dest for x in list(self.sessions)
+                           if x is not self.primary and x.udp_dest]
             if self.paused:                                        # Stop: send nothing; AE's pan/wf go dead
                 time.sleep(0.1)                                    #       but the radio stays connected. Go resumes.
                 continue
@@ -2866,7 +3153,7 @@ class Radio:
                         s.sendto(fft_packet(pid, fseq & 0xF, pixels, fi), dest); fseq += 1
                         s.sendto(wf_packet(pan["wf_id"], wseq & 0xF, intens, low_hz, binbw_hz, tc, auto_black=wf_ab), dest); wseq += 1
                     for g in list(self.slices):                     # per-slice S-meter (level at slice = pan centre)
-                        s.sendto(meter_packet(self.meter_sid, mseq & 0xF, SLICE_METER_BASE + g, levels[ctx.center]), dest); mseq += 1
+                        send_meter(meter_packet(self.meter_sid, mseq & 0xF, SLICE_METER_BASE + g, levels[ctx.center])); mseq += 1
                 except OSError as e:
                     log("[stream] send error:", e); break
                 fi += 1
@@ -2887,8 +3174,8 @@ class Radio:
                           if (keyed and self.amp_operate) else 0.0)
             self.amp_temp_c += (tgt - self.amp_temp_c) * 0.02
             try:
-                s.sendto(meter_packet(self.meter_sid, mseq & 0xF, FWDPWR_ID, fwd_dbm), dest); mseq += 1
-                s.sendto(meter_packet(self.meter_sid, mseq & 0xF, SWR_ID, sw), dest); mseq += 1
+                send_meter(meter_packet(self.meter_sid, mseq & 0xF, FWDPWR_ID, fwd_dbm)); mseq += 1
+                send_meter(meter_packet(self.meter_sid, mseq & 0xF, SWR_ID, sw)); mseq += 1
                 # Amplifier meters. In OPERATE the amp is amplifying, so it
                 # reports GAIN_DB more forward power than the exciter; in
                 # STANDBY it is a through-path and reports the exciter level.
@@ -2900,10 +3187,10 @@ class Radio:
                 amp_dbm = fwd_dbm + (AMP_GAIN_DB if self.amp_operate else 0.0)
                 rho = max(1e-6, (sw - 1.0) / (sw + 1.0))
                 amp_rl = -20.0 * math.log10(rho)      # 1.0 SWR -> ~120 dB, 3:1 -> 6 dB
-                s.sendto(meter_packet(self.meter_sid, mseq & 0xF, AMP_FWD_ID, amp_dbm), dest); mseq += 1
-                s.sendto(meter_packet(self.meter_sid, mseq & 0xF, AMP_RL_ID, min(60.0, amp_rl)), dest); mseq += 1
-                s.sendto(meter_packet(self.meter_sid, mseq & 0xF, AMP_TEMP_ID,
-                                      self.amp_temp_c, scale=64.0), dest); mseq += 1
+                send_meter(meter_packet(self.meter_sid, mseq & 0xF, AMP_FWD_ID, amp_dbm)); mseq += 1
+                send_meter(meter_packet(self.meter_sid, mseq & 0xF, AMP_RL_ID, min(60.0, amp_rl))); mseq += 1
+                send_meter(meter_packet(self.meter_sid, mseq & 0xF, AMP_TEMP_ID,
+                                      self.amp_temp_c, scale=64.0)); mseq += 1
             except OSError:
                 pass
             dt = period - (time.time() - now)
@@ -3514,7 +3801,7 @@ def apply_license_query(radio, q):
             radio.dvk_refuses = val
     if changes:
         log(f"[license] live change: {changes}")
-        radio.emit_license_status(radio.conn)
+        radio.emit_license_status(None, to_all=True)
     return {"ok": True, "license": radio.license_state()}
 
 
@@ -3857,10 +4144,7 @@ def start_rack_control_server(rack, port):
                         r.model = q["model"][0]
                         r.max_slices = MODELS[r.model]["slices"]
                         log(f"[rack] R{r.radio_id + 1} model -> {r.model} (re-discovering)")
-                        c = r.conn                         # drop -> AE re-discovers it as the new model
-                        if c:
-                            try: c.shutdown(socket.SHUT_RDWR); c.close()
-                            except OSError: pass
+                        r.drop_clients()                   # drop -> AE re-discovers it as the new model
                 except (ValueError, IndexError):
                     pass
                 self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
