@@ -112,9 +112,15 @@ the entire HL2 backend effort.
 - **One** DDC IQ stream outbound
 - Enough to make a radio appear in a client and paint a waterfall
 
-**v2+ — as needed**
-- Multi-DDC, DUC/transmit, wideband, mic/line
-- Only worth building once something consumes v1
+**v0.2 — multi-DDC** — *Status: **built** (2026-10-24).* Every enabled DDC streams;
+`--ddc`/`--gateware`; pre-rendered signal for high packet rates; experimental diversity
+framing. Built once a consumer appeared: AetherSDR's G2 backend is moving to a second
+receiver (RFC #4970 phase 2) and diversity (RFC #6725). See §7 for what it guesses.
+
+**v3+ — as needed**
+- DUC/transmit, wideband, mic/line, PureSignal feedback, a web control page
+- Only worth building once something consumes v0.2 and a real-G2 capture says what the
+  radio does
 
 ## 4b. Port map and packet sizes (extracted 2026-08-09, corrected since)
 
@@ -248,3 +254,23 @@ backend, comparable in size to the whole HL2 effort. The plan was therefore:
    built upstream under its own RFC. The sim was first run against it on
    **2026-09-16**: it interoperated end to end, and the backend — already validated on
    real hardware — showed the sim's I/Q handedness was mirrored (fixed in v0.3.1).
+
+## 7. What v0.2 guesses — questions a real G2 can settle
+
+Everything below is in the sim today, **works as described, and is not yet confirmed by a
+capture of a real G2**. Each is a question for an owner with a radio and Wireshark
+(`udp portrange 1024-1114`, the radio's IP, and the sample rate you set).
+
+| # | The sim does | The question | A capture shows it |
+|---|---|---|---|
+| 1 | With High Priority byte 1363 bit 1 set, DDC0 packets carry 119 interleaved DDC0/DDC1 pairs, the header still says 238 samples | **Packet cadence in diversity:** one packet per 119 samples (twice the packet rate at a given sample rate), or the same cadence with the effective rate halved? | inter-arrival time of the DDC0 stream with diversity on vs off, same rate |
+| 2 | In diversity DDC1 has **no stream of its own** | Does the radio also send a separate DDC1 stream (port 1036) while diversity is on? | any traffic from `:1036` |
+| 3 | Several enabled DDCs each stream from their own port 1035+*n*, own sequence counter | True of the real radio? Do the streams share sequence numbers or timestamps? Are the packets time-aligned across DDCs? | two DDCs enabled at once (e.g. DDC2 + DDC3) |
+| 4 | Discovery reply byte 13 (gateware) = **27**, byte 20 (DDC count) = **4** | What does the real reply say? | the 60-byte discovery reply |
+| 5 | A mask bit for a DDC beyond the advertised count is ignored (nothing streams) | What does a real radio do — ignore it, stream anyway, or stall the session? | enable a DDC above the count the reply advertises |
+| 6 | High Priority status out is 60 bytes of zeros every 50 ms | Which bytes carry ADC overflow, PTT, supply voltage and the other readings AetherSDR now displays? | a few seconds of `:1025 → PC` status |
+| 7 | No transmit | TX framing is confirmed (4 B header + 240 samples), but **modulation with real audio** is unvalidated — the captures so far were keyed with silence | TX with voice or two-tone, not silence |
+
+`p2verify.py` in this repository reads the pcapng directly (no tshark) and reports each
+of these from a capture. Captures of a private station's traffic stay private; only the
+findings need to come back.
