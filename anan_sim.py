@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # anan_sim.py — openHPSDR Protocol 2 (ANAN / Saturn) receiver simulator.
 #
-# v1 scope: enough of Protocol 2 that a client discovers a radio, completes the
-# start-up handshake, and receives a continuous DDC0 I/Q stream — i.e. enough to
-# paint a waterfall. TX, multi-DDC, wideband and mic are deliberately absent
-# (see "NOT implemented" below).
+# Scope: enough of Protocol 2 that a client discovers a radio, completes the
+# start-up handshake, and receives continuous I/Q from EVERY DDC it enables
+# (v0.2: multi-DDC; v1 streamed only the lowest enabled one) — i.e. enough to
+# paint a waterfall, or to run a second receiver. TX, wideband and mic are
+# deliberately absent (see "NOT implemented" below).
 #
 # WHY THIS EXISTS
 #   AetherSDR speaks HPSDR Protocol 1 (Metis) via its HL2 backend. The ANAN-G2
@@ -63,8 +64,28 @@
 #     ADC clock). The General Packet's byte 37 bit 3 selects it, and the
 #     discovery reply's byte 21 advertises it. 10.000 MHz is 349525333.
 #
-# NOT implemented (v1): TX/DUC, DDC1-9, wideband ADC, mic samples, memory-mapped
-# access, non-default port re-assignment (accepted and logged, not acted on).
+#   - EVERY enabled DDC streams (v0.2). DDC-Specific byte 7 is the enable mask;
+#     each enabled DDC streams from its own source port 1035+n, with its own
+#     sequence counter, its own commanded rate (record n) and its own tuning (High
+#     Priority word n). Real-G2 evidence covers ONE enabled DDC at a time (the
+#     N2JXL pcaps); several-at-once follows the documented per-DDC ports and is
+#     UNCONFIRMED against a capture.
+#   - A DDC the radio does not have is not streamed. The discovery reply
+#     advertises --ddc DDCs (default 4: the figure AetherSDR PR #6697 gives for a
+#     real G2's p2app, unconfirmed here) and a mask bit beyond that is logged and
+#     ignored -- the "radio reports fewer DDCs than the client enabled" case.
+#   - DIVERSITY (EXPERIMENTAL, off unless the client asks): per a real-G2 owner,
+#     with High Priority byte 1363 bit 1 set the DDC0 header still declares 238
+#     samples but they arrive as 119 interleaved DDC0/DDC1 pairs. Modelled as
+#     that and nothing more: DDC1's own stream is withheld, the DDC0 packet
+#     cadence becomes 119/rate (each DDC still runs at its commanded rate), and
+#     DDC1 is the same tone 6 dB down and 45 degrees round so a combiner has
+#     something to combine. The cadence and the DDC1 behaviour are GUESSES until a
+#     capture says otherwise -- see docs/ANAN_P2_SIM_SCOPE.md.
+#
+# NOT implemented: TX/DUC, wideband ADC, mic samples, memory-mapped access,
+# PureSignal feedback, non-default port re-assignment (accepted and logged, not
+# acted on).
 #
 # Run:   python3 anan_sim.py                 # defaults, pattern=tone
 #        python3 anan_sim.py --rate 96000 --pattern noise
@@ -81,7 +102,7 @@ import sys
 import threading
 import time
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 
 # --- ports (PC -> SDR unless noted). Saturn doc, "Port Numbers to Use". -------
 PORT_DISCOVERY = 1024          # discovery AND General Packet to SDR
@@ -101,7 +122,13 @@ REPLY_LEN = 60
 STATUS_IDLE = 0x02             # 2 = idle/available, 3 = already sending
 DEVICE_SATURN = 0x0A           # pihpsdr NEW_DEVICE_SATURN 1010 = 1000 + 0x0A
 P2_VERSION = 39                # protocol 3.9
-SW_VERSION = 21
+# Gateware ("software") version in the discovery reply. NereusSDR logged "fw: 21"
+# against this sim; AetherSDR's droop defaults say they were derived against 27,
+# which is the best available evidence of what a real G2 reports. Both are
+# unconfirmed by a capture -- hence --gateware.
+SW_VERSION = 27
+DEFAULT_DDC_COUNT = 4
+MAX_DDC = 8                    # DDC-Specific byte 7 is a mask for DDC0-7
 
 # --- DDC Specific packet (port 1025) ------------------------------------------
 # Per-DDC records are 6 bytes starting at byte 17: ADC assignment at 17+6n,
@@ -122,6 +149,8 @@ FULL_SCALE_24 = (1 << 23) - 1
 PHASE_WORD_CLOCK_HZ = 122_880_000   # Saturn ADC clock: Hz = word * clock / 2^32
 GENERAL_FREQ_FLAGS = 37             # General Packet byte; bit 3 set = phase word
 HP_FREQ_OFFSET = 9                  # High Priority: 4-byte word per DDC at 9+4n
+HP_DIVERSITY_OFFSET = 1363          # High Priority byte; bit 1 = diversity (see above)
+HP_DIVERSITY_BIT = 0x02
 
 
 def phase_word_to_hz(word):
@@ -129,7 +158,18 @@ def phase_word_to_hz(word):
 
 
 def log(*a):
-    print(time.strftime("%H:%M:%S"), *a, flush=True)
+    """A log line must never be able to kill the thread that wrote it. On Windows a
+    piped stdout is cp1252, which cannot encode the warning sign in the sim's own
+    messages: print() raised UnicodeEncodeError, the DDC Specific thread died, and
+    the sim silently stopped reading mask and rate packets (found by the v0.2 tests
+    on Windows -- invisible on Linux and in any shell that sets PYTHONIOENCODING)."""
+    msg = " ".join(str(x) for x in (time.strftime("%H:%M:%S"), *a))
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        print(msg.encode("ascii", "replace").decode("ascii"), flush=True)
+    except (OSError, ValueError):      # stdout closed / broken pipe: never fatal
+        pass
 
 
 def local_ip():
@@ -143,29 +183,167 @@ def local_ip():
     finally:
         s.close()
 
+class IqSource:
+    """Pre-rendered, phase-continuous I/Q for ONE DDC.
+
+    v0.1 built every packet one sample at a time in Python (238 x two to_bytes
+    per packet) and topped out near 540 packets/s on the hub's Celeron J1900 --
+    about two-thirds of a real G2's 807 packets/s at 192k and a tenth of what
+    1536k wants. A tone is periodic, so render ONE whole number of cycles once
+    (and again only when the rate changes) and hand out slices of it: a packet
+    is then a single bytes slice, no per-sample Python at all.
+
+    The tone is rounded to a whole number of Hz so that period = rate / gcd(rate,
+    tone) is an integer and the ring wraps phase-continuously (no click at the
+    seam). Noise is a fixed 64k-sample ring: it repeats every ~1.4 s at 48k,
+    which is fine for exercising a waterfall and is NOT a statistics source.
+    """
+
+    NOISE_SAMPLES = 65536
+
+    def __init__(self, pattern, rate, tone_hz, amp_scale=1.0, phase_deg=0.0, seed=0):
+        self.pattern = pattern
+        self.rate = rate
+        self.tone_hz = tone_hz
+        self.amp_scale = amp_scale
+        self.phase_deg = phase_deg
+        self.seed = seed
+        self.pos = 0
+        self._render()
+
+    def set_rate(self, rate):
+        """A new rate changes the tone's period, so the ring is rebuilt. The
+        tone phase restarts; a rate change already discontinuously restarts the
+        client's DSP, so there is nothing to be continuous with."""
+        if rate != self.rate:
+            self.rate = rate
+            self.pos = 0
+            self._render()
+
+    @staticmethod
+    def _pack(i, q):
+        return (i & 0xFFFFFF).to_bytes(3, "big") + (q & 0xFFFFFF).to_bytes(3, "big")
+
+    def _render(self):
+        amp = int(FULL_SCALE_24 * 0.25 * self.amp_scale)
+        if self.pattern == "zero":
+            self.period = 1
+            unit = bytes(IQ_BYTES_PER_SAMPLE)
+            self.ring = unit * (IQ_SAMPLES_PER_PACKET + 1)
+            return
+        if self.pattern == "noise":
+            rng = random.Random(self.seed)
+            lim = max(1, amp // 8)
+            ring = bytearray()
+            for _ in range(self.NOISE_SAMPLES):
+                ring += self._pack(rng.randint(-lim, lim), rng.randint(-lim, lim))
+            self.period = self.NOISE_SAMPLES
+            self.ring = bytes(ring) + bytes(ring[:IQ_SAMPLES_PER_PACKET * IQ_BYTES_PER_SAMPLE])
+            return
+        f = int(round(self.tone_hz))
+        period = self.rate // math.gcd(self.rate, abs(f)) if f else 1
+        phase0 = math.radians(self.phase_deg)
+        ring = bytearray()
+        for n in range(period):
+            th = 2.0 * math.pi * f * n / self.rate + phase0
+            # Conjugate of the analytic convention, like the real wire:
+            # -sin puts a +tone_hz offset ABOVE the dial on a correct client.
+            ring += self._pack(int(amp * math.cos(th)), int(-amp * math.sin(th)))
+        self.period = period
+        reps = IQ_SAMPLES_PER_PACKET // period + 2
+        self.ring = bytes(ring) * reps
+
+    def take(self, nsamples):
+        """The next nsamples samples as 24-bit I/Q bytes (6 bytes each)."""
+        o = self.pos * IQ_BYTES_PER_SAMPLE
+        out = self.ring[o:o + nsamples * IQ_BYTES_PER_SAMPLE]
+        self.pos = (self.pos + nsamples) % self.period
+        return out
+
+
+def interleave_pairs(a, b):
+    """Two equal-length runs of 6-byte samples -> a0 b0 a1 b1 ... (the diversity
+    DDC0/DDC1 pair framing). Strided slice assignment: no per-sample loop."""
+    assert len(a) == len(b) and len(a) % IQ_BYTES_PER_SAMPLE == 0
+    out = bytearray(2 * len(a))
+    w = 2 * IQ_BYTES_PER_SAMPLE
+    for k in range(IQ_BYTES_PER_SAMPLE):
+        out[k::w] = a[k::IQ_BYTES_PER_SAMPLE]
+        out[IQ_BYTES_PER_SAMPLE + k::w] = b[k::IQ_BYTES_PER_SAMPLE]
+    return bytes(out)
+
+
+def ddc_tone_hz(base_hz, ddc):
+    """Tone offset for DDC n: DDC0-2 carry base_hz (DDC2 is RX1 on a Thetis-family
+    client, DDC0/1 the diversity pair), DDC3 carries 2x, DDC4 3x ... so a second
+    receiver is audibly and visibly a different signal from the first."""
+    return base_hz * max(1, ddc - 1)
+
+
+class DdcStream:
+    """One enabled DDC's outgoing stream: own socket (source port 1035+n),
+    sequence counter, rate and signal source."""
+
+    def __init__(self, ip, ddc, rate, pattern, tone_hz):
+        self.ddc = ddc
+        self.rate = rate
+        self.seq = 0
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((ip, PORT_DDC0_IQ_OUT + ddc))
+        # DDC1 is the same tone 6 dB down and 45 degrees round: indistinguishable
+        # from DDC0 it would be useless as a diversity pair.
+        self.source = IqSource(pattern, rate, ddc_tone_hz(tone_hz, ddc),
+                               amp_scale=0.5 if ddc == 1 else 1.0,
+                               phase_deg=45.0 if ddc == 1 else 0.0, seed=ddc)
+        self.next_at = time.perf_counter()
+        self.pkts = 0
+
+    def set_rate(self, rate):
+        self.rate = rate
+        self.source.set_rate(rate)
+        self.next_at = time.perf_counter()
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
 
 class AnanSim:
-    def __init__(self, ip, mac, rate, pattern, tone_hz, ddc_count):
+    def __init__(self, ip, mac, rate, pattern, tone_hz, ddc_count,
+                 gateware=SW_VERSION):
         self.ip = ip
         self.mac = mac
-        self.rate = rate
+        self.rate = rate                 # default for a DDC with no commanded rate yet
         self.pattern = pattern
         self.tone_hz = tone_hz
         self.ddc_count = ddc_count
+        self.gateware = gateware
 
         self.run = False                 # set by the High Priority run bit
         self.stop = False
         self.pc_addr = None              # (host, port) of the client SESSION
-        self.active_ddc = 0              # which DDC we stream as (enable mask)
-        self.centre_hz = 14_100_000      # active DDC's NCO, from High Priority
+        # DDC-Specific byte 7: bit n = DDCn streams. Starts as DDC0-only, the v0.1
+        # behaviour that p2stream.c and a bare run-bit client depend on: a REAL
+        # radio would stream nothing until a DDC Specific packet enables a DDC,
+        # so this is a deliberate convenience, replaced the moment one arrives.
+        self.enable_mask = 0x01
+        self.ddc_rates = {}              # n -> commanded S/s (DDC Specific record n)
+        self.centre_hz = {}              # n -> NCO Hz (High Priority word n)
+        self.diversity = False           # High Priority byte 1363 bit 1
         self.freq_is_phase_word = True   # the P2 default; General byte 37 bit 3
-        self.seq_iq = 0
         self.seq_hp = 0
-        self.phase = 0.0
-        self.stat_pkts = 0
-        self.stat_t0 = time.perf_counter()
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()    # spec + HP threads both touch mask/centres
+        self.hp_words = {}               # n -> latest raw High Priority word, enabled or not
         self.socks = []
+        self._warned = set()
+
+    def _warn_once(self, key, msg):
+        if key not in self._warned:
+            self._warned.add(key)
+            log(msg)
 
     # -- discovery + general (port 1024) -------------------------------------
     def serve_discovery(self):
@@ -203,7 +381,7 @@ class AnanSim:
         b[5:11] = self.mac
         b[11] = DEVICE_SATURN
         b[12] = P2_VERSION
-        b[13] = SW_VERSION
+        b[13] = self.gateware
         b[20] = self.ddc_count
         b[21] = 1                        # High Priority frequencies are phase words
         return bytes(b)
@@ -253,19 +431,39 @@ class AnanSim:
             if run != self.run:
                 self.run = run
                 log(f"[hp ] RUN bit -> {int(run)} "
-                    f"({'streaming DDC0' if run else 'stopped'})")
-            # Centre frequency of the DDC we stream: big-endian uint32 at 9+4n,
-            # a phase word unless the General Packet switched to Hz. Logged
-            # only -- the tone is an offset from wherever the client tuned.
-            off = HP_FREQ_OFFSET + 4 * self.active_ddc
-            if len(data) >= off + 4:
-                word = struct.unpack_from(">I", data, off)[0]
-                hz = round(phase_word_to_hz(word)) if self.freq_is_phase_word else word
-                if word and hz != self.centre_hz:
-                    self.centre_hz = hz
-                    log(f"[hp ] DDC{self.active_ddc} centre -> {hz/1e6:.6f} MHz")
+                    f"({'streaming' if run else 'stopped'})")
+            # Tuning of every DDC: big-endian uint32 at 9+4n, a phase word unless
+            # the General Packet switched to Hz. ALL words are remembered, so a
+            # DDC enabled by a DDC Specific packet that arrives AFTER this one
+            # still picks up its tuning at once. Logged and kept only -- each
+            # tone is an offset from wherever the client tuned.
+            with self.lock:
+                for n in range(MAX_DDC):
+                    off = HP_FREQ_OFFSET + 4 * n
+                    if len(data) >= off + 4:
+                        self.hp_words[n] = struct.unpack_from(">I", data, off)[0]
+                self._note_centres()
+            if len(data) > HP_DIVERSITY_OFFSET:
+                div = bool(data[HP_DIVERSITY_OFFSET] & HP_DIVERSITY_BIT)
+                if div != self.diversity:
+                    self.diversity = div
+                    log(f"[hp ] diversity {'ON' if div else 'off'} (byte "
+                        f"{HP_DIVERSITY_OFFSET}) -- EXPERIMENTAL framing"
+                        f"{': DDC0 carries 119 interleaved DDC0/DDC1 pairs' if div else ''}")
 
-    # -- DDC specific (1025): the client commands the DDC0 sample rate here ---
+    def _note_centres(self):
+        """Log (and keep) the tuning of every ENABLED DDC whose word changed.
+        Caller holds self.lock."""
+        for n in range(MAX_DDC):
+            word = self.hp_words.get(n, 0)
+            if not (self.enable_mask >> n) & 1 or not word:
+                continue
+            hz = round(phase_word_to_hz(word)) if self.freq_is_phase_word else word
+            if hz != self.centre_hz.get(n):
+                self.centre_hz[n] = hz
+                log(f"[hp ] DDC{n} centre -> {hz/1e6:.6f} MHz")
+
+    # -- DDC specific (1025): enable mask + a commanded rate PER DDC ----------
     def serve_ddc_spec(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -292,32 +490,46 @@ class AnanSim:
                              for i in range(4)]
                     log(f"[ddc] CmdRx mask=0x{data[7]:02x} "
                         f"rates(kHz) DDC0-3={rates}")
+            if len(data) < 8:
+                continue
             # buf[7] = DDC enable bitmask (bit n = DDCn), per Thetis CmdRx
             # (NereusSDR P2CodecOrionMkII::composeCmdRx). Thetis-family clients
-            # run RX1 on DDC2 — DDC0/1 are reserved for PureSignal feedback —
-            # which is why N2JXL's real-G2 capture streams from port 1037, not
-            # 1035. Stream as the LOWEST enabled DDC, from its own port.
-            if len(data) >= 8 and data[7]:
-                ddc = (data[7] & -data[7]).bit_length() - 1
-                if ddc != self.active_ddc:
-                    self.active_ddc = ddc
-                    log(f"[ddc] enable mask 0x{data[7]:02x} -> streaming as "
-                        f"DDC{ddc} (port {PORT_DDC0_IQ_OUT + ddc})")
-            rate_off = DDC0_RATE_OFFSET + 6 * self.active_ddc
-            if len(data) < rate_off + 2:
-                continue
-            khz = struct.unpack_from(">H", data, rate_off)[0]
-            rate = khz * 1000
-            if not khz or rate == self.rate:
-                continue
-            if rate not in DDC_RATES:
-                log(f"[ddc] ⚠ commanded DDC{self.active_ddc} rate {khz} kHz "
-                    f"is not a P2 rate — ignored")
-                continue
-            self.rate = rate
-            log(f"[ddc] DDC{self.active_ddc} rate -> {rate} S/s "
-                f"(cadence {IQ_SAMPLES_PER_PACKET/rate*1000:.3f} ms/packet, "
-                f"size stays {IQ_HEADER_BYTES + IQ_PAYLOAD_BYTES} B)")
+            # run RX1 on DDC2 -- DDC0/1 are reserved for PureSignal feedback and
+            # diversity -- which is why N2JXL's real-G2 capture streams from
+            # port 1037, not 1035. EVERY enabled DDC streams (v0.2).
+            mask = data[7]
+            with self.lock:
+                if mask != self.enable_mask:
+                    on = [n for n in range(MAX_DDC) if (mask >> n) & 1]
+                    log(f"[ddc] enable mask 0x{self.enable_mask:02x} -> 0x{mask:02x} "
+                        f"-> streaming DDC{on} "
+                        f"(ports {[PORT_DDC0_IQ_OUT + n for n in on]})")
+                    self.enable_mask = mask
+                    self._note_centres()
+                for n in range(MAX_DDC):
+                    if not (mask >> n) & 1:
+                        continue
+                    if n >= self.ddc_count:
+                        self._warn_once(("nodev", n),
+                                        f"[ddc] ⚠ DDC{n} enabled but this radio advertises "
+                                        f"only {self.ddc_count} DDCs -- not streaming it")
+                        continue
+                    off = DDC0_RATE_OFFSET + 6 * n
+                    if len(data) < off + 2:
+                        continue
+                    khz = struct.unpack_from(">H", data, off)[0]
+                    rate = khz * 1000
+                    if not khz or rate == self.ddc_rates.get(n):
+                        continue
+                    if rate not in DDC_RATES:
+                        self._warn_once(("badrate", n, khz),
+                                        f"[ddc] ⚠ commanded DDC{n} rate {khz} kHz "
+                                        f"is not a P2 rate — ignored")
+                        continue
+                    self.ddc_rates[n] = rate
+                    log(f"[ddc] DDC{n} rate -> {rate} S/s "
+                        f"(cadence {IQ_SAMPLES_PER_PACKET/rate*1000:.3f} ms/packet, "
+                        f"size stays {IQ_HEADER_BYTES + IQ_PAYLOAD_BYTES} B)")
 
     # -- DUC specific (1026): accepted, minimally parsed ----------------------
     def serve_spec(self, port, name):
@@ -336,87 +548,111 @@ class AnanSim:
                 log(f"[{name}] first packet ({len(data)} B) — accepted")
 
     # -- DDC I/Q out (to the client's SESSION port, from 1035+n) --------------
-    # Clients demux streams by the radio-side SOURCE port, so the socket must
-    # be bound to 1035 + active_ddc and rebound if the enable mask moves it.
-    def stream_ddc0(self):
-        bound = self.active_ddc
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((self.ip, PORT_DDC0_IQ_OUT + bound))
-        self.socks.append(s)
-        period = IQ_SAMPLES_PER_PACKET / self.rate      # 4.96 ms @ 48k
+    # Clients demux streams by the radio-side SOURCE port, so each enabled DDC
+    # owns a socket bound to 1035 + n; one is opened when its mask bit appears and
+    # closed when it goes (a re-enabled DDC starts a fresh stream, seq 0).
+    def _wanted(self):
+        """({ddc: rate}, diversity_active) for the streams that should run now."""
+        with self.lock:
+            mask, diversity = self.enable_mask, self.diversity
+            want = {}
+            for n in range(min(MAX_DDC, self.ddc_count)):
+                if (mask >> n) & 1:
+                    want[n] = self.ddc_rates.get(n, self.rate)
+            # Diversity: DDC1 rides inside DDC0's packets, never its own.
+            div = diversity and 0 in want
+            if div:
+                want.pop(1, None)
+            return want, div
+
+    def stream_ddcs(self):
+        streams = {}
+        stat_t0 = time.perf_counter()
         log(f"[iq ] DDC ready: {IQ_PAYLOAD_BYTES} B / {IQ_SAMPLES_PER_PACKET} samples "
-            f"every {period*1000:.3f} ms at {self.rate} S/s")
-        next_at = time.perf_counter()
+            f"per packet at every rate (cadence = {IQ_SAMPLES_PER_PACKET}/rate)")
         while not self.stop:
-            if bound != self.active_ddc:
-                s.close()
-                bound = self.active_ddc
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind((self.ip, PORT_DDC0_IQ_OUT + bound))
-                self.socks.append(s)
-                self.seq_iq = 0            # fresh stream identity, fresh seq
-                log(f"[iq ] source port -> {PORT_DDC0_IQ_OUT + bound} (DDC{bound})")
-            if not (self.run and self.pc_addr):
+            want, div = self._wanted()
+            for n in [n for n in streams if n not in want]:
+                streams.pop(n).close()
+                log(f"[iq ] DDC{n} stream stopped (port {PORT_DDC0_IQ_OUT + n})")
+            for n, rate in want.items():
+                st = streams.get(n)
+                if st is None:
+                    try:
+                        streams[n] = DdcStream(self.ip, n, rate, self.pattern, self.tone_hz)
+                    except OSError as e:
+                        self._warn_once(("bind", n), f"[iq ] ⚠ cannot bind DDC{n} source port "
+                                        f"{PORT_DDC0_IQ_OUT + n}: {e}")
+                        continue
+                    log(f"[iq ] DDC{n} stream started: source port "
+                        f"{PORT_DDC0_IQ_OUT + n}, {rate} S/s, tone "
+                        f"{ddc_tone_hz(self.tone_hz, n):g} Hz above the dial")
+                elif st.rate != rate:
+                    st.set_rate(rate)
+            if not (self.run and self.pc_addr and streams):
                 time.sleep(0.02)
-                next_at = time.perf_counter()
+                now = time.perf_counter()
+                for st in streams.values():
+                    st.next_at = now
                 continue
             # Windows sleep() is ~15 ms grained; per-packet pacing at 1.24 ms
-            # (192k) is impossible. Sleep to the next deadline, then send EVERY
-            # packet due in one burst — clients buffer; what they cannot survive
-            # is the old "fell behind -> resync" branch silently DROPPING the
-            # backlog (heard as ~3 Hz clicking: bursts of tone, then starvation).
-            slack = next_at - time.perf_counter()
+            # (192k) is impossible. Sleep to the earliest deadline (capped, so a
+            # mask or rate change is noticed within 20 ms), then send EVERY packet
+            # due in one burst -- clients buffer; what they cannot survive is the
+            # old "fell behind -> resync" branch silently DROPPING the backlog
+            # (heard as ~3 Hz clicking: bursts of tone, then starvation).
+            slack = min(st.next_at for st in streams.values()) - time.perf_counter()
             if slack > 0:
-                time.sleep(slack)
-            sent = 0
-            while next_at <= time.perf_counter() and sent < 64:
-                try:
-                    s.sendto(self.iq_packet(), self.pc_addr)
-                except OSError:
-                    pass
-                self.seq_iq += 1
-                self.stat_pkts += 1
-                next_at += IQ_SAMPLES_PER_PACKET / self.rate
-                sent += 1
-            if sent >= 64:                 # hopelessly behind (paused/debugged)
-                next_at = time.perf_counter()
+                time.sleep(min(slack, 0.02))
             now = time.perf_counter()
-            if now - self.stat_t0 >= 5.0:
-                want = self.rate / IQ_SAMPLES_PER_PACKET
-                got = self.stat_pkts / (now - self.stat_t0)
-                log(f"[iq ] {got:.0f} pkt/s (nominal {want:.0f}) at {self.rate} S/s")
-                self.stat_t0, self.stat_pkts = now, 0
+            for st in streams.values():
+                paired = st.ddc == 0 and div
+                nsamp = IQ_SAMPLES_PER_PACKET // 2 if paired else IQ_SAMPLES_PER_PACKET
+                period = nsamp / st.rate
+                sent = 0
+                while st.next_at <= now and sent < 64:
+                    if paired:
+                        d1 = streams.get(1)
+                        partner = d1.source if d1 else self._diversity_partner(st)
+                        # A diversity pair is the SAME instant on two antennas, so
+                        # both halves must come from the same sample index; the only
+                        # difference left is the deliberate -6 dB / 45 degrees.
+                        partner.pos = st.source.pos % partner.period
+                        payload = interleave_pairs(st.source.take(nsamp), partner.take(nsamp))
+                    else:
+                        payload = st.source.take(nsamp)
+                    hdr = struct.pack(">IQHH", st.seq & 0xFFFFFFFF,
+                                      int(time.time() * 1e9) & 0xFFFFFFFFFFFFFFFF,
+                                      24, IQ_SAMPLES_PER_PACKET)
+                    try:
+                        st.sock.sendto(hdr + payload, self.pc_addr)
+                    except OSError:
+                        pass
+                    st.seq += 1
+                    st.pkts += 1
+                    st.next_at += period
+                    sent += 1
+                if sent >= 64:                 # hopelessly behind (paused/debugged)
+                    st.next_at = time.perf_counter()
+            if now - stat_t0 >= 5.0:
+                for st in streams.values():
+                    per = (IQ_SAMPLES_PER_PACKET // 2) if (st.ddc == 0 and div) else IQ_SAMPLES_PER_PACKET
+                    got = st.pkts / (now - stat_t0)
+                    log(f"[iq ] DDC{st.ddc}: {got:.0f} pkt/s (nominal {st.rate / per:.0f}) "
+                        f"at {st.rate} S/s")
+                    st.pkts = 0
+                stat_t0 = now
 
-    def iq_packet(self):
-        hdr = struct.pack(">IQHH", self.seq_iq & 0xFFFFFFFF,
-                          int(time.time() * 1e9) & 0xFFFFFFFFFFFFFFFF,
-                          24, IQ_SAMPLES_PER_PACKET)
-        return hdr + self.iq_payload()
-
-    def iq_payload(self):
-        out = bytearray(IQ_PAYLOAD_BYTES)
-        step = 2.0 * math.pi * self.tone_hz / self.rate
-        amp = int(FULL_SCALE_24 * 0.25)
-        for n in range(IQ_SAMPLES_PER_PACKET):
-            if self.pattern == "noise":
-                i = random.randint(-amp // 8, amp // 8)
-                q = random.randint(-amp // 8, amp // 8)
-            elif self.pattern == "zero":
-                i = q = 0
-            else:                                   # tone (default)
-                self.phase += step
-                if self.phase > 2 * math.pi:
-                    self.phase -= 2 * math.pi
-                # Conjugate of the analytic convention, like the real wire:
-                # -sin puts a +tone_hz offset ABOVE the dial on a correct client.
-                i = int(amp * math.cos(self.phase))
-                q = int(-amp * math.sin(self.phase))
-            o = n * IQ_BYTES_PER_SAMPLE
-            out[o:o+3] = (i & 0xFFFFFF).to_bytes(3, "big")
-            out[o+3:o+6] = (q & 0xFFFFFF).to_bytes(3, "big")
-        return bytes(out)
+    def _diversity_partner(self, st0):
+        """DDC1's signal for the diversity pair when DDC1 itself is not enabled
+        (a client may set the diversity bit with only DDC0 in the mask)."""
+        src = getattr(self, "_div_partner", None)
+        if src is None:
+            src = IqSource(self.pattern, st0.rate, ddc_tone_hz(self.tone_hz, 1),
+                           amp_scale=0.5, phase_deg=45.0, seed=1)
+            self._div_partner = src
+        src.set_rate(st0.rate)
+        return src
 
     # -- high priority out: FROM radio :1025 TO the session port, 50 ms in RX.
     # Real-G2 pcap: .127:1025 -> .108:<session>, 60 B. Clients demux by the
@@ -446,17 +682,21 @@ class AnanSim:
                 ctypes.windll.winmm.timeBeginPeriod(1)
             except Exception:
                 pass
-        log(f"anan-sim {VERSION} — openHPSDR Protocol 2 (Saturn/ANAN-G2) RX only")
+        log(f"anan-sim {VERSION} — openHPSDR Protocol 2 (Saturn/ANAN-G2) RX only, multi-DDC")
         log(f"  ip={self.ip} rate={self.rate} pattern={self.pattern} "
-            f"tone={self.tone_hz} Hz ddc={self.ddc_count}")
+            f"tone={self.tone_hz} Hz ddc={self.ddc_count} gateware={self.gateware}")
         log(f"  MAC {':'.join(f'{x:02x}' for x in self.mac)}  device 0x{DEVICE_SATURN:02x} (Saturn)")
         for target, args in ((self.serve_discovery, ()),
                              (self.serve_high_priority, ()),
                              (self.serve_ddc_spec, ()),
                              (self.serve_spec, (PORT_DUC_SPEC, "duc")),
-                             (self.stream_ddc0, ()),
+                             (self.stream_ddcs, ()),
                              (self.stream_high_priority, ())):
             threading.Thread(target=target, args=args, daemon=True).start()
+        t0 = time.time()
+        while time.time() - t0 < 3.0 and not (len(self.socks) >= 4
+                                              and getattr(self, "sock_1025", None)):
+            time.sleep(0.01)
         log("  waiting for discovery…  (Ctrl-C to stop)")
         try:
             while True:
@@ -475,11 +715,18 @@ def main():
     ap = argparse.ArgumentParser(description="openHPSDR Protocol 2 (ANAN/Saturn) RX simulator")
     ap.add_argument("--ip", default=None, help="interface to bind (default: autodetect)")
     ap.add_argument("--rate", type=int, default=48000, choices=list(DDC_RATES),
-                    help="initial DDC0 sample rate — the client's DDC Specific "
-                         "packet overrides it (changes packet CADENCE, not size)")
+                    help="default sample rate for a DDC the client has not commanded "
+                         "one for -- the DDC Specific packet overrides it per DDC "
+                         "(changes packet CADENCE, not size)")
     ap.add_argument("--pattern", default="tone", choices=["tone", "noise", "zero"])
     ap.add_argument("--tone", type=float, default=1000.0, help="tone offset from centre, Hz")
-    ap.add_argument("--ddc", type=int, default=2, help="DDC count to advertise")
+    ap.add_argument("--ddc", type=int, default=DEFAULT_DDC_COUNT,
+                    help="DDC count to advertise AND to stream (an enabled DDC beyond "
+                         "it is ignored, like a radio that lacks it); default "
+                         f"{DEFAULT_DDC_COUNT}")
+    ap.add_argument("--gateware", type=int, default=SW_VERSION,
+                    help="gateware version byte in the discovery reply "
+                         f"(default {SW_VERSION}; unconfirmed against a real G2)")
     ap.add_argument("--mac", default="00:1c:c0:a2:13:dd", help="MAC in the discovery reply")
     args = ap.parse_args()
 
@@ -490,8 +737,10 @@ def main():
     except ValueError:
         sys.exit(f"bad --mac {args.mac!r}: want six hex octets like 00:1c:c0:a2:13:dd")
 
+    if not 1 <= args.ddc <= MAX_DDC:
+        sys.exit(f"bad --ddc {args.ddc}: want 1..{MAX_DDC}")
     AnanSim(args.ip or local_ip(), mac, args.rate, args.pattern,
-            args.tone, args.ddc).start()
+            args.tone, args.ddc, args.gateware).start()
 
 
 if __name__ == "__main__":
