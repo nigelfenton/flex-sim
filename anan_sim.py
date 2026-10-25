@@ -111,15 +111,20 @@
 # Then point a Protocol 2 client (Thetis, piHPSDR) at this host.
 
 import argparse
+import atexit
+import errno
+import ipaddress
 import math
+import queue
 import random
 import socket
 import struct
 import sys
 import threading
 import time
+import traceback
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 # --- ports (PC -> SDR unless noted). Saturn doc, "Port Numbers to Use". -------
 PORT_DISCOVERY = 1024          # discovery AND General Packet to SDR
@@ -202,19 +207,58 @@ def phase_word_to_hz(word):
     return word * PHASE_WORD_CLOCK_HZ / (1 << 32)
 
 
+# Logging must never be able to stall the sim. print() BLOCKS when stdout is a pipe nobody
+# is reading (a Windows pipe holds only ~4 KB) or a console paused by selecting text, and
+# log() is called while holding the sim's lock -- so a burst of log-producing packets froze
+# the DDC Specific handling, then everything behind it, with no error. Lines now go through
+# a bounded queue to ONE writer thread; if stdout is blocked the queue fills and further
+# lines are DROPPED (and counted), never waited for.
+_LOGQ = queue.Queue(maxsize=2000)
+_log_state = {"dropped": 0, "started": False}
+_log_start_lock = threading.Lock()
+
+
+def _log_writer():
+    while True:
+        msg = _LOGQ.get()
+        dropped = _log_state["dropped"]
+        if dropped:
+            _log_state["dropped"] = 0
+            msg = f"[log] {dropped} line(s) dropped while stdout was blocked\n" + msg
+        try:
+            print(msg, flush=True)
+        except UnicodeEncodeError:
+            # Windows pipes are cp1252, which cannot encode the warning sign in the sim's own
+            # messages: print() raised and (v0.1/v0.2) killed the thread that logged it.
+            try:
+                print(msg.encode("ascii", "replace").decode("ascii"), flush=True)
+            except Exception:
+                pass
+        except (OSError, ValueError):      # stdout closed / broken pipe: never fatal
+            pass
+
+
 def log(*a):
-    """A log line must never be able to kill the thread that wrote it. On Windows a
-    piped stdout is cp1252, which cannot encode the warning sign in the sim's own
-    messages: print() raised UnicodeEncodeError, the DDC Specific thread died, and
-    the sim silently stopped reading mask and rate packets (found by the v0.2 tests
-    on Windows -- invisible on Linux and in any shell that sets PYTHONIOENCODING)."""
+    """Queue one log line. Never blocks, never raises."""
     msg = " ".join(str(x) for x in (time.strftime("%H:%M:%S"), *a))
+    if not _log_state["started"]:
+        with _log_start_lock:
+            if not _log_state["started"]:
+                threading.Thread(target=_log_writer, daemon=True, name="log-writer").start()
+                _log_state["started"] = True
     try:
-        print(msg, flush=True)
-    except UnicodeEncodeError:
-        print(msg.encode("ascii", "replace").decode("ascii"), flush=True)
-    except (OSError, ValueError):      # stdout closed / broken pipe: never fatal
-        pass
+        _LOGQ.put_nowait(msg)
+    except queue.Full:
+        _log_state["dropped"] += 1
+
+
+@atexit.register
+def _flush_log():
+    """Give the writer a moment to print what is queued before the process exits."""
+    t_end = time.time() + 1.0
+    while not _LOGQ.empty() and time.time() < t_end:
+        time.sleep(0.01)
+    time.sleep(0.05)
 
 
 def local_ip():
@@ -227,6 +271,31 @@ def local_ip():
         return "127.0.0.1"
     finally:
         s.close()
+
+# A rendered ring is a pure function of (pattern, rate, tone, amplitude, phase, seed), so
+# render each ONCE. A client that flaps the rate (48k <-> 1536k a few hundred times a
+# second) used to make the stream thread re-render the ring every time -- a CPU storm
+# that starved the control plane. The cache is small: 6 rates x a few tones.
+_RING_CACHE = {}
+_RING_CACHE_MAX = 48
+# A ring longer than this takes seconds to render on a Celeron and stalls the stream thread.
+# rate / gcd(rate, tone) can reach the rate itself (an odd tone at 1536 k = 1.5 M samples),
+# so the tone is nudged by a few Hz to the nearest value whose ring stays short.
+MAX_RING_SAMPLES = 262144
+
+
+def tone_for_ring(rate, tone_hz):
+    """The whole-Hz tone actually rendered: tone_hz rounded, then moved by the smallest
+    amount (<= a few Hz) that keeps the ring period (rate / gcd) within MAX_RING_SAMPLES."""
+    f = int(round(tone_hz))
+    if f == 0:
+        return 0
+    for d in range(0, 400):
+        for cand in (f + d, f - d):
+            if cand and (cand > 0) == (f > 0) and rate // math.gcd(rate, abs(cand)) <= MAX_RING_SAMPLES:
+                return cand
+    return f
+
 
 class IqSource:
     """Pre-rendered, phase-continuous I/Q for ONE DDC.
@@ -270,6 +339,19 @@ class IqSource:
         return (i & 0xFFFFFF).to_bytes(3, "big") + (q & 0xFFFFFF).to_bytes(3, "big")
 
     def _render(self):
+        f = tone_for_ring(self.rate, self.tone_hz) if self.pattern == "tone" else 0
+        key = (self.pattern, self.rate if self.pattern == "tone" else 0, f,
+               self.amp_scale, self.phase_deg, self.seed)
+        hit = _RING_CACHE.get(key)
+        if hit is None:
+            self._render_uncached()
+            if len(_RING_CACHE) >= _RING_CACHE_MAX:
+                _RING_CACHE.clear()
+            _RING_CACHE[key] = (self.period, self.ring)
+        else:
+            self.period, self.ring = hit
+
+    def _render_uncached(self):
         amp = int(FULL_SCALE_24 * 0.25 * self.amp_scale)
         if self.pattern == "zero":
             self.period = 1
@@ -285,7 +367,7 @@ class IqSource:
             self.period = self.NOISE_SAMPLES
             self.ring = bytes(ring) + bytes(ring[:IQ_SAMPLES_PER_PACKET * IQ_BYTES_PER_SAMPLE])
             return
-        f = int(round(self.tone_hz))
+        f = tone_for_ring(self.rate, self.tone_hz)
         period = self.rate // math.gcd(self.rate, abs(f)) if f else 1
         phase0 = math.radians(self.phase_deg)
         ring = bytearray()
@@ -359,8 +441,15 @@ class DdcStream:
 class AnanSim:
     def __init__(self, ip, mac, rate, pattern, tone_hz, ddc_count,
                  gateware=SW_VERSION, pair_order="d0d1", enforce_ddc_count=False,
-                 stale_burst=False, supply_volts=13.58, adc_peak=None, adc_overload=0):
+                 stale_burst=False, supply_volts=13.58, adc_peak=None, adc_overload=0,
+                 allow=None):
         self.ip = ip
+        # --allow CIDR: only these hosts may START or REDIRECT a session (General / High
+        # Priority). Without it ANY host that sends one High Priority packet makes the sim
+        # stream to that source -- as a real radio does -- which also makes the sim a traffic
+        # reflector: a spoofed source aims up to ~75 Mbit/s (1536 k) at a victim.
+        self.allow = [ipaddress.ip_network(c, strict=False) for c in (allow or [])]
+        self._bound = {}                 # port -> the one socket bound to it
         self.mac = mac
         self.rate = rate                 # default for a DDC with no commanded rate yet
         self.pattern = pattern
@@ -396,6 +485,62 @@ class AnanSim:
         self.socks = []
         self._warned = set()
 
+    def _socket_for(self, port):
+        """The ONE socket bound to `port`, created on first use. Binding happens in start(),
+        before any thread, so a thread that crashes and is restarted reuses its socket
+        (no second bind competing for the same datagrams) and "waiting for discovery"
+        is only printed when the sim really is listening."""
+        s = self._bound.get(port)
+        if s is None:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((self.ip, port))
+            self._bound[port] = s
+            self.socks.append(s)
+        return s
+
+    def _recvfrom(self, s):
+        """The next datagram as (data, addr), or None once the socket is closed for shutdown.
+
+        On Windows an UNCONNECTED UDP socket raises from recvfrom() in two cases that are
+        NOT shutdown: WSAECONNRESET (10054) when an earlier sendto() from the same socket hit
+        a closed port (the ICMP unreachable is reported on the NEXT receive), and WSAEMSGSIZE
+        (10040) for a datagram larger than the buffer. Every loop here used to treat any
+        OSError as "socket closed" and break, so ONE oversize datagram killed the discovery
+        thread and a client that simply vanished killed the DDC Specific thread -- the sim
+        then silently ignored every mask and rate packet. The buffer is the maximum a UDP
+        datagram can carry, and only a closed socket ends the loop."""
+        while not self.stop:
+            try:
+                return s.recvfrom(65535)
+            except (ConnectionResetError, ConnectionAbortedError):
+                continue
+            except OSError as e:
+                if self.stop or e.errno in (errno.EBADF, errno.ENOTSOCK) \
+                        or getattr(e, "winerror", None) in (10038, 10004):
+                    return None
+                self._warn_once(("recv", e.errno), f"[net] recv error {e!r} - continuing")
+                time.sleep(0.01)
+        return None
+
+    def _supervised(self, target, *args):
+        """A thread body that restarts its target when it raises, with the traceback logged:
+        a thread must never die silently while the process lives and keeps answering discovery."""
+        name = getattr(target, "__name__", "thread")
+
+        def run():
+            crashes = 0
+            while not self.stop:
+                try:
+                    target(*args)
+                    return
+                except Exception:
+                    crashes += 1
+                    log(f"[sim] ! thread {name} crashed (#{crashes}); restarting in 0.5 s:\n"
+                        + traceback.format_exc())
+                    time.sleep(0.5)
+        return run
+
     def _warn_once(self, key, msg):
         if key not in self._warned:
             self._warned.add(key)
@@ -403,16 +548,13 @@ class AnanSim:
 
     # -- discovery + general (port 1024) -------------------------------------
     def serve_discovery(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((self.ip, PORT_DISCOVERY))
-        self.socks.append(s)
+        s = self._socket_for(PORT_DISCOVERY)
         log(f"[disc] listening on {self.ip}:{PORT_DISCOVERY}")
         while not self.stop:
-            try:
-                data, addr = s.recvfrom(2048)
-            except OSError:
+            got = self._recvfrom(s)
+            if got is None:
                 break
+            data, addr = got
             if len(data) < 5:
                 continue
             # P2 discovery: [0:4] == 0, [4] == 0x02. A P1 probe (EF FE ...) also
@@ -449,15 +591,21 @@ class AnanSim:
         went to :62520, the General/HP source — not :62517, the discovery
         source). Learned from General and HP-in so it survives a sim restart
         mid-session."""
+        if self.allow and not any(ipaddress.ip_address(addr[0]) in net for net in self.allow):
+            self._warn_once(("deny", addr[0]),
+                            f"[gen] session request from {addr[0]} ignored: not in --allow")
+            return False
         if addr != self.pc_addr:
             self.pc_addr = addr
             log(f"[gen] session -> {addr[0]}:{addr[1]} (streams target this port)")
+        return True
 
     def handle_general(self, data, addr):
         """General Packet to SDR — may re-assign every port. v1 logs only."""
         if len(data) < 60:
             return
-        self._learn_session(addr)
+        if not self._learn_session(addr):
+            return
         # Ports live at [5:] as big-endian uint16 pairs; zero means "default".
         wanted = struct.unpack_from(">H", data, 5)[0] if len(data) >= 7 else 0
         if wanted not in (0, PORT_DDC_SPEC):
@@ -472,18 +620,16 @@ class AnanSim:
 
     # -- high priority in (port 1027): carries the RUN bit --------------------
     def serve_high_priority(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((self.ip, PORT_HIGH_PRIO_IN))
-        self.socks.append(s)
+        s = self._socket_for(PORT_HIGH_PRIO_IN)
         while not self.stop:
-            try:
-                data, addr = s.recvfrom(2048)
-            except OSError:
+            got = self._recvfrom(s)
+            if got is None:
                 break
+            data, addr = got
             if len(data) < 5:
                 continue
-            self._learn_session(addr)
+            if not self._learn_session(addr):
+                continue                     # a host that is not allowed to drive the sim
             run = bool(data[4] & 0x01)
             if run != self.run:
                 if run:
@@ -517,17 +663,14 @@ class AnanSim:
 
     # -- DDC specific (1025): enable mask + a commanded rate PER DDC ----------
     def serve_ddc_spec(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((self.ip, PORT_DDC_SPEC))
-        self.socks.append(s)
+        s = self._socket_for(PORT_DDC_SPEC)
         self.sock_1025 = s     # HP-out shares it: radio sends HP FROM :1025
         seen = False
         while not self.stop:
-            try:
-                data, _ = s.recvfrom(2048)
-            except OSError:
+            got = self._recvfrom(s)
+            if got is None:
                 break
+            data, _ = got
             if not seen:
                 seen = True
                 log(f"[ddc] first packet ({len(data)} B) — accepted")
@@ -594,18 +737,15 @@ class AnanSim:
 
     # -- DUC specific (1026): accepted, minimally parsed ----------------------
     def serve_spec(self, port, name):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((self.ip, port))
-        self.socks.append(s)
+        s = self._socket_for(port)
         if port == PORT_DUC_SPEC:
             self.sock_1026 = s     # the mic stream leaves FROM :1026, like HP-out from :1025
         seen = False
         while not self.stop:
-            try:
-                data, _ = s.recvfrom(2048)
-            except OSError:
+            got = self._recvfrom(s)
+            if got is None:
                 break
+            data, _ = got
             if not seen:
                 seen = True
                 log(f"[{name}] first packet ({len(data)} B) — accepted")
@@ -859,6 +999,15 @@ class AnanSim:
             f"{' enforce-ddc-count' if self.enforce_ddc_count else ''}"
             f"{' stale-burst' if self.stale_burst else ''}")
         log(f"  MAC {':'.join(f'{x:02x}' for x in self.mac)}  device 0x{DEVICE_SATURN:02x} (Saturn)")
+        # Bind EVERY listening socket here, before any thread: a port that is already in use
+        # is then a clear message at startup, and "waiting for discovery" below is true.
+        for port in (PORT_DISCOVERY, PORT_HIGH_PRIO_IN, PORT_DDC_SPEC, PORT_DUC_SPEC):
+            try:
+                self._socket_for(port)
+            except OSError as e:
+                sys.exit(f"cannot bind {self.ip}:{port}: {e}")
+        self.sock_1025 = self._bound[PORT_DDC_SPEC]
+        self.sock_1026 = self._bound[PORT_DUC_SPEC]
         for target, args in ((self.serve_discovery, ()),
                              (self.serve_high_priority, ()),
                              (self.serve_ddc_spec, ()),
@@ -866,11 +1015,7 @@ class AnanSim:
                              (self.stream_ddcs, ()),
                              (self.stream_mic, ()),
                              (self.stream_high_priority, ())):
-            threading.Thread(target=target, args=args, daemon=True).start()
-        t0 = time.time()
-        while time.time() - t0 < 3.0 and not (len(self.socks) >= 4
-                                              and getattr(self, "sock_1025", None)):
-            time.sleep(0.01)
+            threading.Thread(target=self._supervised(target, *args), daemon=True).start()
         log("  waiting for discovery…  (Ctrl-C to stop)")
         try:
             while True:
@@ -920,7 +1065,28 @@ def main():
                     help="gateware version byte in the discovery reply "
                          f"(default {SW_VERSION}; unconfirmed against a real G2)")
     ap.add_argument("--mac", default="00:1c:c0:a2:13:dd", help="MAC in the discovery reply")
+    ap.add_argument("--allow", action="append", default=[], metavar="CIDR",
+                    help="only hosts in this network may start or redirect a session (repeatable, "
+                         "e.g. --allow 192.168.0.0/24 --allow 100.64.0.0/10). Default: any host, "
+                         "like a real radio -- which also lets a spoofed source aim the stream "
+                         "at a victim")
     args = ap.parse_args()
+
+    def need(cond, msg):
+        if not cond:
+            sys.exit(f"bad {msg}")
+    need(math.isfinite(args.tone) and abs(args.tone) <= 23000,
+         f"--tone {args.tone}: want a finite offset within +/-23000 Hz (below the 48 kHz Nyquist)")
+    need(0 <= args.gateware <= 255, f"--gateware {args.gateware}: want 0..255 (one byte)")
+    need(math.isfinite(args.supply_volts) and 0 <= args.supply_volts <= 104.5,
+         f"--supply-volts {args.supply_volts}: want 0..104.5 (the 12-bit reading's range)")
+    need(args.adc_peak is None or 0 <= args.adc_peak <= 65535, f"--adc-peak {args.adc_peak}: want 0..65535")
+    need(0 <= args.adc_overload <= 3, f"--adc-overload {args.adc_overload}: want 0..3")
+    for cidr in args.allow:
+        try:
+            ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            sys.exit(f"bad --allow {cidr!r}: want a network like 192.168.0.0/24")
 
     try:
         mac = bytes(int(x, 16) for x in args.mac.split(":"))
@@ -929,12 +1095,12 @@ def main():
     except ValueError:
         sys.exit(f"bad --mac {args.mac!r}: want six hex octets like 00:1c:c0:a2:13:dd")
 
-    if not 1 <= args.ddc <= MAX_DDC:
-        sys.exit(f"bad --ddc {args.ddc}: want 1..{MAX_DDC}")
+    if not 1 <= args.ddc <= 10:
+        sys.exit(f"bad --ddc {args.ddc}: want 1..10 (ports 1035-1044)")
     AnanSim(args.ip or local_ip(), mac, args.rate, args.pattern,
             args.tone, args.ddc, args.gateware, args.pair_order,
             args.enforce_ddc_count, args.stale_burst, args.supply_volts,
-            args.adc_peak, args.adc_overload).start()
+            args.adc_peak, args.adc_overload, args.allow).start()
 
 
 if __name__ == "__main__":
