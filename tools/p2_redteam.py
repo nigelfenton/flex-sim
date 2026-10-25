@@ -18,10 +18,12 @@ Findings are classified:
 usage:
   python3 tools/p2_redteam.py                  # spawn a sim on loopback and attack it (default)
   python3 tools/p2_redteam.py --quick          # a short pass (CI-sized)
-  python3 tools/p2_redteam.py --host H --pid N # attack a RUNNING sim (see the warning below)
+  python3 tools/p2_redteam.py --host H --attach  # attack a RUNNING sim over the network
+                                                # (light phases only; see the warning below)
 
-Attacking a sim someone else is using disturbs them. Heavy phases (load, churn) are skipped
-unless the sim was spawned here or --heavy is given.
+Attacking a sim someone else is using disturbs them. With --attach the heavy phases (load,
+churn, the hostile-command-line phase) are skipped unless --heavy is given, and the discovery
+flood is rate-limited so it cannot saturate a small network.
 """
 
 import argparse
@@ -148,7 +150,7 @@ class Target:
 
 def client():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind((IP, 0))
+    s.bind(("0.0.0.0", 0))          # loopback or LAN: the sim answers to the source address
     return s
 
 
@@ -388,6 +390,7 @@ def attack_discovery_flood(tgt, quick):
     socks = [client() for _ in range(4)]
     probe = discovery()
     sent, t_end = 0, time.time() + secs
+    remote = IP != "127.0.0.1"
     while time.time() < t_end:
         for s in socks:
             try:
@@ -395,6 +398,8 @@ def attack_discovery_flood(tgt, quick):
                 sent += 1
             except OSError:
                 pass
+        if remote:
+            time.sleep(0.004)       # ~1000 probes/s: enough to prove the point, kind to a LAN
     for s in socks:
         drain(s, 0.2)
         s.close()
@@ -488,10 +493,15 @@ def main():
     ap.add_argument("--skip-startup", action="store_true", help="skip the hostile-command-line phase")
     ap.add_argument("--heavy", action="store_true", help="allow load/churn against a sim you did not spawn")
     ap.add_argument("--pid", type=int, default=None, help="attack a RUNNING sim with this pid (loopback)")
+    ap.add_argument("--host", default="127.0.0.1", help="address of the sim to attack (default loopback)")
+    ap.add_argument("--attach", action="store_true", help="attack a sim that is already running (do not spawn one)")
     ap.add_argument("--sim-args", nargs="*", default=[], help="arguments for the spawned sim")
     a = ap.parse_args()
 
-    tgt = Target(spawn=a.pid is None, args=a.sim_args, pid=a.pid)
+    global IP
+    IP = a.host
+    attach = a.attach or a.pid is not None
+    tgt = Target(spawn=not attach, args=a.sim_args, pid=a.pid)
     t0 = time.time()
     try:
         print("baseline")
@@ -503,7 +513,7 @@ def main():
         print(f"  handles at start: {h0}")
         phases = [("malformed input", attack_malformed), ("hostile field values", attack_hostile_fields),
                   ("two clients / hijack", attack_hijack), ("discovery flood", attack_discovery_flood)]
-        if a.pid is None or a.heavy:
+        if not attach or a.heavy:
             phases += [("flapping and churn", attack_flapping), ("sustained load", attack_load)]
         for name, fn in phases:
             print(f"\n== {name}")
@@ -512,7 +522,7 @@ def main():
         print(f"\n  handles at end of the attacks: {h1} (start {h0})")
         if h0 is not None and h1 is not None and h1 - h0 > 40:
             finding("LEAK", "whole run", f"handles {h0} -> {h1}")
-        if a.pid is None and not a.skip_startup:
+        if not attach and not a.skip_startup:
             tgt.close()                       # the next sims need the ports the main one holds
             print("\n== hostile command lines")
             attack_startup_args()
