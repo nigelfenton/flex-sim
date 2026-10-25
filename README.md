@@ -190,7 +190,9 @@ follows the reference and where it has to guess.
 (Saturn)** speaking **openHPSDR Protocol 2**. It answers discovery, completes the
 General → DDC-Specific → DUC-Specific → High-Priority handshake, and streams DDC I/Q
 at the sample rate the client commands — enough for a Protocol 2 client to find the
-radio and paint a panadapter and waterfall. Pure standard library, like the rest.
+radio and paint a panadapter and waterfall, **and (v0.2) to run several receivers at
+once**: every DDC the client enables streams from its own port, at its own commanded
+rate, with its own sequence counter. Pure standard library, like the rest.
 
 It exists so Protocol 2 client work can be developed and reviewed **without a radio on
 the bench** — including AetherSDR's own ANAN-G2 backend
@@ -201,14 +203,27 @@ the bench** — including AetherSDR's own ANAN-G2 backend
 python3 anan_sim.py                           # 48 k, test tone, autodetected interface
 python3 anan_sim.py --rate 96000 --pattern noise
 python3 anan_sim.py --ip 10.0.0.5             # bind a specific interface
+python3 anan_sim.py --ddc 2                   # a radio with only 2 DDCs (enabling DDC2 streams nothing)
+python3 anan_sim.py --gateware 21             # change the gateware version the discovery reply reports
 ```
 
 Then point a Protocol 2 client — Thetis, piHPSDR, NereusSDR, AetherSDR's ANAN backend —
 at that host. As with the Flex sim, a **separate machine or IP** is the simple path.
 
 **Receive only.** Not implemented: transmit (DUC), wideband ADC streams, mic samples,
-memory-mapped access, and acting on a non-default port re-assignment (accepted and
-logged, not honoured).
+memory-mapped access, PureSignal feedback, and acting on a non-default port
+re-assignment (accepted and logged, not honoured).
+
+**v0.2 — what changed, and what is a guess.**
+
+| | |
+|---|---|
+| **Every enabled DDC streams** | DDC-Specific byte 7 is the enable mask; DDC *n* streams from port 1035+*n* with its own sequence, rate (record *n*) and tuning (High Priority word *n*). DDC2 is RX1 on a Thetis-family client, DDC3 the second receiver. Each DDC carries a distinct tone (DDC0–2 the base tone, DDC3 2×, DDC4 3× …) so a second receiver is visibly a different signal. *Real-G2 captures cover one enabled DDC at a time; several at once follows the documented ports and is **unconfirmed**.* |
+| **A DDC the radio lacks is not streamed** | `--ddc N` sets how many DDCs the discovery reply advertises; a mask bit beyond that is logged and ignored — the case where a client enables DDC2 on a radio that reports fewer than three. Default 4 (the figure AetherSDR's PR #6697 gives for a real G2's p2app; unconfirmed here). |
+| **Fast enough for high rates** | The signal is pre-rendered once per rate and a packet is a slice, so the sender no longer builds packets sample by sample. On a Celeron J1900 v0.1 managed ~540 packets/s whatever the rate (two-thirds of nominal at 192 k, a tenth at 1536 k). `tools/p2_throughput.py` measures it against any running sim. |
+| **Gateware 27 by default** | Was 21 (what NereusSDR logged against the sim). AetherSDR's droop defaults say they were derived against 27 — the best evidence of what a real G2 reports. `--gateware` overrides. *Unconfirmed by a capture.* |
+| **Diversity (EXPERIMENTAL)** | With High Priority byte 1363 bit 1 set, DDC0 packets still declare 238 samples but carry 119 interleaved DDC0/DDC1 pairs (as described by a real-G2 owner). **Guessed, not observed:** DDC1 gets no stream of its own, the DDC0 packet rate doubles, and DDC1 is the same tone 6 dB down and 45° round. See [docs/ANAN_P2_SIM_SCOPE.md §7](docs/ANAN_P2_SIM_SCOPE.md#7-what-v02-guesses--questions-a-real-g2-can-settle). |
+| **Hardening** | A log line can no longer kill the thread that wrote it. On Windows a piped stdout is cp1252, which cannot encode the warning sign in the sim's own messages: `print()` raised and the DDC Specific thread died, so mask and rate packets silently stopped being read. Found by the v0.2 tests; invisible on Linux. The sim also no longer says "waiting for discovery" until its sockets are bound. |
 
 **How it has been checked** — deliberately not only against itself, because the sim,
 its tests and the probe below all derive from the same documentation and could agree
@@ -221,6 +236,8 @@ while all being wrong:
 | `tools/p2stream.c` | an independent probe whose send and parse offsets come from piHPSDR, not from this sim |
 | AetherSDR's ANAN-G2 backend, end to end (2026-09-16) | discovery, session and streaming interoperate — and it exposed that the sim's **I/Q handedness was mirrored**: the "+1 kHz" tone drew 1 kHz *below* the dial and was audible only in LSB. AE's polarity had been measured on a real G2 and cross-checked with an RSP1B, so the sim was the one in error. Fixed in v0.3.1 |
 | `tests/test_anan_p2.py` | the wire bytes **and the tone's handedness**, asserted in CI on Linux and Windows |
+| `tests/test_anan_multi_ddc.py` | several DDCs at once, per-DDC rates and sequence counters, a DDC the radio lacks, the diversity framing (pinned as *current behaviour*, not as real-G2 truth), phase-continuity of the tone across its ring seam, and the log-encoding regression. Mutation-checked: each of seven deliberate bugs fails it |
+| AetherSDR PR #6697 (RX1 → DDC2), 2026-10-24 | built from the PR head and run against the sim: the DDC-Specific mask `0x04`, the rate in DDC2's record only (DDC0/DDC1 zero) at every zoom step 48 k ↔ 1536 k, and the tuning word in DDC2's slot all land as the PR claims — the same wire its author benched on a real G2 |
 
 **I/Q handedness.** Like a real HPSDR radio, the sim's wire I/Q is the conjugate of the
 textbook convention: a signal *above* the dial arrives at a *negative* frequency. A
@@ -233,7 +250,8 @@ itself was clean, with its attribution deliberately left unresolved
 ([#5](https://github.com/nigelfenton/flex-sim/issues/5)).
 
 ```
-python3 -m pytest tests/test_anan_p2.py                      # spawns its own sim on loopback
+python3 -m pytest tests/test_anan_p2.py tests/test_anan_multi_ddc.py   # spawn their own sims on loopback
+python3 tools/p2_throughput.py --host 127.0.0.1               # packets/s delivered at each rate, vs nominal
 cc -O2 -o p2stream tools/p2stream.c && ./p2stream 127.0.0.1  # POSIX: Linux / macOS / WSL
 ```
 
