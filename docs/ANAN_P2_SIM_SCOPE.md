@@ -112,10 +112,12 @@ the entire HL2 backend effort.
 - **One** DDC IQ stream outbound
 - Enough to make a radio appear in a client and paint a waterfall
 
-**v0.2 — multi-DDC** — *Status: **built** (2026-10-24).* Every enabled DDC streams;
-`--ddc`/`--gateware`; pre-rendered signal for high packet rates; experimental diversity
-framing. Built once a consumer appeared: AetherSDR's G2 backend is moving to a second
-receiver (RFC #4970 phase 2) and diversity (RFC #6725). See §7 for what it guesses.
+**v0.2 / v0.3 — multi-DDC, then real-G2 behaviour** — *Status: **built** (2026-10-24 / 2026-10-25).*
+Every enabled DDC streams; pre-rendered signal for high packet rates. v0.3 replaced the
+v0.2 guesses with what a real G2 was measured to do (diversity, DDC count, timestamps,
+sessions, the mic stream and the status packet). Built once a consumer appeared:
+AetherSDR's G2 backend is moving to a second receiver (RFC #4970 phase 2) and diversity
+(RFC #6725). See §7.
 
 **v3+ — as needed**
 - DUC/transmit, wideband, mic/line, PureSignal feedback, a web control page
@@ -255,22 +257,37 @@ backend, comparable in size to the whole HL2 effort. The plan was therefore:
    **2026-09-16**: it interoperated end to end, and the backend — already validated on
    real hardware — showed the sim's I/Q handedness was mirrored (fixed in v0.3.1).
 
-## 7. What v0.2 guesses — questions a real G2 can settle
+## 7. What a real G2 has told us — and what is still open
 
-Everything below is in the sim today, **works as described, and is not yet confirmed by a
-capture of a real G2**. Each is a question for an owner with a radio and Wireshark
-(`udp portrange 1024-1114`, the radio's IP, and the sample rate you set).
+On 2026-10-25 **Sotiris KO9B** (the author of AetherSDR's G2 backend) measured the seven
+questions this section used to pose, on his own radio, with a receive-only probe. His three
+run logs are the source of every *measured* statement in the README. Results:
 
-| # | The sim does | The question | A capture shows it |
+| # | Question | Answer from a real G2 | v0.2 guess |
 |---|---|---|---|
-| 1 | With High Priority byte 1363 bit 1 set, DDC0 packets carry 119 interleaved DDC0/DDC1 pairs, the header still says 238 samples | **Packet cadence in diversity:** one packet per 119 samples (twice the packet rate at a given sample rate), or the same cadence with the effective rate halved? | inter-arrival time of the DDC0 stream with diversity on vs off, same rate |
-| 2 | In diversity DDC1 has **no stream of its own** | Does the radio also send a separate DDC1 stream (port 1036) while diversity is on? | any traffic from `:1036` |
-| 3 | Several enabled DDCs each stream from their own port 1035+*n*, own sequence counter | True of the real radio? Do the streams share sequence numbers or timestamps? Are the packets time-aligned across DDCs? | two DDCs enabled at once (e.g. DDC2 + DDC3) |
-| 4 | Discovery reply byte 13 (gateware) = **27**, byte 20 (DDC count) = **4** | What does the real reply say? | the 60-byte discovery reply |
-| 5 | A mask bit for a DDC beyond the advertised count is ignored (nothing streams) | What does a real radio do — ignore it, stream anyway, or stall the session? | enable a DDC above the count the reply advertises |
-| 6 | High Priority status out is 60 bytes of zeros every 50 ms | Which bytes carry ADC overflow, PTT, supply voltage and the other readings AetherSDR now displays? | a few seconds of `:1025 → PC` status |
-| 7 | No transmit | TX framing is confirmed (4 B header + 240 samples), but **modulation with real audio** is unvalidated — the captures so far were keyed with silence | TX with voice or two-tone, not silence |
+| 1 | Diversity: how is it selected, and what is the cadence? | **DDC Specific byte 1363 == 0x02** (equality, not a bit; **not** High Priority). Byte 7 enables DDC0 only and p2app enables DDC1 itself; the pair's rate is DDC1's record (bytes 24–25). Header still 238 samples = 119 pairs; **packet rate doubles** (201.5 → 407.3 pkt/s at 48 k, 811.8 → 1619.3 at 192 k). | cadence ✔ (doubles) — trigger ✘ (High Priority bit) |
+| 1b | Pair order | DDC0 first in the first session after power-up; **swapped in 4 of 10 trials** after DDC0 had run alone (p2app sets up its buffers and FIFO once, so a leftover odd sample count shifts every pair). Never moved in 15 trials when DDC0 only ever carries pairs (RX1 on DDC2). A client can detect the order itself. | DDC0 first ✔ (not guaranteed) |
+| 2 | Does DDC1 also stream while diversity is on? | **No** — nothing from :1036. | ✔ |
+| 3 | Two DDCs at once | Own port, own sequence counter, **starting at 0 at run=1**; timestamp bytes 4–11 **always zero**; same ADC and frequency ⇒ packet *k* of each covers the same instants (lag 0, peak 1.00) a constant NCO phase apart; ~0.1 ms between them; mixed rates run at their own rates. | ports and counters ✔ — timestamps ✘ (wall clock) |
+| 4 | Discovery reply | byte 13 = **27**, byte 20 = **4**, board 10, protocol **4.3**, byte 23 (p2app build) = **46**. | 27 ✔, 4 ✔, protocol 3.9 ✘ |
+| 5 | A DDC above the advertised count | **Streams normally** (DDC4 from :1039); p2app reads enables for 10 DDCs and the 4 is a literal in `p2app.c`. | ✘ (ignored it) |
+| 6 | Status packet | About every **232 ms**; byte map in the README (supply rail is bytes **57–58**, not 49–50). | 60 zero bytes every 50 ms ✘ |
+| 7 | TX with real audio | **Not yet** — AetherSDR does not transmit on the G2 yet; he will capture it when it does. | — |
 
-`p2verify.py` in this repository reads the pcapng directly (no tshark) and reports each
-of these from a capture. Captures of a private station's traffic stay private; only the
-findings need to come back.
+Two things he volunteered: every session starts with a **stale burst** (up to ~76 packets,
+observed 76, 49 and 12, in the previous layout, numbered from 0, some from ports no longer
+enabled), and the **mic stream** runs at ~750 packets/s from :1026 whenever the radio runs.
+
+### Still open
+
+- **TX with real audio** (and a second sample rate) — the framing is confirmed, modulation is not.
+- Is the **first session after power-up** clean of the stale burst? (Expected; unchecked.)
+- A **diversity pair whose two rate records differ** — he always sets them equal; the sim
+  follows DDC1's record, as p2app's source says, but nobody has run a mismatch.
+- **Where DDC8–9 live** in the DDC Specific packet (p2app reads 10 enables; the sim stops at 8).
+- The **DDC FIFO depth** (status bytes 31–32) varied 63–4165 in his run; the sim reports the
+  median (1522) as a constant.
+- A **side-by-side**: he will run `anan_sim.py` and the same probe against both the sim and his G2.
+
+`p2verify.py` in this repository reads a pcapng directly (no tshark). Captures of a private
+station's traffic stay private; only the findings need to come back.

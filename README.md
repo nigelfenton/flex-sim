@@ -203,7 +203,9 @@ the bench** — including AetherSDR's own ANAN-G2 backend
 python3 anan_sim.py                           # 48 k, test tone, autodetected interface
 python3 anan_sim.py --rate 96000 --pattern noise
 python3 anan_sim.py --ip 10.0.0.5             # bind a specific interface
-python3 anan_sim.py --ddc 2                   # a radio with only 2 DDCs (enabling DDC2 streams nothing)
+python3 anan_sim.py --ddc 2 --enforce-ddc-count   # advertises 2 DDCs and ignores a DDC above that
+python3 anan_sim.py --pair-order d1d0             # diversity pairs in the swapped order a real G2 sometimes sends
+python3 anan_sim.py --stale-burst                 # start each session with the stale burst a real G2 sends
 python3 anan_sim.py --gateware 21             # change the gateware version the discovery reply reports
 ```
 
@@ -214,16 +216,24 @@ at that host. As with the Flex sim, a **separate machine or IP** is the simple p
 memory-mapped access, PureSignal feedback, and acting on a non-default port
 re-assignment (accepted and logged, not honoured).
 
-**v0.2 — what changed, and what is a guess.**
+**v0.3 — the sim now behaves the way a real G2 was measured to.** On 2026-10-25 Sotiris
+KO9B — who writes AetherSDR's G2 backend — answered the sim's open questions from his own
+radio. Where this sim says *measured* below, that is what a real G2 did; where it says
+*invented*, nobody has seen a real radio do it.
 
 | | |
 |---|---|
-| **Every enabled DDC streams** | DDC-Specific byte 7 is the enable mask; DDC *n* streams from port 1035+*n* with its own sequence, rate (record *n*) and tuning (High Priority word *n*). DDC2 is RX1 on a Thetis-family client, DDC3 the second receiver. Each DDC carries a distinct tone (DDC0–2 the base tone, DDC3 2×, DDC4 3× …) so a second receiver is visibly a different signal. *Real-G2 captures cover one enabled DDC at a time; several at once follows the documented ports and is **unconfirmed**.* |
-| **A DDC the radio lacks is not streamed** | `--ddc N` sets how many DDCs the discovery reply advertises; a mask bit beyond that is logged and ignored — the case where a client enables DDC2 on a radio that reports fewer than three. Default 4 (the figure AetherSDR's PR #6697 gives for a real G2's p2app; unconfirmed here). |
-| **Fast enough for high rates** | The signal is pre-rendered once per rate and a packet is a slice, so the sender no longer builds packets sample by sample. On a Celeron J1900 v0.1 managed ~540 packets/s whatever the rate (two-thirds of nominal at 192 k, a tenth at 1536 k). `tools/p2_throughput.py` measures it against any running sim. |
-| **Gateware 27 by default** | Was 21 (what NereusSDR logged against the sim). AetherSDR's droop defaults say they were derived against 27 — the best evidence of what a real G2 reports. `--gateware` overrides. *Unconfirmed by a capture.* |
-| **Diversity (EXPERIMENTAL)** | With High Priority byte 1363 bit 1 set, DDC0 packets still declare 238 samples but carry 119 interleaved DDC0/DDC1 pairs (as described by a real-G2 owner). **Guessed, not observed:** DDC1 gets no stream of its own, the DDC0 packet rate doubles, and DDC1 is the same tone 6 dB down and 45° round. See [docs/ANAN_P2_SIM_SCOPE.md §7](docs/ANAN_P2_SIM_SCOPE.md#7-what-v02-guesses--questions-a-real-g2-can-settle). |
-| **Hardening** | A log line can no longer kill the thread that wrote it. On Windows a piped stdout is cp1252, which cannot encode the warning sign in the sim's own messages: `print()` raised and the DDC Specific thread died, so mask and rate packets silently stopped being read. Found by the v0.2 tests; invisible on Linux. The sim also no longer says "waiting for discovery" until its sockets are bound. |
+| **Every enabled DDC streams** | *Measured.* DDC *n* streams from port 1035+*n* with its own sequence counter (restarting at 0 at every run=1), its own rate (record *n*) and its own tuning (High Priority word *n*). On the same ADC and frequency the DDCs cover the same instants; at mixed rates each runs at its own rate. *Invented:* each DDC carries a distinct tone (DDC0–2 the base tone, DDC3 2×, DDC4 3× …) so a second receiver is visibly a different signal — a real G2 on one antenna gives both the same. |
+| **No DDC-count limit** | *Measured.* A real G2 streams a DDC above the 4 it advertises (DDC4 from :1039): p2app reads 10 enables and the 4 is a literal. `--ddc N` changes only what discovery says; `--enforce-ddc-count` opts into a radio that ignores a DDC above it — the case AetherSDR's PR #6697 names as a limit. (v0.2 had this the other way round: a guess, and wrong.) |
+| **Diversity** | *Measured.* **DDC Specific byte 1363 == 0x02** — an equality test, **not** a bit and **not** High Priority. Byte 7 enables DDC0 only; the pair's rate is DDC1's record (bytes 24–25). DDC0 packets still declare 238 samples but carry 119 interleaved DDC0/DDC1 pairs, the packet rate doubles, and nothing comes from :1036. Pair order is DDC0 first in a real G2's first session after power-up; `--pair-order d1d0` gives the swapped order it showed in 4 of 10 trials after DDC0 had run alone (a client can detect the order itself). *Invented:* DDC1's signal is the same tone 6 dB down and 45° round. |
+| **Discovery and the DDC header** | *Measured.* Protocol 4.3, gateware 27, 4 DDCs, p2app build 46, board 10 (`--gateware` overrides). DDC packet timestamps (bytes 4–11) are **always zero**. |
+| **Status packet** | *Measured.* About every 232 ms. Byte 4 = 0x10 (PLL locked; bit 0 PTT, 1 dot, 2 dash); byte 5 = ADC overload (bit 0 ADC0, bit 1 ADC1); 39–40 / 41–42 = ADC peak-holds; **57–58 = the supply rail** (AIN3: volts = counts × 23.0/1.1 × 5/4095, so 532 = 13.58 V) — *not* 49–50, which is AIN6 on a G2; plus exciter 63, forward 14, reverse 14, byte 30 = 0x0C, byte 59 = 0x07. `--supply-volts`, `--adc-peak` (default: his measured medians) and `--adc-overload` set the live readings. |
+| **Mic stream** | *Measured rate and size:* ~750 packets/s from :1026 whenever the radio runs, 132 B (4 B sequence + 64 × 16-bit). *Invented:* the sim has no microphone, it is silence. |
+| **Stale burst** | *Measured.* Every session on a real G2 starts with up to ~76 packets in the *previous* session's DDC layout (observed 76, 49 and 12), numbered from 0, some from ports no longer enabled — p2app does not reset its FIFO between sessions. `--stale-burst` reproduces it; off by default because it breaks naive clients (AetherSDR's PR #6697 drops such frames and warns once per port). |
+| **Fast enough for high rates** | The signal is pre-rendered once per rate and a packet is a slice. On a Celeron J1900 v0.1 managed ~540 packets/s whatever the rate (two-thirds of nominal at 192 k, a tenth at 1536 k); v0.2 and later deliver 100 % of nominal at every rate there. `tools/p2_throughput.py` measures it against any running sim. |
+| **Hardening** | A log line can no longer kill the thread that wrote it: on Windows a piped stdout is cp1252, which cannot encode the warning sign in the sim's own messages, so `print()` raised and the DDC Specific thread died. The sim also no longer says "waiting for discovery" until its sockets are bound. |
+
+Still open, and listed in [docs/ANAN_P2_SIM_SCOPE.md §7](docs/ANAN_P2_SIM_SCOPE.md#7-what-a-real-g2-has-told-us--and-what-is-still-open): transmit with real audio, whether the *first* session after power-up is free of the stale burst, and where DDC8–9 live in the DDC Specific packet.
 
 **How it has been checked** — deliberately not only against itself, because the sim,
 its tests and the probe below all derive from the same documentation and could agree
@@ -236,7 +246,8 @@ while all being wrong:
 | `tools/p2stream.c` | an independent probe whose send and parse offsets come from piHPSDR, not from this sim |
 | AetherSDR's ANAN-G2 backend, end to end (2026-09-16) | discovery, session and streaming interoperate — and it exposed that the sim's **I/Q handedness was mirrored**: the "+1 kHz" tone drew 1 kHz *below* the dial and was audible only in LSB. AE's polarity had been measured on a real G2 and cross-checked with an RSP1B, so the sim was the one in error. Fixed in v0.3.1 |
 | `tests/test_anan_p2.py` | the wire bytes **and the tone's handedness**, asserted in CI on Linux and Windows |
-| `tests/test_anan_multi_ddc.py` | several DDCs at once, per-DDC rates and sequence counters, a DDC the radio lacks, the diversity framing (pinned as *current behaviour*, not as real-G2 truth), phase-continuity of the tone across its ring seam, and the log-encoding regression. Mutation-checked: each of seven deliberate bugs fails it |
+| `tests/test_anan_multi_ddc.py` | 66 checks: several DDCs at once, per-DDC rates, sequence counters and zero timestamps, a DDC above the advertised count, diversity exactly as measured (byte 1363 in DDC Specific, equality, DDC1's rate record, doubled cadence, nothing from :1036, pair order), the status packet's byte map and cadence, the mic stream, the stale burst, phase-continuity of the tone across its ring seam, and the log-encoding regression. Each check that rests on a real-G2 measurement is tagged `[KO9B]`. Mutation-checked: twelve deliberate bugs, each one fails it |
+| A real G2 (KO9B, 2026-10-25) | the v0.2 guesses were checked against a real radio: five were right (cadence doubling, nothing from :1036, per-DDC ports and counters, gateware 27, DDC count 4) and the rest were wrong or missing (where diversity is triggered and that it is an equality test, that a DDC above the count is ignored, that timestamps are zero, the protocol version, the status packet's layout and cadence, and the mic stream). v0.3 follows his measurements |
 | AetherSDR PR #6697 (RX1 → DDC2), 2026-10-24 | built from the PR head and run against the sim: the DDC-Specific mask `0x04`, the rate in DDC2's record only (DDC0/DDC1 zero) at every zoom step 48 k ↔ 1536 k, and the tuning word in DDC2's slot all land as the PR claims — the same wire its author benched on a real G2 |
 
 **I/Q handedness.** Like a real HPSDR radio, the sim's wire I/Q is the conjugate of the

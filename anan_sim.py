@@ -64,24 +64,41 @@
 #     ADC clock). The General Packet's byte 37 bit 3 selects it, and the
 #     discovery reply's byte 21 advertises it. 10.000 MHz is 349525333.
 #
-#   - EVERY enabled DDC streams (v0.2). DDC-Specific byte 7 is the enable mask;
-#     each enabled DDC streams from its own source port 1035+n, with its own
-#     sequence counter, its own commanded rate (record n) and its own tuning (High
-#     Priority word n). Real-G2 evidence covers ONE enabled DDC at a time (the
-#     N2JXL pcaps); several-at-once follows the documented per-DDC ports and is
-#     UNCONFIRMED against a capture.
-#   - A DDC the radio does not have is not streamed. The discovery reply
-#     advertises --ddc DDCs (default 4: the figure AetherSDR PR #6697 gives for a
-#     real G2's p2app, unconfirmed here) and a mask bit beyond that is logged and
-#     ignored -- the "radio reports fewer DDCs than the client enabled" case.
-#   - DIVERSITY (EXPERIMENTAL, off unless the client asks): per a real-G2 owner,
-#     with High Priority byte 1363 bit 1 set the DDC0 header still declares 238
-#     samples but they arrive as 119 interleaved DDC0/DDC1 pairs. Modelled as
-#     that and nothing more: DDC1's own stream is withheld, the DDC0 packet
-#     cadence becomes 119/rate (each DDC still runs at its commanded rate), and
-#     DDC1 is the same tone 6 dB down and 45 degrees round so a combiner has
-#     something to combine. The cadence and the DDC1 behaviour are GUESSES until a
-#     capture says otherwise -- see docs/ANAN_P2_SIM_SCOPE.md.
+#   - EVERY enabled DDC streams. DDC-Specific byte 7 is the enable mask; each
+#     enabled DDC streams from its own source port 1035+n with its own sequence
+#     counter (restarting at 0 at every run=1), its own commanded rate (record n)
+#     and its own tuning (High Priority word n). MEASURED on a real G2 by KO9B
+#     (2026-10-25): same ADC and frequency => packet k of each DDC covers the same
+#     instants, a constant NCO phase offset apart, ~0.1 ms between them; at mixed
+#     rates the streams ran at their own rates (202.6 and 811.2 pkt/s for 48k+192k).
+#     The sim's per-DDC tones are an INVENTION so a second receiver is visibly a
+#     different signal; a real G2 on one antenna gives both DDCs the same signal.
+#   - ANY enabled DDC streams, whatever discovery advertises. MEASURED (KO9B):
+#     discovery byte 20 says 4, but p2app reads enables for 10 DDCs and DDC4 streams
+#     normally from :1039 -- the 4 is a literal in p2app.c. --enforce-ddc-count
+#     reproduces the OTHER behaviour a client might meet (a radio that ignores a DDC
+#     above its advertised count), which AetherSDR's PR #6697 names as a limit.
+#   - DIVERSITY, MEASURED on a real G2 by KO9B (2026-10-25): DDC Specific byte 1363
+#     (PC -> radio :1025; NOT High Priority) == 0x02 -- an equality test in p2app, not
+#     a bit. Byte 7 enables DDC0 only and p2app enables DDC1 itself; the pair's rate
+#     comes from DDC1's record (bytes 24-25). The DDC0 header still declares 238
+#     samples but they are 119 interleaved DDC0/DDC1 pairs, the packet rate doubles
+#     (201.5 -> 407.3 pkt/s at 48k, 811.8 -> 1619.3 at 192k), and NOTHING comes from
+#     :1036. Pair order is DDC0 first (I0Q0 I1Q1) in the first session after power-up,
+#     but after DDC0 has run on its own it came out SWAPPED in 4 of 10 trials
+#     (p2app sets up its sample buffers and FIFO once, so a leftover odd sample count
+#     shifts every pair): --pair-order d1d0 reproduces that. When DDC0 only ever
+#     carries pairs the order never moved in 15 trials, and a client can find the
+#     order itself by switching DDC1's input from TX samples (silent) to ADC1.
+#     DDC1's signal here is the same tone 6 dB down and 45 degrees round: invented,
+#     so a combiner has something to combine.
+#   - DDC packet timestamps (bytes 4-11) are ALWAYS ZERO on a real G2. The mic stream
+#     (:1026 -> PC) runs ~750 packets/s whenever the radio runs (64 x 16-bit samples:
+#     132 B), and the status packet (:1025 -> PC) goes out about every 232 ms.
+#   - Every session on a real G2 starts with a burst of up to ~76 packets in the
+#     PREVIOUS session's DDC layout, numbered from 0, some from ports no longer
+#     enabled (p2app does not reset the FIFO between sessions). --stale-burst
+#     reproduces it; off by default because it breaks naive clients.
 #
 # NOT implemented: TX/DUC, wideband ADC, mic samples, memory-mapped access,
 # PureSignal feedback, non-default port re-assignment (accepted and logged, not
@@ -102,7 +119,7 @@ import sys
 import threading
 import time
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # --- ports (PC -> SDR unless noted). Saturn doc, "Port Numbers to Use". -------
 PORT_DISCOVERY = 1024          # discovery AND General Packet to SDR
@@ -121,20 +138,28 @@ PORT_DDC0_IQ_OUT = 1035        # DDC0 I/Q -> PC (DDC0-9 = 1035..1044)
 REPLY_LEN = 60
 STATUS_IDLE = 0x02             # 2 = idle/available, 3 = already sending
 DEVICE_SATURN = 0x0A           # pihpsdr NEW_DEVICE_SATURN 1010 = 1000 + 0x0A
-P2_VERSION = 39                # protocol 3.9
-# Gateware ("software") version in the discovery reply. NereusSDR logged "fw: 21"
-# against this sim; AetherSDR's droop defaults say they were derived against 27,
-# which is the best available evidence of what a real G2 reports. Both are
-# unconfirmed by a capture -- hence --gateware.
+P2_VERSION = 43                # protocol 4.3 (MEASURED on a real G2, KO9B; was 39)
+P2APP_BUILD = 46               # discovery byte 23: the real G2's p2app build
+# Gateware ("software") version in the discovery reply. MEASURED on a real G2 by
+# KO9B (2026-10-25): byte 13 = 27, byte 20 = 4 (and board 10, protocol 4.3, p2app
+# build 46). Both the sim's earlier guesses were right. NereusSDR had logged "fw: 21"
+# against v0.1 -- hence --gateware, to reproduce an older radio.
 SW_VERSION = 27
 DEFAULT_DDC_COUNT = 4
-MAX_DDC = 8                    # DDC-Specific byte 7 is a mask for DDC0-7
+# DDC-Specific byte 7 is a mask for DDC0-7. A real p2app reads enables for 10 DDCs
+# (ports 1035-1044); where DDC8-9 live in the packet has not been measured, so the
+# sim stops at 8.
+MAX_DDC = 8
 
 # --- DDC Specific packet (port 1025) ------------------------------------------
 # Per-DDC records are 6 bytes starting at byte 17: ADC assignment at 17+6n,
 # sample rate at 18+6n as a big-endian uint16 in kHz (pihpsdr new_protocol.c).
 # DDC0's rate therefore lives at bytes [18:20].
 DDC0_RATE_OFFSET = 18
+DDC1_RATE_OFFSET = DDC0_RATE_OFFSET + 6      # bytes 24-25: the pair's rate in diversity
+# DDC Specific byte 1363 == 0x02 selects diversity (p2app tests EQUALITY, not a bit).
+DDC_SPEC_DIVERSITY_OFFSET = 1363
+DDC_SPEC_DIVERSITY_VALUE = 0x02
 DDC_RATES = (48000, 96000, 192000, 384000, 768000, 1536000)
 
 # --- DDC I/Q framing (real-hardware pcap, 2026-08-17) -------------------------
@@ -149,8 +174,28 @@ FULL_SCALE_24 = (1 << 23) - 1
 PHASE_WORD_CLOCK_HZ = 122_880_000   # Saturn ADC clock: Hz = word * clock / 2^32
 GENERAL_FREQ_FLAGS = 37             # General Packet byte; bit 3 set = phase word
 HP_FREQ_OFFSET = 9                  # High Priority: 4-byte word per DDC at 9+4n
-HP_DIVERSITY_OFFSET = 1363          # High Priority byte; bit 1 = diversity (see above)
-HP_DIVERSITY_BIT = 0x02
+
+# --- streams the radio sends that are not DDC I/Q (MEASURED, KO9B, 2026-10-25) ----
+PORT_MIC_OUT = 1026                 # mic -> PC, from the same :1026 the radio listens on
+MIC_PACKETS_PER_S = 750             # ~750/s whenever the radio runs
+MIC_SAMPLES = 64                    # 64 x 16-bit mono = 48 kHz; 4 B seq + 128 B = 132 B
+STATUS_PERIOD_S = 0.232             # HP status every ~232 ms on receive
+STALE_BURST_PACKETS = 76            # observed bursts: 76, 49 and 12 packets; the worst case
+# Status packet constants a G2 reports at receive (bytes as measured):
+STATUS_PLL_LOCKED = 0x10            # byte 4: bit0 PTT, bit1 dot, bit2 dash, bit4 PLL locked
+STATUS_EXCITER = 63                 # bytes 6-7
+STATUS_FORWARD = 14                 # bytes 14-15
+STATUS_REVERSE = 14                 # bytes 22-23
+STATUS_UNDERFLOW = 0x0C             # byte 30: DUC + speaker underflow (nothing is sent)
+STATUS_AIN6 = 1586                  # bytes 49-50: AIN6, which is NOT the supply on a G2
+STATUS_AIN4 = 4                     # bytes 55-56 (median 4, range 0-16 in KO9B's run)
+STATUS_FIFO_DEPTH = 1522            # bytes 31-32: median of 63-4165 in KO9B's run
+# ADC peak-hold medians KO9B measured on HIS antennas (bytes 39-40 / 41-42); a real
+# G2 never reads 0 with an antenna on it, so these beat a flat zero for AE's meters.
+DEFAULT_ADC0_PEAK = 11768
+DEFAULT_ADC1_PEAK = 3151
+STATUS_BYTE59 = 0x07
+SUPPLY_DIVIDER = 23.0 / 1.1         # volts = counts * 23.0/1.1 * 5/4095 (AIN3, bytes 57-58)
 
 
 def phase_word_to_hz(word):
@@ -313,7 +358,8 @@ class DdcStream:
 
 class AnanSim:
     def __init__(self, ip, mac, rate, pattern, tone_hz, ddc_count,
-                 gateware=SW_VERSION):
+                 gateware=SW_VERSION, pair_order="d0d1", enforce_ddc_count=False,
+                 stale_burst=False, supply_volts=13.58, adc_peak=None, adc_overload=0):
         self.ip = ip
         self.mac = mac
         self.rate = rate                 # default for a DDC with no commanded rate yet
@@ -321,8 +367,18 @@ class AnanSim:
         self.tone_hz = tone_hz
         self.ddc_count = ddc_count
         self.gateware = gateware
+        self.pair_order = pair_order     # diversity pair order on the wire
+        self.enforce_ddc_count = enforce_ddc_count
+        self.stale_burst = stale_burst
+        self.supply_counts = max(0, min(4095, round(supply_volts / SUPPLY_DIVIDER * 4095 / 5)))
+        self.adc0_peak = DEFAULT_ADC0_PEAK if adc_peak is None else adc_peak
+        self.adc1_peak = DEFAULT_ADC1_PEAK if adc_peak is None else adc_peak
+        self.adc_overload = adc_overload & 0x03
 
         self.run = False                 # set by the High Priority run bit
+        self.run_epoch = 0               # +1 on every run 0 -> 1: a new session
+        self.last_run_layout = set()     # DDCs that were streaming in the previous run
+        self.sock_1026 = None            # mic leaves from the DUC Specific socket
         self.stop = False
         self.pc_addr = None              # (host, port) of the client SESSION
         # DDC-Specific byte 7: bit n = DDCn streams. Starts as DDC0-only, the v0.1
@@ -332,7 +388,7 @@ class AnanSim:
         self.enable_mask = 0x01
         self.ddc_rates = {}              # n -> commanded S/s (DDC Specific record n)
         self.centre_hz = {}              # n -> NCO Hz (High Priority word n)
-        self.diversity = False           # High Priority byte 1363 bit 1
+        self.diversity = False           # DDC Specific byte 1363 == 0x02
         self.freq_is_phase_word = True   # the P2 default; General byte 37 bit 3
         self.seq_hp = 0
         self.lock = threading.RLock()    # spec + HP threads both touch mask/centres
@@ -384,6 +440,7 @@ class AnanSim:
         b[13] = self.gateware
         b[20] = self.ddc_count
         b[21] = 1                        # High Priority frequencies are phase words
+        b[23] = P2APP_BUILD
         return bytes(b)
 
     def _learn_session(self, addr):
@@ -429,6 +486,8 @@ class AnanSim:
             self._learn_session(addr)
             run = bool(data[4] & 0x01)
             if run != self.run:
+                if run:
+                    self.run_epoch += 1          # a new session: seqs restart at 0
                 self.run = run
                 log(f"[hp ] RUN bit -> {int(run)} "
                     f"({'streaming' if run else 'stopped'})")
@@ -443,13 +502,6 @@ class AnanSim:
                     if len(data) >= off + 4:
                         self.hp_words[n] = struct.unpack_from(">I", data, off)[0]
                 self._note_centres()
-            if len(data) > HP_DIVERSITY_OFFSET:
-                div = bool(data[HP_DIVERSITY_OFFSET] & HP_DIVERSITY_BIT)
-                if div != self.diversity:
-                    self.diversity = div
-                    log(f"[hp ] diversity {'ON' if div else 'off'} (byte "
-                        f"{HP_DIVERSITY_OFFSET}) -- EXPERIMENTAL framing"
-                        f"{': DDC0 carries 119 interleaved DDC0/DDC1 pairs' if div else ''}")
 
     def _note_centres(self):
         """Log (and keep) the tuning of every ENABLED DDC whose word changed.
@@ -506,14 +558,20 @@ class AnanSim:
                         f"(ports {[PORT_DDC0_IQ_OUT + n for n in on]})")
                     self.enable_mask = mask
                     self._note_centres()
+                # Diversity: byte 1363 of THIS packet, tested for EQUALITY with 0x02
+                # exactly as p2app does (KO9B, 2026-10-25) -- not High Priority, not
+                # a bit. Byte 7 then enables DDC0 only; the pair rate is DDC1's record.
+                if len(data) > DDC_SPEC_DIVERSITY_OFFSET:
+                    div = data[DDC_SPEC_DIVERSITY_OFFSET] == DDC_SPEC_DIVERSITY_VALUE
+                    if div != self.diversity:
+                        self.diversity = div
+                        log(f"[ddc] diversity {'ON' if div else 'off'} (DDC Specific byte "
+                            f"{DDC_SPEC_DIVERSITY_OFFSET} == 0x{data[DDC_SPEC_DIVERSITY_OFFSET]:02x})"
+                            f"{': DDC0 carries 119 interleaved DDC0/DDC1 pairs at the rate in DDC1 record' if div else ''}")
+                # A rate record exists for EVERY DDC (a client leaves the disabled ones
+                # stale or zero), and diversity reads DDC1's although DDC1 is not in the
+                # mask -- so parse them all, log only the ones that matter.
                 for n in range(MAX_DDC):
-                    if not (mask >> n) & 1:
-                        continue
-                    if n >= self.ddc_count:
-                        self._warn_once(("nodev", n),
-                                        f"[ddc] ⚠ DDC{n} enabled but this radio advertises "
-                                        f"only {self.ddc_count} DDCs -- not streaming it")
-                        continue
                     off = DDC0_RATE_OFFSET + 6 * n
                     if len(data) < off + 2:
                         continue
@@ -521,15 +579,18 @@ class AnanSim:
                     rate = khz * 1000
                     if not khz or rate == self.ddc_rates.get(n):
                         continue
+                    live = (mask >> n) & 1 or (n == 1 and self.diversity)
                     if rate not in DDC_RATES:
-                        self._warn_once(("badrate", n, khz),
-                                        f"[ddc] ⚠ commanded DDC{n} rate {khz} kHz "
-                                        f"is not a P2 rate — ignored")
+                        if live:
+                            self._warn_once(("badrate", n, khz),
+                                            f"[ddc] \u26a0 commanded DDC{n} rate {khz} kHz "
+                                            f"is not a P2 rate - ignored")
                         continue
                     self.ddc_rates[n] = rate
-                    log(f"[ddc] DDC{n} rate -> {rate} S/s "
-                        f"(cadence {IQ_SAMPLES_PER_PACKET/rate*1000:.3f} ms/packet, "
-                        f"size stays {IQ_HEADER_BYTES + IQ_PAYLOAD_BYTES} B)")
+                    if live:
+                        log(f"[ddc] DDC{n} rate -> {rate} S/s "
+                            f"(cadence {IQ_SAMPLES_PER_PACKET/rate*1000:.3f} ms/packet, "
+                            f"size stays {IQ_HEADER_BYTES + IQ_PAYLOAD_BYTES} B)")
 
     # -- DUC specific (1026): accepted, minimally parsed ----------------------
     def serve_spec(self, port, name):
@@ -537,6 +598,8 @@ class AnanSim:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((self.ip, port))
         self.socks.append(s)
+        if port == PORT_DUC_SPEC:
+            self.sock_1026 = s     # the mic stream leaves FROM :1026, like HP-out from :1025
         seen = False
         while not self.stop:
             try:
@@ -555,18 +618,32 @@ class AnanSim:
         """({ddc: rate}, diversity_active) for the streams that should run now."""
         with self.lock:
             mask, diversity = self.enable_mask, self.diversity
+            # A real G2 streams ANY enabled DDC regardless of the count it advertises
+            # (KO9B: DDC4 streams from :1039); --enforce-ddc-count opts into a radio
+            # that ignores one above its advertised count.
+            limit = min(MAX_DDC, self.ddc_count) if self.enforce_ddc_count else MAX_DDC
             want = {}
-            for n in range(min(MAX_DDC, self.ddc_count)):
-                if (mask >> n) & 1:
-                    want[n] = self.ddc_rates.get(n, self.rate)
-            # Diversity: DDC1 rides inside DDC0's packets, never its own.
+            for n in range(MAX_DDC):
+                if not (mask >> n) & 1:
+                    continue
+                if n >= limit:
+                    self._warn_once(("nodev", n),
+                                    f"[ddc] \u26a0 DDC{n} enabled but this radio advertises "
+                                    f"only {self.ddc_count} DDCs and --enforce-ddc-count "
+                                    f"is set -- not streaming it")
+                    continue
+                want[n] = self.ddc_rates.get(n, self.rate)
+            # Diversity: DDC1 rides inside DDC0's packets, never its own, and the
+            # pair runs at the rate in DDC1's record (bytes 24-25), not DDC0's.
             div = diversity and 0 in want
             if div:
                 want.pop(1, None)
+                want[0] = self.ddc_rates.get(1, want[0])
             return want, div
 
     def stream_ddcs(self):
         streams = {}
+        seen_epoch = self.run_epoch
         stat_t0 = time.perf_counter()
         log(f"[iq ] DDC ready: {IQ_PAYLOAD_BYTES} B / {IQ_SAMPLES_PER_PACKET} samples "
             f"per packet at every rate (cadence = {IQ_SAMPLES_PER_PACKET}/rate)")
@@ -595,6 +672,17 @@ class AnanSim:
                 for st in streams.values():
                     st.next_at = now
                 continue
+            if self.run_epoch != seen_epoch:
+                # run went 0 -> 1: a NEW session. Sequence counters restart at 0
+                # (KO9B: "starting from 0 at run=1"), and a real G2 first flushes a
+                # burst in the previous layout (p2app does not reset its FIFO).
+                seen_epoch = self.run_epoch
+                if self.stale_burst:
+                    self._stale_burst(self.last_run_layout - set(streams))
+                for st in streams.values():
+                    st.seq = 0
+                    st.next_at = time.perf_counter()
+            self.last_run_layout = set(streams)
             # Windows sleep() is ~15 ms grained; per-packet pacing at 1.24 ms
             # (192k) is impossible. Sleep to the earliest deadline (capped, so a
             # mask or rate change is noticed within 20 ms), then send EVERY packet
@@ -618,11 +706,15 @@ class AnanSim:
                         # both halves must come from the same sample index; the only
                         # difference left is the deliberate -6 dB / 45 degrees.
                         partner.pos = st.source.pos % partner.period
-                        payload = interleave_pairs(st.source.take(nsamp), partner.take(nsamp))
+                        a, b = st.source.take(nsamp), partner.take(nsamp)
+                        # DDC0 first in the first session after power-up; after DDC0 has
+                        # run alone a real G2 swapped them in 4 of 10 trials.
+                        payload = interleave_pairs(a, b) if self.pair_order == "d0d1" \
+                            else interleave_pairs(b, a)
                     else:
                         payload = st.source.take(nsamp)
-                    hdr = struct.pack(">IQHH", st.seq & 0xFFFFFFFF,
-                                      int(time.time() * 1e9) & 0xFFFFFFFFFFFFFFFF,
+                    # Timestamp bytes 4-11 are ALWAYS ZERO on a real G2 (KO9B).
+                    hdr = struct.pack(">IQHH", st.seq & 0xFFFFFFFF, 0,
                                       24, IQ_SAMPLES_PER_PACKET)
                     try:
                         st.sock.sendto(hdr + payload, self.pc_addr)
@@ -645,7 +737,7 @@ class AnanSim:
 
     def _diversity_partner(self, st0):
         """DDC1's signal for the diversity pair when DDC1 itself is not enabled
-        (a client may set the diversity bit with only DDC0 in the mask)."""
+        (a real client enables DDC0 only; p2app enables DDC1 itself)."""
         src = getattr(self, "_div_partner", None)
         if src is None:
             src = IqSource(self.pattern, st0.rate, ddc_tone_hz(self.tone_hz, 1),
@@ -654,23 +746,101 @@ class AnanSim:
         src.set_rate(st0.rate)
         return src
 
-    # -- high priority out: FROM radio :1025 TO the session port, 50 ms in RX.
-    # Real-G2 pcap: .127:1025 -> .108:<session>, 60 B. Clients demux by the
-    # radio-side SOURCE port, so this must leave from :1025 — reuse the DDC
-    # Specific socket, which is already bound there.
+    def _stale_burst(self, gone):
+        """Up to STALE_BURST_PACKETS packets, numbered from 0, from each port of the
+        PREVIOUS session's layout that the new one no longer enables. A real G2 does
+        this at the start of every session after the first (p2app does not reset
+        its FIFO between sessions); a client must drop them, not draw them."""
+        for n in sorted(gone):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((self.ip, PORT_DDC0_IQ_OUT + n))
+            except OSError:
+                continue
+            try:
+                rate = self.ddc_rates.get(n, self.rate)
+                src = IqSource(self.pattern, rate, ddc_tone_hz(self.tone_hz, n), seed=n)
+                for seq in range(STALE_BURST_PACKETS):
+                    hdr = struct.pack(">IQHH", seq, 0, 24, IQ_SAMPLES_PER_PACKET)
+                    try:
+                        s.sendto(hdr + src.take(IQ_SAMPLES_PER_PACKET), self.pc_addr)
+                    except OSError:
+                        break
+            finally:
+                s.close()
+            log(f"[iq ] stale burst: {STALE_BURST_PACKETS} packets from port "
+                f"{PORT_DDC0_IQ_OUT + n} (DDC{n}, not in this session's layout)")
+
+    # -- mic stream: FROM :1026 TO the session port, ~750 packets/s while running.
+    # 64 x 16-bit samples (48 kHz) + a 4 B sequence = 132 B, the size the N2JXL
+    # capture shows. The sim has no microphone: it is silence. The sequence
+    # restarting at each run=1 is ASSUMED (measured only for the DDC streams).
+    def stream_mic(self):
+        while not self.stop and self.sock_1026 is None:
+            time.sleep(0.05)
+        period = 1.0 / MIC_PACKETS_PER_S
+        silence = bytes(MIC_SAMPLES * 2)
+        seq, seen_epoch = 0, self.run_epoch
+        next_at = time.perf_counter()
+        while not self.stop:
+            if not (self.run and self.pc_addr):
+                time.sleep(0.02)
+                next_at = time.perf_counter()
+                continue
+            if self.run_epoch != seen_epoch:
+                seen_epoch, seq = self.run_epoch, 0
+            slack = next_at - time.perf_counter()
+            if slack > 0:
+                time.sleep(min(slack, 0.02))
+            now = time.perf_counter()
+            sent = 0
+            while next_at <= now and sent < 16:
+                try:
+                    self.sock_1026.sendto(struct.pack(">I", seq & 0xFFFFFFFF) + silence,
+                                          self.pc_addr)
+                except OSError:
+                    pass
+                seq += 1
+                next_at += period
+                sent += 1
+            if sent >= 16:
+                next_at = time.perf_counter()
+
+    # -- high priority out (the "status" packet): FROM radio :1025 TO the session
+    # port, about every 232 ms on receive (KO9B: p2app sleeps 400 x 0.5 ms). Clients
+    # demux by the radio-side SOURCE port, so this must leave from :1025 -- reuse the
+    # DDC Specific socket, which is already bound there. Layout MEASURED on a real G2.
+    def status_packet(self):
+        b = bytearray(60)
+        struct.pack_into(">I", b, 0, self.seq_hp & 0xFFFFFFFF)
+        b[4] = STATUS_PLL_LOCKED                         # PTT/dot/dash clear
+        b[5] = self.adc_overload                         # bit0 = ADC0 (ANT1), bit1 = ADC1
+        struct.pack_into(">H", b, 6, STATUS_EXCITER)
+        struct.pack_into(">H", b, 14, STATUS_FORWARD)
+        struct.pack_into(">H", b, 22, STATUS_REVERSE)
+        b[30] = STATUS_UNDERFLOW
+        struct.pack_into(">H", b, 31, STATUS_FIFO_DEPTH)  # DDC FIFO depth
+        struct.pack_into(">H", b, 39, self.adc0_peak)    # ADC0 peak-hold
+        struct.pack_into(">H", b, 41, self.adc1_peak)    # ADC1 peak-hold
+        struct.pack_into(">H", b, 55, STATUS_AIN4)
+        struct.pack_into(">H", b, 49, STATUS_AIN6)       # AIN6 -- NOT the supply
+        struct.pack_into(">H", b, 57, self.supply_counts)  # AIN3 = the supply rail
+        b[59] = STATUS_BYTE59
+        return bytes(b)
+
     def stream_high_priority(self):
         while not self.stop and getattr(self, "sock_1025", None) is None:
             time.sleep(0.05)
         while not self.stop:
             if self.run and self.pc_addr:
-                b = bytearray(60)
-                struct.pack_into(">I", b, 0, self.seq_hp & 0xFFFFFFFF)
+                pkt = self.status_packet()
                 self.seq_hp += 1
                 try:
-                    self.sock_1025.sendto(bytes(b), self.pc_addr)
+                    self.sock_1025.sendto(pkt, self.pc_addr)
                 except OSError:
                     pass
-            time.sleep(0.050)                      # 50 ms in RX; 1 ms in TX
+            time.sleep(STATUS_PERIOD_S)
 
     def start(self):
         if sys.platform == "win32":
@@ -684,13 +854,17 @@ class AnanSim:
                 pass
         log(f"anan-sim {VERSION} — openHPSDR Protocol 2 (Saturn/ANAN-G2) RX only, multi-DDC")
         log(f"  ip={self.ip} rate={self.rate} pattern={self.pattern} "
-            f"tone={self.tone_hz} Hz ddc={self.ddc_count} gateware={self.gateware}")
+            f"tone={self.tone_hz} Hz ddc={self.ddc_count} gateware={self.gateware} "
+            f"pair-order={self.pair_order}"
+            f"{' enforce-ddc-count' if self.enforce_ddc_count else ''}"
+            f"{' stale-burst' if self.stale_burst else ''}")
         log(f"  MAC {':'.join(f'{x:02x}' for x in self.mac)}  device 0x{DEVICE_SATURN:02x} (Saturn)")
         for target, args in ((self.serve_discovery, ()),
                              (self.serve_high_priority, ()),
                              (self.serve_ddc_spec, ()),
                              (self.serve_spec, (PORT_DUC_SPEC, "duc")),
                              (self.stream_ddcs, ()),
+                             (self.stream_mic, ()),
                              (self.stream_high_priority, ())):
             threading.Thread(target=target, args=args, daemon=True).start()
         t0 = time.time()
@@ -721,9 +895,27 @@ def main():
     ap.add_argument("--pattern", default="tone", choices=["tone", "noise", "zero"])
     ap.add_argument("--tone", type=float, default=1000.0, help="tone offset from centre, Hz")
     ap.add_argument("--ddc", type=int, default=DEFAULT_DDC_COUNT,
-                    help="DDC count to advertise AND to stream (an enabled DDC beyond "
-                         "it is ignored, like a radio that lacks it); default "
-                         f"{DEFAULT_DDC_COUNT}")
+                    help="DDC count to ADVERTISE in the discovery reply (default "
+                         f"{DEFAULT_DDC_COUNT}, what a real G2 says). A real G2 streams "
+                         "any enabled DDC regardless -- see --enforce-ddc-count")
+    ap.add_argument("--enforce-ddc-count", action="store_true",
+                    help="stream nothing for an enabled DDC above --ddc, like a radio "
+                         "that lacks it (NOT what a real G2 does)")
+    ap.add_argument("--pair-order", default="d0d1", choices=["d0d1", "d1d0"],
+                    help="diversity pair order on the wire: DDC0 first (a real G2's "
+                         "first session after power-up) or DDC1 first (what it did in "
+                         "4 of 10 trials after DDC0 had run alone)")
+    ap.add_argument("--stale-burst", action="store_true",
+                    help="at each run=1 send a burst of packets from ports of the "
+                         "previous session's layout (a real G2 does this); a client "
+                         "must drop them")
+    ap.add_argument("--supply-volts", type=float, default=13.58,
+                    help="supply rail the status packet reports (AIN3, bytes 57-58)")
+    ap.add_argument("--adc-peak", type=int, default=None,
+                    help="ADC0 AND ADC1 peak-hold in the status packet (0..65535); "
+                         f"default is KO9B's measured medians {DEFAULT_ADC0_PEAK}/{DEFAULT_ADC1_PEAK}")
+    ap.add_argument("--adc-overload", type=int, default=0,
+                    help="status byte 5 ADC overload bits: 1 = ADC0, 2 = ADC1, 3 = both")
     ap.add_argument("--gateware", type=int, default=SW_VERSION,
                     help="gateware version byte in the discovery reply "
                          f"(default {SW_VERSION}; unconfirmed against a real G2)")
@@ -740,7 +932,9 @@ def main():
     if not 1 <= args.ddc <= MAX_DDC:
         sys.exit(f"bad --ddc {args.ddc}: want 1..{MAX_DDC}")
     AnanSim(args.ip or local_ip(), mac, args.rate, args.pattern,
-            args.tone, args.ddc, args.gateware).start()
+            args.tone, args.ddc, args.gateware, args.pair_order,
+            args.enforce_ddc_count, args.stale_burst, args.supply_volts,
+            args.adc_peak, args.adc_overload).start()
 
 
 if __name__ == "__main__":
