@@ -131,6 +131,10 @@ WAV). Whatever text you choose stays on your machine — generated WAVs are giti
 
 Like a real radio, flex-sim serves several API connections at once: AetherSDR plus a **non-GUI client** such as a front-panel controller (a CTR2-Max through AE's USB relay), a logger, or a second GUI client. Each connection gets its own client handle. A non-GUI client sees AE with `sub client all` and attaches with `client bind client_id=<uuid>`. It can then tune and drive AE's slices (`slice tune`, `slice set … mode=/audio_level=`, `filt`, `xmit`), and AE sees each change. When a client disconnects, only its own slices are freed, and TX is unkeyed only if that client keyed it. The control panel's `/state` lists the connected clients. Wire details are in [PROTOCOL.md §13](PROTOCOL.md#13-multiple-clients-multiflex--non-gui-controllers--2026-10-21), and `tests/test_multiclient.py` drives a GUI client and a controller together.
 
+## Spots (DXLab Commander, N1MM, SpotCollector ...)
+
+flex-sim keeps radio-side spots the way FlexLib describes them. A spot pusher sends `spot add callsign=W1AW rx_freq=14.074 mode=FT8 color=#FFFF0000 lifetime_seconds=600` and gets the new index in the reply. The GUI client and every client that sent `sub spot all` see `spot <i> ...`, and AetherSDR draws the label on its panadapter. Clicking the label makes AetherSDR send `spot trigger <i> pan=0x...`. The sim reports `spot <i> triggered pan=0x...` to the pusher, and with `trigger_action=tune` (FlexLib's default) it retunes that pan's slice to the spot. `spot set`, `spot remove`, `spot clear` and `lifetime_seconds` expiry all report `spot <i> removed`. Some behaviour is assumed rather than measured on a radio: that the add reply carries the index, that no lifetime means the spot never expires, and how tune works. `tests/test_spots.py` covers all of it.
+
 ## Offline self-test
 ```
 python3 loopback_test.py carrier      # mock-AetherSDR: handshake + VITA + meter checks, no real AE

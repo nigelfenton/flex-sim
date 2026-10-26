@@ -60,7 +60,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES_DIR = os.path.join(HERE, "fixtures")
 REPORTS_DIR  = os.path.join(HERE, "reports")
 
-FLEX_SIM_VERSION = "0.3.6"
+FLEX_SIM_VERSION = "0.3.7"
 
 DISCOVERY_PORT = 4992        # AE always listens for discovery here (fixed); we broadcast TO it
 DEFAULT_PORT = 4992          # flex-sim's own control (TCP) + VITA-prime (UDP) port; override with --port
@@ -1326,7 +1326,8 @@ SLICE_ECHO_KEYS = ("audio_level", "audio_pan", "agc_mode", "agc_threshold")
 # Status object -> the 'sub <topic>' that receives it on a real radio.
 STATUS_TOPICS = {"slice": "slice", "display": "pan", "transmit": "tx", "interlock": "tx",
                  "meter": "meter", "cwx": "cwx", "apd": "apd", "license": "license",
-                 "amplifier": "amplifier", "tnf": "tnf", "radio": "radio", "client": "client"}
+                 "amplifier": "amplifier", "tnf": "tnf", "radio": "radio", "client": "client",
+                 "spot": "spot"}
 
 
 class Radio:
@@ -1357,6 +1358,11 @@ class Radio:
         self.pan_id = PAN_ID + radio_id * 16     # FFT stream-id BASE; AE stacks a panadapter per +RX,
         self.wf_id = WF_ID + radio_id * 16       # waterfall base. pan k -> base+k (16 ids/radio, no overlap)
         self.pans = {}                           # pan_id -> {"wf_id":int,"slice":global_idx|None,"y_pixels":int}
+        # Radio-side spots (FlexLib Radio.RequestSpot / Spot.cs): what DXLab Commander, N1MM and
+        # friends push with "spot add", shared with every client that sent "sub spot all".
+        self.spots = {}                          # index -> {"kv": {key: value}, "expires": monotonic|None}
+        self.next_spot = 0
+        self._spot_reaper = None
         self.pan_seq = 0                          # next panadapter index for this radio
         self.meter_sid = METER_SID + radio_id    # meter VITA stream id (PCC 0x8002)
         self.pattern = pattern if pattern in PATTERNS else "ramp"
@@ -2521,10 +2527,150 @@ class Radio:
             self.slices[idx].setdefault("extra", {}).update(filter_lo=lo, filter_hi=hi)
             self.reply(conn, seq)
             self.emit_slice_status(conn, idx)
+        elif c.split()[:1] == ["spot"]:
+            self._handle_spot(conn, seq, c)
         elif c.startswith("tnf "):
             self._handle_tnf(conn, seq, c)
         else:
             self.reply(conn, seq)
+
+    # ---- spots ---------------------------------------------------------------------------
+    # FlexLib: Radio.RequestSpot sends "spot add callsign=<c> rx_freq=<MHz f6> [tx_freq= mode= color=
+    # background_color= source= spotter_callsign= timestamp= lifetime_seconds= comment= priority=
+    # trigger_action=]"; Spot.cs sends "spot set <i> k=v", "spot remove <i>", "spot trigger <i>
+    # [pan=0x<8 hex>]"; Radio "spot clear". The radio reports "spot <i> k=v ...", "spot <i> removed"
+    # and "spot <i> triggered pan=0x...". Spaces inside callsign/comment travel as \x7f and are
+    # echoed as received. Defaults are FlexLib's (priority 5, trigger_action tune).
+    # MEASURED (aethersdr/AetherSDR#2366, UT4LW on a real radio): "triggered" always carries pan=,
+    # 0x00000000 when the trigger named none - a bare "spot <i> triggered" never comes from a radio.
+    # ASSUMPTIONS, not measured on a radio: the add reply carries the new index; an absent
+    # lifetime_seconds never expires; trigger_action=tune retunes the slice on the given pan (or the
+    # active slice) to rx_freq, and anything else leaves the slice alone.
+    SPOT_KEYS = ("callsign", "rx_freq", "tx_freq", "mode", "color", "background_color", "source",
+                 "spotter_callsign", "timestamp", "lifetime_seconds", "comment", "priority",
+                 "trigger_action")
+
+    def _spot_status(self, idx):
+        kv = self.spots[idx]["kv"]
+        return f"spot {idx} " + " ".join(f"{k}={kv[k]}" for k in self.SPOT_KEYS if k in kv)
+
+    def _spot_expiry(self, kv):
+        try:
+            life = int(kv.get("lifetime_seconds", "0"))
+        except ValueError:
+            life = 0
+        return time.monotonic() + life if life > 0 else None
+
+    def _start_spot_reaper(self):
+        if self._spot_reaper is not None:
+            return
+
+        def reap():
+            while self.run:
+                time.sleep(0.25)
+                with self.lock:
+                    now = time.monotonic()
+                    gone = [i for i, sp in self.spots.items() if sp["expires"] and now >= sp["expires"]]
+                    for i in gone:
+                        del self.spots[i]
+                        log(f"[spot] {i} expired")
+                        self.publish(f"spot {i} removed")
+
+        self._spot_reaper = threading.Thread(target=reap, daemon=True)
+        self._spot_reaper.start()
+
+    def _handle_spot(self, conn, seq, c):
+        words = c.split()
+        action = words[1] if len(words) > 1 else ""
+        kvs = parse_kvs(c)
+        bad = lambda: self.reply(conn, seq, code=0x5000002D)
+        if action == "add":
+            if "callsign" not in kvs or "rx_freq" not in kvs:
+                return bad()
+            try:
+                rx = float(kvs["rx_freq"])
+                tx = float(kvs.get("tx_freq", rx))
+            except ValueError:
+                return bad()
+            kv = {k: kvs[k] for k in self.SPOT_KEYS if k in kvs}
+            kv["rx_freq"] = f"{rx:.6f}"
+            kv["tx_freq"] = f"{tx:.6f}"
+            kv.setdefault("timestamp", str(int(time.time())))
+            kv.setdefault("priority", "5")
+            kv.setdefault("trigger_action", "tune")
+            idx = self.next_spot
+            self.next_spot += 1
+            self.spots[idx] = {"kv": kv, "expires": self._spot_expiry(kv)}
+            if self.spots[idx]["expires"]:
+                self._start_spot_reaper()
+            self.reply(conn, seq, str(idx))
+            log(f"[spot] {idx} added by 0x{conn.handle_hex}: {kv['callsign']} {kv['rx_freq']} MHz")
+            self.publish(self._spot_status(idx), conn)
+        elif action in ("set", "remove", "trigger"):
+            try:
+                idx = int(words[2])
+            except (IndexError, ValueError):
+                return bad()
+            if idx not in self.spots:
+                return bad()
+            if action == "set":
+                changed = {k: kvs[k] for k in self.SPOT_KEYS if k in kvs}
+                if not changed:
+                    return bad()
+                for k in ("rx_freq", "tx_freq"):
+                    if k in changed:
+                        try:
+                            changed[k] = f"{float(changed[k]):.6f}"
+                        except ValueError:
+                            return bad()
+                self.spots[idx]["kv"].update(changed)
+                if "lifetime_seconds" in changed:           # FlexLib: setting it resets the countdown
+                    self.spots[idx]["expires"] = self._spot_expiry(self.spots[idx]["kv"])
+                    if self.spots[idx]["expires"]:
+                        self._start_spot_reaper()
+                self.reply(conn, seq)
+                self.publish(f"spot {idx} " + " ".join(f"{k}={v}" for k, v in changed.items()), conn)
+            elif action == "remove":
+                del self.spots[idx]
+                self.reply(conn, seq)
+                log(f"[spot] {idx} removed by 0x{conn.handle_hex}")
+                self.publish(f"spot {idx} removed", conn)
+            else:                                           # trigger
+                pan = kvs.get("pan")
+                self.reply(conn, seq)
+                log(f"[spot] {idx} triggered by 0x{conn.handle_hex} pan={pan or '0x00000000'}")
+                self.publish(f"spot {idx} triggered pan={pan or '0x00000000'}", conn)
+                kv = self.spots[idx]["kv"]
+                if kv.get("trigger_action") == "tune":
+                    self._spot_tune(conn, kv, pan)
+        elif action == "clear":
+            gone = sorted(self.spots)
+            self.spots.clear()
+            self.reply(conn, seq)
+            for i in gone:
+                self.publish(f"spot {i} removed", conn)
+        else:
+            bad()
+
+    def _spot_tune(self, conn, kv, pan):
+        """trigger_action=tune: move the slice on that pan (else the active slice) to the spot."""
+        target = None
+        if pan:
+            try:
+                pid = int(pan, 16)
+            except ValueError:
+                pid = None
+            target = next((i for i, sl in self.slices.items() if sl.get("pan") == pid), None)
+        if target is None:
+            target = self.active_slice if self.active_slice in self.slices else next(iter(self.slices), None)
+        if target is None:
+            return
+        self.slices[target]["freq"] = float(kv["rx_freq"])
+        if kv.get("mode"):
+            self.slices[target]["mode"] = kv["mode"]
+        log(f"[spot] tune slice {target} -> {kv['rx_freq']} MHz {kv.get('mode', '')}")
+        self._sync_active_slice()
+        self.emit_slice_status(conn, target)
 
     def _handle_tnf(self, conn, seq, c):
         """Tracking Notch Filter: 'tnf create freq=<MHz>' (reply = new id),
