@@ -2539,8 +2539,10 @@ class Radio:
     # background_color= source= spotter_callsign= timestamp= lifetime_seconds= comment= priority=
     # trigger_action=]"; Spot.cs sends "spot set <i> k=v", "spot remove <i>", "spot trigger <i>
     # [pan=0x<8 hex>]"; Radio "spot clear". The radio reports "spot <i> k=v ...", "spot <i> removed"
-    # and "spot <i> triggered [pan=0x...]". Spaces inside callsign/comment travel as \x7f and are
+    # and "spot <i> triggered pan=0x...". Spaces inside callsign/comment travel as \x7f and are
     # echoed as received. Defaults are FlexLib's (priority 5, trigger_action tune).
+    # MEASURED (aethersdr/AetherSDR#2366, UT4LW on a real radio): "triggered" always carries pan=,
+    # 0x00000000 when the trigger named none - a bare "spot <i> triggered" never comes from a radio.
     # ASSUMPTIONS, not measured on a radio: the add reply carries the new index; an absent
     # lifetime_seconds never expires; trigger_action=tune retunes the slice on the given pan (or the
     # active slice) to rx_freq, and anything else leaves the slice alone.
@@ -2636,8 +2638,8 @@ class Radio:
             else:                                           # trigger
                 pan = kvs.get("pan")
                 self.reply(conn, seq)
-                log(f"[spot] {idx} triggered by 0x{conn.handle_hex}" + (f" pan={pan}" if pan else ""))
-                self.publish(f"spot {idx} triggered" + (f" pan={pan}" if pan else ""), conn)
+                log(f"[spot] {idx} triggered by 0x{conn.handle_hex} pan={pan or '0x00000000'}")
+                self.publish(f"spot {idx} triggered pan={pan or '0x00000000'}", conn)
                 kv = self.spots[idx]["kv"]
                 if kv.get("trigger_action") == "tune":
                     self._spot_tune(conn, kv, pan)

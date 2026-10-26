@@ -4,7 +4,8 @@
 Wire contract from FlexLib (Radio.RequestSpot, Spot.cs, Radio.ParseSpotStatus):
   host -> radio  spot add callsign=<c> rx_freq=<MHz> [tx_freq= mode= color= ... trigger_action=]
                  spot set <i> k=v | spot remove <i> | spot clear | spot trigger <i> [pan=0x<hex>]
-  radio -> host  spot <i> k=v ...  |  spot <i> removed  |  spot <i> triggered [pan=0x<hex>]
+  radio -> host  spot <i> k=v ...  |  spot <i> removed  |  spot <i> triggered pan=0x<hex>
+  (a real radio always sends pan=, 0x00000000 for a pan-less trigger - aethersdr/AetherSDR#2366)
 Spaces inside callsign/comment travel as 0x7f.
 
 Checks:
@@ -14,7 +15,7 @@ Checks:
   2. a client that neither is the GUI client nor subscribed hears nothing;
   3. the GUI client triggers it with pan=: the adder hears 'spot <i> triggered pan=0x...', and
      trigger_action=tune retunes the GUI client's slice to rx_freq (and sets the mode);
-  4. trigger_action=none leaves the slice alone;
+  4. trigger_action=none leaves the slice alone; a pan-less trigger reports pan=0x00000000;
   5. 'spot set' updates a field and reports it; 'spot remove' and 'spot clear' report removed;
   6. lifetime_seconds expires a spot by itself (removed status, gone from the radio);
   7. refusals: no rx_freq, unknown index, a non-numeric frequency.
@@ -183,6 +184,11 @@ def main():
         check("4. trigger_action=none: triggered is reported but the slice does not move",
               cmdr.wait_for(rf"\|spot {idx2} triggered") is not None
               and not any("|slice 0 " in x and "RF_frequency=7.03" in x for x in gui.seen[g2:]), str(gui.seen[g2:]))
+        c1 = cmdr.mark()
+        gui.cmd(f"spot trigger {idx2}")
+        bare = cmdr.wait_for(rf"\|spot {idx2} triggered", since=c1)
+        check("4. a pan-less trigger is reported with pan=0x00000000, as a real radio does",
+              bare is not None and bare.endswith(f"spot {idx2} triggered pan=0x00000000"), str(bare))
 
         # ---- 5. set / remove / clear ----
         g3 = gui.mark()
