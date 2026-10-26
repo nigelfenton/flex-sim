@@ -293,6 +293,28 @@ The reference captures it was verified against are recordings of a private stati
 are not distributed; point it at your own capture. `tests/test_p2verify.py` exercises it
 on a synthetic capture built to trip both traps.
 
+### Reading a Hermes-Lite 2's IO board — `hl2_ioboard_read.py`
+
+A stand-alone, standard-library reader for the N2ADR HL2IOBoard's status registers (input
+pins and `EXTTR`, ATU progress, fault code, firmware major) over HPSDR Protocol 1. It sends
+the same I2C2 read AetherSDR's `hl2` / `ioboard.status` does and decodes the radio's reply.
+
+```
+python3 tools/hl2_ioboard_read.py                       # find an HL2 on the LAN, read once
+python3 tools/hl2_ioboard_read.py --ip 192.168.1.50 -n 30 --interval 1
+python3 tools/hl2_ioboard_read.py --ip 192.168.1.50 --json
+```
+
+It is **receive-only by construction**: it never sets the MOX bit, sends no transmit
+samples and no frequency, drive or I2C-write register, and it will not start if the radio
+reports that another client is already streaming. It does start the radio's receive stream
+(the reply can only travel on it) and stops it on exit, so do not run it while a client is
+connected to the same radio. Exit status: `0` every read came from a real board, `1` some
+reads timed out or found the bus busy, `2` no board answered (an empty bus reads `0xFF`),
+`3` no HL2 / no reply. `tests/test_hl2_ioboard_read.py` runs it against a fake radio on
+loopback and asserts all of the above, including that nothing but the config and read banks
+is ever sent.
+
 ---
 
 ## Same-machine setup (WSL)
