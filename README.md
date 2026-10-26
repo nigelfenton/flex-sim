@@ -259,6 +259,8 @@ correct client shows the default tone just **above** the tuned frequency and hea
 **USB**. If you see it below the dial and hear it only in LSB, the client — or a sim
 older than v0.3.1 — has I/Q the wrong way round.
 
+**Identity (v0.3.2).** The sim answers discovery with the locally administered MAC `02:a0:13:5e:00:01`, which can never belong to a real device. Before v0.3.2 it used `00:1c:c0:a2:13:dd`, which is the **Hermes-Lite 2's factory MAC**: a client that identifies radios by MAC (AetherSDR does) merged the sim with a real HL2 on the same LAN, hid the sim from its list, and `connect` by that serial reached the real radio. `--mac` still overrides it.
+
 One observation is still open: an RX-audio click comb seen in NereusSDR while the wire
 itself was clean, with its attribution deliberately left unresolved
 ([#5](https://github.com/nigelfenton/flex-sim/issues/5)).

@@ -606,8 +606,31 @@ def case_stale_burst_is_opt_in_and_matches_the_observed_shape():
             sim.log()
 
 
+def case_default_mac_is_never_a_real_radios():
+    """The default MAC is locally administered, so it cannot collide with a Hermes-Lite 2 (whose factory MAC is
+    00:1c:c0:a2:13:dd) or any genuine G2; --mac still overrides it."""
+    hl2_factory = bytes.fromhex("001cc0a213dd")
+    want = bytes.fromhex(anan_sim.DEFAULT_MAC.replace(":", ""))
+    check("the default MAC is not a Hermes-Lite 2's factory MAC", want != hl2_factory, anan_sim.DEFAULT_MAC)
+    check("the default MAC is locally administered and unicast (first octet bit 1 set, bit 0 clear)",
+          (want[0] & 0x03) == 0x02, f"first octet {want[0]:#04x}")
+    with Sim() as sim:
+        s = client()
+        reply = discover(s)
+        check("discovery answers with the default MAC at [5:11]", reply[5:11] == want, reply[5:11].hex())
+        s.close()
+        sim.log()
+    with Sim("--mac", "00:1c:c0:a2:13:dd") as sim:
+        s = client()
+        reply = discover(s)
+        check("--mac still overrides it", reply[5:11] == hl2_factory, reply[5:11].hex())
+        s.close()
+        sim.log()
+
+
 def main():
-    for fn in (case_tone_ring_is_phase_continuous_across_the_seam,
+    for fn in (case_default_mac_is_never_a_real_radios,
+               case_tone_ring_is_phase_continuous_across_the_seam,
                case_tone_handedness_and_amplitude,
                case_generator_is_a_slice_not_a_per_sample_loop,
                case_interleave_layout_and_other_patterns,
@@ -639,6 +662,10 @@ def _pytest(*fns):
         import pytest
         pytest.skip(f"anan_sim could not be started (ports 1024-1044 busy?): {e}")
     assert failed == 0, f"{failed} check(s) failed -- see output above"
+
+
+def test_discovery_mac():
+    _pytest(case_default_mac_is_never_a_real_radios)
 
 
 def test_pure_signal_source():
