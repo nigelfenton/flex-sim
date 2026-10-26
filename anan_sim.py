@@ -124,7 +124,7 @@ import threading
 import time
 import traceback
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 # --- ports (PC -> SDR unless noted). Saturn doc, "Port Numbers to Use". -------
 PORT_DISCOVERY = 1024          # discovery AND General Packet to SDR
@@ -150,6 +150,10 @@ P2APP_BUILD = 46               # discovery byte 23: the real G2's p2app build
 # build 46). Both the sim's earlier guesses were right. NereusSDR had logged "fw: 21"
 # against v0.1 -- hence --gateware, to reproduce an older radio.
 SW_VERSION = 27
+# Locally administered (bit 1 of the first octet) and unicast: not any vendor's address. The sim used to answer
+# as 00:1c:c0:a2:13:dd, which is the Hermes-Lite 2's factory MAC, so a client that identifies radios by MAC
+# (AetherSDR does) merged the sim with a real HL2 on the same LAN and connected to the wrong one.
+DEFAULT_MAC = "02:a0:13:5e:00:01"
 DEFAULT_DDC_COUNT = 4
 # DDC-Specific byte 7 is a mask for DDC0-7. A real p2app reads enables for 10 DDCs
 # (ports 1035-1044); where DDC8-9 live in the packet has not been measured, so the
@@ -1064,7 +1068,10 @@ def main():
     ap.add_argument("--gateware", type=int, default=SW_VERSION,
                     help="gateware version byte in the discovery reply "
                          f"(default {SW_VERSION}; unconfirmed against a real G2)")
-    ap.add_argument("--mac", default="00:1c:c0:a2:13:dd", help="MAC in the discovery reply")
+    ap.add_argument("--mac", default=DEFAULT_MAC,
+                    help="MAC in the discovery reply (default %(default)s: a locally administered address, "
+                         "so it can never collide with a real radio; 00:1c:c0:a2:13:dd is a Hermes-Lite 2's "
+                         "factory MAC and a client that keys radios by MAC shows only one of the two)")
     ap.add_argument("--allow", action="append", default=[], metavar="CIDR",
                     help="only hosts in this network may start or redirect a session (repeatable, "
                          "e.g. --allow 192.168.0.0/24 --allow 100.64.0.0/10). Default: any host, "
@@ -1093,7 +1100,7 @@ def main():
         if len(mac) != 6:
             raise ValueError
     except ValueError:
-        sys.exit(f"bad --mac {args.mac!r}: want six hex octets like 00:1c:c0:a2:13:dd")
+        sys.exit(f"bad --mac {args.mac!r}: want six hex octets like 02:a0:13:5e:00:01")
 
     if not 1 <= args.ddc <= 10:
         sys.exit(f"bad --ddc {args.ddc}: want 1..10 (ports 1035-1044)")
