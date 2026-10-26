@@ -150,8 +150,9 @@ AetherSDR can control, each a single pure-stdlib file with its own interactive p
 | `spe_sim.py` | SPE Expert 1.3K/1.5K/2K (amp) | 4531 | manual IP (Network mode) |
 | `acom_sim.py` | ACOM 600S/700S/1200S (amp) | 9600 | manual IP |
 | `kpa_sim.py` | Elecraft KPA1500 (amp), with network PTT | 1500 TCP+UDP | none yet — AetherSDR has no KPA1500 support ([#4097](https://github.com/aethersdr/AetherSDR/issues/4097)) |
+| `lp100_sim.py` | TelePost LP-100A (wattmeter), as a raw-TCP serial proxy | 2000 | manual IP (Peripherals tab, LP-100A Meter, Network mode) |
 
-**`station.py` runs them all in one process** with one prompt to drive them — key an
+**`station.py` runs the six above in one process** (the LP-100A sim runs on its own) with one prompt to drive them — key an
 amp, step the tuner relays, switch antennas — so meters and relays actually move in
 AetherSDR instead of sitting at headless defaults:
 ```
@@ -160,6 +161,36 @@ python3 station.py --with-radio       # also spawn flex_sim.py (the radio)
 python3 station.py --no-cli           # headless (staged/background)
 ```
 It prints a connect table with the exact host:port to enter in AetherSDR for each device.
+
+### LP-100A: a wattmeter on a shared serial line
+
+`lp100_sim.py` answers on a TCP port the way a TelePost LP-100A behind ser2net does, so
+AetherSDR's LP-100A applet can be driven with no meter, no serial adapter and no virtual COM port.
+The format is the one AetherSDR's own design note measured on a real meter (it corrects the
+manual): one 42-character record per `P` poll, led by `;`, with no terminator.
+
+```
+python3 lp100_sim.py                       # meter on :2000, control page / JSON on :8738
+lp100> load 75 0                           # load |Z| and phase - the sim keeps |Z|, phase and SWR consistent
+lp100> key 100                             # 100 W -> AetherSDR shows 100 W, SWR 1.50, RL 14.0 dB, Range Mid
+lp100> hold peak                           # then unkey: power holds ~1.7 s while SWR reverts, as the meter does
+lp100> fault exponent                      # one-shot faults: garbage exponent flip wide-dbm truncate
+lp100> stall on                            # the meter stops answering with TCP still up
+lp100> lag on 7.8 150                      # every 7.8 s hold one reply 150 ms: the next poll queues behind it
+```
+
+In AetherSDR: Peripherals → LP-100A Meter → Network, the sim's address, port 2000. It models the
+idle pattern, auto-ranging against configurable ceilings (`--ceilings`, never sent by a real meter),
+the `A`/`F` commands stepping their fields, the key-up hold, and a **shared wire**: every reply goes
+to every connected client, as on a ser2net port, so a second poller makes AetherSDR ride along. Run
+against AetherSDR v26.10.4, the applet showed the right values in every scenario above, rejected
+the `01e+100` and truncated records, accepted the 5-character dBm variant, reported NO DATA on a stall
+and SHARED with a foreign poller. `lag` reproduces the late-reply pairs measured on a real station in
+[aethersdr/AetherSDR#6794](https://github.com/aethersdr/AetherSDR/issues/6794): against v26.10.4 it makes the
+poll gate count AetherSDR's own second reply as another client, and the 2 s data watchdog fires once per
+event, though AetherSDR is the only poller (11 times in 100 s at `lag on 7.8 150`, none with lag off). Not modelled, because nobody has measured them: what `M` does,
+and whether field 0 is forward or net power (`--net-power` flips it). `tests/test_lp100_sim.py` checks
+every record against a transcription of AetherSDR's record check.
 
 ### KPA1500: a bench for network PTT and T/R interlocks
 
